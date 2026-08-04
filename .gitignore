@@ -1,0 +1,17 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Office temp/lock files
+*.docx
+*.doc
+.~*
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs
+*.log
