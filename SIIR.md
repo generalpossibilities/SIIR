@@ -303,6 +303,11 @@ end to end in one pass:
 7. `claim(ids)` pays the holder SHELL exactly `weight * index / SCALE`
    (verified: 0.1 SHELL per 1000-weight SIIR on a 10 SHELL deposit).
 
+Model B (rounds) is verified too: Genesis → Round 1 → Round 2 issue
+50/1000 → 75/200000 → 100/200000, each `issue()` minting exactly the next
+declared plan; a fourth `issue()` reverts with `ERR_SUPPLY_EXCEEDED`
+(exit 105) — declared supply is never exceeded, silently or otherwise.
+
 Verified on-chain mechanics learned while building:
 
 - Externally-deployed (self-rooted) contracts live at `<own>::<own>`;

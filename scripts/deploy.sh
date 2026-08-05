@@ -216,5 +216,45 @@ cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 cli run "$COMPANY" getHistory '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 cli account "$HOLDER" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  holder ecc:", d.get("ecc_balance"), "vmshell:", d.get("balance"))'
 
+# ---------- 10. MODEL_ROUNDS: second company, incremental rounds ----------
+echo "== 10. model-B company (rounds) =="
+# second company: founder = the holder wallet (distinct statics => distinct address)
+B_FOUNDER_PUB=$(python3 -c 'import json; print(json.load(open("'$WORK'/holder.keys.json"))["public"])')
+B_RAW=$(cli run "$FACTORY" getCompanyAddress \
+  "{\"founder\":\"$(legacy "$HOLDER")\",\"founderPubkey\":\"0x$B_FOUNDER_PUB\"}" --abi "$CT/SIIRFactory.abi.json" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"].split(":")[1])')
+COMPANY_B="$FACTORY_RAW::$B_RAW"
+echo "  rounds company: $COMPANY_B"
+if ! cli account "$COMPANY_B" 2>/dev/null | grep -q '"Active"'; then
+  echo "  deploying rounds company via factory..."
+  # factory spends initialValue in VMSHELL per company; refill if running low
+  FB=$(cli account "$FACTORY" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
+  [ "${FB:-0}" -lt 40000000000 ] && { echo "  factory vmshell low (${FB}); refilling..."; fund "$FACTORY" 50000000000; sleep 5; }
+  cli callx --abi "$CT/SIIRFactory.abi.json" --addr "$FACTORY" --keys "$WORK/factory.keys.json" \
+    -m deployCompany \
+    "{\"name\":\"Rounds Inc\",\"description\":\"model-B company\",\"website\":\"\",\"metadataUri\":\"\",\
+      \"founder\":\"$(legacy "$HOLDER")\",\"founderPubkey\":\"0x$B_FOUNDER_PUB\",\"issuanceModel\":1,\
+      \"plans\":[{\"count\":50,\"weight\":1000,\"label\":\"Genesis\",\"issued\":false},\
+                {\"count\":25,\"weight\":2000,\"label\":\"Round 1\",\"issued\":false},\
+                {\"count\":25,\"weight\":4000,\"label\":\"Round 2\",\"issued\":false}],\
+      \"initialValue\":20000000000}" >/dev/null || true
+  wait_active "$COMPANY_B" "rounds company"
+fi
+run_info_b() { cli run "$COMPANY_B" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    issuedCount=%s totalWeight=%s model=%s"%(d["issuedCount"],d["totalWeight"],d["issuanceModel"]))'; }
+issue_round() { # issue_round <keys-file> — founder = holder, so sign with holder key
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$1" -m issue '{}' >/dev/null 2>&1 || true
+  sleep 3
+}
+echo "  issuing genesis..."
+issue_round "$WORK/holder.keys.json" && run_info_b
+echo "  issuing round 1..."
+issue_round "$WORK/holder.keys.json" && run_info_b
+echo "  issuing round 2..."
+issue_round "$WORK/holder.keys.json" && run_info_b
+echo "  extra issue (expect supply-exceeded rejection):"
+cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$WORK/holder.keys.json" -m issue '{}'
+cli run "$COMPANY_B" getPlans {} --abi "$CT/CompanySIIR.abi.json"
+
 echo ""
-echo "== done. factory: $FACTORY  company: $COMPANY =="
+echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B =="

@@ -319,6 +319,14 @@ factory) were simply abandoned — shellnet accounts are effectively free to
 leave behind; the script keys off `acc_type: Active` + code-hash comparisons,
 so it never reuses a broken deployment.
 
+### 6.18 Factory runs out of VMSHELL after deploying one company
+Second `deployCompany` (the Model-B company) silently never appeared: the
+factory had been funded only once and its balance had been drained by company
+A's `initialValue` (`new CompanySIIR{..., value: initialValue}` is paid **from
+the factory's VMSHELL**). The call exited 0; only the account query showed
+"Not found". **Fix:** check the factory VMSHELL balance before each company
+deploy and refill (`fund`) when below the reserve threshold.
+
 ---
 
 ## 7. Why these components exist (map of responsibilities)
@@ -340,8 +348,12 @@ so it never reuses a broken deployment.
 
 **Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
 (`SIIRFactory`, `CompanySIIR`), `Makefile`, `scripts/deploy.sh`, docs
-(`giver3.md`, `wallet.md`, `project.md`), full dividend-paying lifecycle.
+(`giver3.md`, `wallet.md`, `project.md`, `usage.md`), full dividend-paying
+lifecycle **and the Model-B (rounds) issuance path**:
+Genesis → Round 1 → Round 2 (50/1000 → 75/200000 → 100/200000 issued and
+weighted), and a 4th `issue()` correctly reverts with `ERR_SUPPLY_EXCEEDED`
+(exit 105).
 
-**Next:** commit milestone; test `MODEL_ROUNDS` issuance; explorer/API tooling;
+**Next:** commit milestone; explorer/API tooling;
 wallet integration (claim button, deed view); TIP-3/eccUSDC payout module;
 governance & dissolution safeguards; marketplace hooks.
