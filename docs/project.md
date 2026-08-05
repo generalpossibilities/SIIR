@@ -387,13 +387,13 @@ Two silent comparison bugs in the charter verification:
 
 **Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
 (`SIIRFactory`, `CompanySIIR`), `Makefile`, `scripts/deploy.sh`, docs
-(`giver3.md`, `wallet.md`, `project.md`, `usage.md`), full dividend-paying
-lifecycle, the Model-B (rounds) issuance path, and on-chain company content:
-logo + deed image + UI bundle (base64 data URIs, size-capped, byte-exact
-round-trips) and the **founder's charter** (immutable text, founder-key
-ratification, stable fingerprint).
+(`giver3.md`, `wallet.md`, `project.md`, `usage.md`, `gateway.md`), full
+dividend-paying lifecycle, the Model-B (rounds) issuance path, and on-chain
+company content: logo + deed image + UI bundle (base64 data URIs,
+size-capped, byte-exact round-trips) and the **founder's charter**
+(immutable text, founder-key ratification, stable fingerprint) — all
+servable through the on-chain content gateway (`scripts/gateway.py`).
 
-**Next:** explorer/API tooling;
-wallet integration (claim button, deed view); serving the on-chain UI bundle
-plus images through a gateway; TIP-3/eccUSDC payout module;
+**Next:** wallet integration (claim button, deed view);
+TIP-3/eccUSDC payout module;
 governance & dissolution safeguards; marketplace hooks.

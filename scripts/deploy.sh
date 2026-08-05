@@ -356,3 +356,6 @@ fi
 
 echo ""
 echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B =="
+# register companies for the content gateway (scripts/gateway.py)
+echo "{\"companies\":[{\"address\":\"$COMPANY\",\"tag\":\"model-a\"},{\"address\":\"$COMPANY_B\",\"tag\":\"rounds\"}]}" > "$WORK/companies.json"
+echo "  gateway index -> $WORK/companies.json"
