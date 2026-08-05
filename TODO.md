@@ -5,20 +5,7 @@ Backlog for the SIIR demo project. Checked items are done and committed
 
 ## Open
 
-### 1. Wallet integration: claim button + deed view (DONE — ffdb9fg... )
-- Claim button on the holder page: builds the `claimDividends(ids)` message,
-  signs it with the wallet client, sends to the network, and shows the result.
-- Deed view: render the SIIR deed (logo + weighted voting + dividend info)
-  from chain data.
-- See `docs/wallet.md` and `docs/usage.md` for the wallet setup already in
-  place.
-- Status: `GET/POST /company/<addr>/claim` (signs with
-  `scripts/.work/holder.keys.json`, polls until settled), printable deed card
-  at `/company/<addr>/siir/<id>/deed`, buttons on holder/SIIR pages — all
-  live-tested on shellnet (deposit → gateway claim → settled; error paths
-  for nothing-claimable and not-owned).
-
-### 2. Gateway hardening: mirror-node client without tvm-cli (parked)
+### 1. Gateway hardening: mirror-node client without tvm-cli (parked)
 Replace the per-getter `tvm-cli run` spawns in `scripts/gateway.py` with a
 fast in-process client. State of the work in `scripts/mirror.py`:
 
@@ -46,15 +33,19 @@ fast in-process client. State of the work in `scripts/mirror.py`:
   results keyed by the account `data_hash` (cheap GraphQL field), re-running
   only when state changes.
 
-### 3. Governance & dissolution safeguards
+### 2. Governance & dissolution safeguards
 - Grant/revoke flows, quorum enforcement, `dissolveCompany` path, owner-side
   guarantees (see `contracts/CompanySIIR.sol`).
 
-### 4. Marketplace hooks
+### 3. Marketplace hooks
 - Listing, offers, and settlement primitives on top of `transfer` +
   `claimDividends`.
 
 ## Done
+- `941f119` Wallet integration in gateway: `GET/POST /claim` (signs with
+  `scripts/.work/holder.keys.json`, polls until settled) + printable deed card
+  at `/siir/<id>/deed`; live-tested on shellnet incl. error paths. This task
+  created this TODO file.
 - `ffdb9fd` Explorer on the gateway: register, holders, plans, treasury,
   history, search.
 - `0fd1654` Currency-agnostic dividends (NACKL+SHELL+USDC in one claim).
