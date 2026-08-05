@@ -26,6 +26,9 @@ HTTP face, so the gateway translates getter calls into web responses:
 | `GET /company/<addr>/holders.json` | holders aggregated from the register (`{owner: {count, weight}}`); full scan, so large registers are capped by a time budget (`truncated`) |
 | `GET /company/<addr>/holder/<owner>` | holder page (SIIRs + balance + claimable). Accepts `64-hex`, `0:64-hex`, or `dapp_id::account_id`; the same data is on `.../holder.json/<owner>` |
 | `GET /company/<addr>/siir/<id>` | SIIR page (weight, owner, round, label, metadata, fingerprint, claimable, transfer history); same data on `.../siir.json/<id>` |
+| `GET /company/<addr>/siir/<id>/deed` | printable deed card: company + logo, holder, weight, claimable, fingerprint, provenance |
+| `GET /company/<addr>/claim` | claim form for the gateway's wallet (the SIIRs it owns, with pending amounts) |
+| `POST /company/<addr>/claim` | sends `claim(ids)` signed by the gateway wallet (JSON body `{"ids":["1"]}` or a form `ids=1&ids=2`; JSON reply when `Accept: application/json`) |
 | `GET /company/<addr>/plans` | `getPlans` as JSON |
 | `GET /company/<addr>/treasury` | `getDividendCurrencies` as JSON |
 | `GET /company/<addr>/history/<id>` | `getHistory` entries as JSON |
@@ -36,7 +39,13 @@ HTTP face, so the gateway translates getter calls into web responses:
 ```bash
 python3 scripts/gateway.py --port 8000            # shellnet by default
 python3 scripts/gateway.py --port 8000 --net <other-net> --debug
+python3 scripts/gateway.py --port 8000 --multisig-abi <path-to-UpdateCustodianMultisigWallet.abi.json>
 ```
+
+`/claim` signs with `scripts/.work/holder.keys.json` (the wallet deployed by
+`scripts/deploy.sh`); the keys never leave the server. Without the multisig
+ABI (auto-located in `contracts/0.79.3_compiled/...` or the acki-research
+checkout) or without the holder keys, the claim form explains what is missing.
 
 Then open `http://127.0.0.1:8000/`.
 
@@ -57,8 +66,9 @@ Then open `http://127.0.0.1:8000/`.
 
 - Read-only and localhost-bound by default; production would put a real
   mirror-node client or GraphQL behind it.
-- The gateway is not a wallet: transfers, deposits and claims are still
-  signed transactions (see `usage.md`).
+- The gateway is a wallet **only for its own holder account** (`/claim`):
+  every other operation stays read-only. Other holders still claim by signing
+  their own wallet (see `usage.md`).
 - Any tvm-cli networking quirk (e.g. message-delivery races) is invisible
   here — getters are local emulation against the mirror node.
 - Reading a whole register is expensive: each SIIR needs its own getter, so

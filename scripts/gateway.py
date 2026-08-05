@@ -18,11 +18,15 @@ tvm-cli getters) and serves:
   GET /company/<addr>/holders.json        holders aggregated from the register
   GET /company/<addr>/holder/<owner>      holder page (also /holder.json/<owner>)
   GET /company/<addr>/siir/<id>           SIIR page (also /siir.json/<id>)
+  GET /company/<addr>/siir/<id>/deed      printable deed card
+  GET /company/<addr>/claim               claim form for the gateway's wallet
+  POST /company/<addr>/claim              send claim() via the wallet (JSON body {"ids":[...]} or form)
   GET /company/<addr>/plans, /treasury, /history/<id>   JSON
   GET /company/<addr>/search?q=...        address -> holder page; else label/metadata/owner scan
 
 Everything served here is stored on-chain; nothing is cached by us for
-longer than a few seconds.
+longer than a few seconds. Claim signs with scripts/.work/holder.keys.json
+(the gateway's own wallet) and never exposes keys.
 
 Usage:  python3 scripts/gateway.py [--port 8000] [--net shellnet.ackinacki.org]
 Requires: tvm-cli on PATH and the repo's contracts/ for ABIs.
@@ -274,12 +278,237 @@ def claimable_pairs(pairs):
     return [f"ecc:{escape(str(c))} = {escape(str(a))}" for c, a in pairs]
 
 
+# ---------- wallet (claim) ----------
+
+MULTISIG_ABI_PATHS = [
+    os.path.join(ROOT, "contracts", "0.79.3_compiled",
+                 "updatecustodianmultisigwallet",
+                 "UpdateCustodianMultisigWallet.abi.json"),
+    os.path.join("/tmp/opencode/acki-research/ackinacki", "contracts",
+                 "0.79.3_compiled", "updatecustodianmultisigwallet",
+                 "UpdateCustodianMultisigWallet.abi.json"),
+]
+WALLET_KEYS = os.path.join(WORK, "holder.keys.json")
+WALLET_ADDR = os.path.join(WORK, "holder.addr")
+WALLET_ABI = None
+
+
+def wallet_abi():
+    return WALLET_ABI
+
+
+def gateway_wallet():
+    """(legacy 0:hex, keys path) for the gateway's own wallet, or None."""
+    if not (os.path.exists(WALLET_KEYS) and os.path.exists(WALLET_ADDR)):
+        return None
+    try:
+        addr = open(WALLET_ADDR).read().strip()
+    except OSError:
+        return None
+    if not addr:
+        return None
+    if not addr.startswith("0:"):
+        addr = "0:" + addr
+    return addr, WALLET_KEYS
+
+
+def wallet_ext(legacy):
+    """extended <dapp>::<acct> for a self-rooted legacy address."""
+    h = legacy.split(":")[-1]
+    return f"{h}::{h}"
+
+
+def wallet_owns(addr, wallet, ids):
+    owned = []
+    for i in ids:
+        s = run_getter(addr, "getSIIR", '{"id":%d}' % i) or {}
+        if s.get("owner") == wallet:
+            owned.append(i)
+    return owned
+
+
+def pending_for(addr, ids):
+    total = 0
+    for i in ids:
+        cl = run_getter(addr, "getClaimable", '{"id":%d}' % i) or {}
+        total += sum(as_int(a) for a in cl.get("amounts", []))
+    return total
+
+
+def do_claim(addr, ids):
+    """Sign and send claim(ids) from the gateway's wallet; poll until settled."""
+    w = gateway_wallet()
+    abi = wallet_abi()
+    if w is None:
+        return {"error": "gateway wallet not configured (scripts/.work/holder.keys.json)"}
+    if abi is None:
+        return {"error": "multisig ABI not found (see --multisig-abi)"}
+    wallet, keys = w
+    ids = sorted({int(i) for i in ids if str(i).lstrip("-").isdigit() and int(i) > 0})
+    if not ids:
+        return {"error": "no ids given"}
+    owned = wallet_owns(addr, wallet, ids)
+    not_owned = [i for i in ids if i not in owned]
+    if not_owned:
+        return {"error": f"not owned by gateway wallet: {not_owned}"}
+    pending = pending_for(addr, ids)
+    if pending <= 0:
+        return {"error": "nothing claimable yet (deposit dividends first)",
+                "ids": ids}
+    company_legacy = "0:" + addr.split("::")[1]
+    body = tvm_cli("body", "--abi", COMPANY_ABI, "claim",
+                   json.dumps({"ids": [str(i) for i in ids]}))
+    try:
+        payload = json.loads(body.stdout)["Message"]
+    except (json.JSONDecodeError, KeyError):
+        return {"error": f"failed to build claim body: {body.stdout[:200]}"}
+    params = json.dumps({
+        "dest": company_legacy, "value": "1000000000", "cc": {},
+        "bounce": True, "flags": 1, "payload": payload,
+    })
+    out = tvm_cli("callx", "--abi", abi, "--addr", wallet_ext(wallet),
+                  "--keys", keys, "-m", "sendTransaction", params)
+    if out.returncode != 0:
+        return {"error": f"sendTransaction failed: {out.stderr[:300]}"}
+    try:
+        txid = (json.loads(out.stdout).get("Transaction") or {}).get("id", "")
+    except json.JSONDecodeError:
+        txid = ""
+    remaining = pending
+    settled_at = None
+    for _ in range(15):
+        time.sleep(2)
+        remaining = pending_for(addr, ids)
+        if remaining == 0:
+            settled_at = time.time()
+            break
+    return {"ids": ids, "pending": pending, "txid": txid,
+            "settled": remaining == 0, "remaining": remaining,
+            "settledAt": settled_at}
+
+
+def claim_form_page(addr):
+    w = gateway_wallet()
+    if w is None:
+        return f"""<!doctype html><html><body><p>Gateway wallet not configured —
+        scripts/.work/holder.keys.json missing. Run scripts/deploy.sh first.</p>
+        <p><a href="/company/{addr}/">company</a></p></body></html>"""
+    wallet, _ = w
+    out = run_getter(addr, "getSIIRsOf", '{"owner":"%s"}' % wallet) or {}
+    ids = sorted(int(i, 16) for i in out.get("ids", []))
+    rows = ""
+    for i in ids:
+        cl = run_getter(addr, "getClaimable", '{"id":%d}' % i) or {}
+        pairs = list(zip(cl.get("currencies", []), cl.get("amounts", [])))
+        total = sum(as_int(a) for _, a in pairs)
+        if total > 0:
+            rows += (f'<tr><td><input type="checkbox" name="ids" value="{i}" checked></td>'
+                     f'<td><a href="/company/{addr}/siir/{i}">#{i}</a></td>'
+                     f'<td>{escape(str(total))}</td>'
+                     f'<td>{" ".join(claimable_pairs(pairs)) or "—"}</td></tr>')
+    if not rows:
+        rows = '<tr><td colspan=4>nothing claimable</td></tr>'
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>claim — SIIR</title>
+<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
+table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}}
+a{{color:#1d4ed8}}</style></head><body>
+<h1>Claim dividends</h1>
+<p>wallet: <code>{escape(wallet)}</code> · signing with the gateway's key (never leaves the server)</p>
+<form method="post" action="/company/{addr}/claim">
+<table><tr><th></th><th>id</th><th>pending</th><th>claimable</th></tr>
+{rows}
+</table>
+<p><button type="submit">claim selected</button></p>
+</form>
+<p><a href="/company/{addr}/explore">explore</a> · <a href="/company/{addr}/">company</a></p>
+</body></html>"""
+
+
+def claim_result_page(addr, r):
+    if "error" in r:
+        msg = f"<p class='err'>{escape(r['error'])}</p>"
+    else:
+        msg = (f"<p class='ok'>claim sent and settled ✓</p>" if r.get("settled")
+               else f"<p class='warn'>claim sent but still pending "
+                    f"({r.get('remaining')} left)</p>")
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>claim result</title>
+<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
+.ok{{color:#15803d}} .err{{color:#b91c1c}} .warn{{color:#b45309}}
+a{{color:#1d4ed8}}</style></head><body>
+<h1>Claim result</h1>
+{msg}
+<table>
+<tr><th>ids</th><td>{escape(str(r.get('ids','')))}</td></tr>
+<tr><th>pending</th><td>{escape(str(r.get('pending','')))}</td></tr>
+<tr><th>txid</th><td><code>{escape(str(r.get('txid','')))}</code></td></tr>
+<tr><th>remaining</th><td>{escape(str(r.get('remaining','')))}</td></tr>
+</table>
+<p><a href="/company/{addr}/holder/{str(r.get('ids','')).split(',')[0].strip('[]') if r.get('ids') else ''}">holder</a> ·
+<a href="/company/{addr}/claim">claim again</a> · <a href="/company/{addr}/">company</a></p>
+</body></html>"""
+
+
+def deed_page(addr, id_s):
+    d = siir_data(addr, id_s)
+    if "error" in d:
+        return f"<!doctype html><html><body><p>{escape(d['error'])}</p></body></html>"
+    info = run_getter(addr, "getCompanyInfo") or {}
+    name = info.get("name", addr)
+    owner = d.get("owner", "")
+    owner_link = owner.split(":")[-1]
+    hist = "".join(
+        f"<tr><td>{escape(h.get('from',''))}</td><td>{escape(h.get('to',''))}</td>"
+        f"<td>{escape(str(h.get('timestamp','')))}</td></tr>"
+        for h in d.get("history", [])
+    )
+    claim = " ".join(claimable_pairs(d["claimable"])) or "—"
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>deed #{d['id']} — {escape(name)}</title>
+<style>
+ body{{font-family:ui-serif,Georgia,serif;max-width:560px;margin:32px auto;padding:0 16px;color:#111;background:#fafaf9}}
+ .deed{{border:2px solid #111;border-radius:16px;padding:28px;background:#fff;box-shadow:0 8px 24px rgba(0,0,0,.12)}}
+ .head{{display:flex;align-items:center;gap:14px;border-bottom:2px solid #111;padding-bottom:14px}}
+ .head img{{height:56px;width:56px;border-radius:10px;object-fit:cover}}
+ .no{{font-family:ui-sans-serif,sans-serif;font-size:13px;color:#6b7280}}
+ .row{{display:flex;justify-content:space-between;gap:16px;padding:8px 0;border-bottom:1px dotted #ddd;font-size:14px}}
+ .row b{{font-weight:600}}
+ .row code{{font-size:12px;word-break:break-all}}
+ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;text-align:left;font-size:12px}}
+ .print{{margin-top:16px}}
+</style></head><body>
+<div class="deed">
+ <div class="head">
+  <img src="/company/{addr}/logo" alt="logo" onerror="this.style.display='none'">
+  <div><h2 style="margin:0">{escape(name)}</h2>
+  <div class="no">SIIR # {d['id']} · {escape(str(d.get('label','')))} · {escape(str(d.get('weight','')))} weight</div></div>
+ </div>
+ <div class="row"><b>holder</b><code>{escape(str(owner))}</code></div>
+ <div class="row"><b>round</b><span>{escape(str(d.get('round','')))}</span></div>
+ <div class="row"><b>created</b><span>{escape(str(d.get('createdAt','')))}</span></div>
+ <div class="row"><b>claimable</b><span>{claim}</span></div>
+ <div class="row"><b>fingerprint</b><code>{escape(str(d.get('fingerprint','')))}</code></div>
+ <div class="row"><b>metadata</b><code>{escape(str(d.get('metadataUri','')))}</code></div>
+ <h3 style="margin:18px 0 6px">Provenance</h3>
+ <table><tr><th>from</th><th>to</th><th>timestamp</th></tr>
+ {hist or '<tr><td colspan=3>—</td></tr>'}</table>
+</div>
+<div class="print"><img src="/company/{addr}/deed" alt="deed image" style="max-width:100%;border-radius:12px" onerror="this.style.display='none'"></div>
+<p><a href="/company/{addr}/siir/{d['id']}">SIIR page</a> · <a href="/company/{addr}/holder/{owner_link}">holder</a> ·
+<a href="/company/{addr}/">company</a></p>
+</body></html>"""
+
+
 def siir_page(addr, id_s):
     d = siir_data(addr, id_s)
     if "error" in d:
         return f"<!doctype html><html><body><p>{escape(d['error'])}</p></body></html>"
     owner = d.get("owner", "")
     owner_link = owner.split(":")[-1]
+    w = gateway_wallet()
+    mine = bool(w and owner == w[0])
+    claim_btn = (
+        f'<p><a href="/company/{addr}/claim"><button>claim dividends</button></a></p>'
+        if mine else ""
+    )
     hist = "".join(
         f"<tr><td>{escape(h.get('from',''))}</td><td>{escape(h.get('to',''))}</td>"
         f"<td>{escape(str(h.get('timestamp','')))}</td></tr>"
@@ -291,7 +520,9 @@ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding
 pre{{background:#f6f6f6;padding:8px;border-radius:8px;white-space:pre-wrap;word-break:break-all}}
 a{{color:#1d4ed8}}</style></head><body>
 <h1>SIIR #{d['id']}</h1>
-<p><a href="/company/{addr}/">company</a> · <a href="/company/{addr}/explore">explore</a></p>
+<p><a href="/company/{addr}/">company</a> · <a href="/company/{addr}/explore">explore</a> ·
+<a href="/company/{addr}/siir/{d['id']}/deed">deed card</a></p>
+{claim_btn}
 <table>
 <tr><th>weight</th><td>{escape(str(d.get('weight','')))}</td></tr>
 <tr><th>owner</th><td><a href="/company/{addr}/holder/{owner_link}"><code>{escape(str(owner))}</code></a></td></tr>
@@ -321,6 +552,11 @@ def holder_page(addr, owner_raw):
         for r in d["siirs"]
     )
     claim = ' '.join(claimable_pairs(d["claimable"])) or "—"
+    w = gateway_wallet()
+    claim_btn = (
+        f'<p><a href="/company/{addr}/claim"><button>claim dividends</button></a></p>'
+        if w and owner == w[0] else ""
+    )
     body = f"""<!doctype html><html><head><meta charset="utf-8"><title>holder {owner}</title>
 <style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
 table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}}
@@ -328,6 +564,7 @@ a{{color:#1d4ed8}}</style></head><body>
 <h1>Holder</h1>
 <p><code>{escape(owner)}</code> · {escape(str(d['company']))}</p>
 <p>balance: <b>{escape(str(d['balance']))}</b> SIIRs · claimable: {claim}</p>
+{claim_btn}
 <table><tr><th>id</th><th>label</th><th>weight</th><th>round</th></tr>{rows or '<tr><td colspan=4>no SIIRs</td></tr>'}</table>
 <p><a href="/company/{addr}/">company</a> · <a href="/company/{addr}/explore">explore</a></p>
 </body></html>"""
@@ -525,6 +762,52 @@ class Handler(BaseHTTPRequestHandler):
 <p><small>everything rendered here is read from the contracts on-chain.</small></p></body></html>"""
         return self._send(html.encode(), "text/html; charset=utf-8")
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path).strip("/")
+        parts = path.split("/") if path else []
+        qs = parse_qs(parsed.query)
+        if parts[:1] == ["company"] and len(parts) >= 2:
+            addr = parts[1]
+            if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", addr):
+                return self._send(b"bad address (want dapp_id::account_id)",
+                                  "text/plain", 400)
+            if parts[2:] == ["claim"]:
+                return self.company_claim(addr, qs)
+        return self._send(b"not found", "text/plain", 404)
+
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        ctype = self.headers.get("Content-Type", "")
+        if not raw:
+            return {}
+        if "application/json" in ctype:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace")).items()}
+
+    def company_claim(self, addr, qs):
+        body = self._read_body()
+        if body is None:
+            return self._send(b"bad JSON body", "text/plain", 400)
+        ids = body.get("ids")
+        if isinstance(ids, str):
+            ids = ids.split(",")
+        if not ids:
+            ids = (qs.get("ids") or [""])[0].split(",")
+        ids = [i for i in ids if str(i).strip().isdigit()]
+        if not ids:
+            return self._send(b"no ids given (send {\"ids\":[\"1\",\"2\"]})",
+                              "text/plain", 400)
+        r = do_claim(addr, [int(i) for i in ids])
+        if "application/json" in (self.headers.get("Accept") or ""):
+            return self._send(json.dumps(r).encode(), "application/json")
+        return self._send(claim_result_page(addr, r).encode(),
+                          "text/html; charset=utf-8")
+
     def company_resource(self, addr, rest, qs):
         if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", addr):
             return self._send(b"bad address (want dapp_id::account_id)", "text/plain", 400)
@@ -583,7 +866,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(json.dumps(holder_data(addr, rest[1])).encode(),
                               "application/json")
         if what == "siir" and len(rest) > 1:
+            if len(rest) > 2 and rest[2] == "deed":
+                return self._send(deed_page(addr, rest[1]).encode(),
+                                  "text/html; charset=utf-8")
             return self._send(siir_page(addr, rest[1]).encode(),
+                              "text/html; charset=utf-8")
+        if what == "claim":
+            return self._send(claim_form_page(addr).encode(),
                               "text/html; charset=utf-8")
         if what == "siir.json" and len(rest) > 1:
             return self._send(json.dumps(siir_data(addr, rest[1])).encode(),
@@ -633,14 +922,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global NET, DEBUG
+    global NET, DEBUG, WALLET_ABI
     ap = argparse.ArgumentParser(description="SIIR on-chain content gateway")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--net", default="shellnet.ackinacki.org")
+    ap.add_argument("--multisig-abi",
+                    help="path to UpdateCustodianMultisigWallet.abi.json "
+                         "(defaults: repo/contracts/0.79.3_compiled/..., "
+                         "/tmp/opencode/acki-research/ackinacki/...)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     NET = args.net
     DEBUG = args.debug
+    if args.multisig_abi:
+        MULTISIG_ABI_PATHS.insert(0, args.multisig_abi)
+    WALLET_ABI = next((p for p in MULTISIG_ABI_PATHS if os.path.exists(p)), None)
+    if WALLET_ABI is None:
+        log("warning: multisig ABI not found; /claim will be disabled")
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     log(f"listening on http://127.0.0.1:{args.port}  (net={NET})")
     try:
