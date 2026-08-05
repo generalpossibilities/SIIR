@@ -15,3 +15,13 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Contract build artifacts
+contracts/*.tvc
+contracts/*.abi.json
+contracts/*.code
+contracts/*.debug.json
+
+# Demo runtime state (keys/addresses must never be committed)
+scripts/.work/
+scripts/*.addr

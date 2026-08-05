@@ -199,6 +199,10 @@ Protocol rule — pending dividends belong to the SIIR, not the holder:
   SIIR with unclaimed value. The owner can claim at any time.
 - No record-date snapshot, no per-holder accounting, no settlement on
   transfer. Only the SIIR's checkpoint ever changes.
+- Dividends are paid in SHELL (ecc currency id 2), which transfers
+  across Dapp IDs — so contributors and holders are never bound by the
+  app boundary VMSHELL imposes. Swap to a TIP-3 ecc token (e.g.
+  eccUSDC) later is a payout-module change, not an accounting change.
 
 ## Transfer
 
@@ -279,6 +283,40 @@ Ownership history - Fingerprint - Treasury - Dividend claims - Wallet
 integration (claim button, deed view) - Explorer - Governance -
 Dissolution - Marketplace - SDK - Indexer - Migration tooling -
 Documentation
+
+## Live Implementation (Shellnet)
+
+The core is built and running on Acki Nacki shellnet
+(`shellnet.ackinacki.org`); `scripts/deploy.sh` runs the full lifecycle
+end to end in one pass:
+
+1. Deploy `SIIRFactory` (self-rooted dapp; stores the `CompanySIIR` code
+   cell, generated via `tvm-cli decode stateinit`).
+2. Deploy the founder wallet (precompiled multisig, self-rooted).
+3. `deployCompany` → `CompanySIIR` in the factory's dapp.
+4. `issue()` mints the declared plan (verified: 100 SIIRs, totalWeight
+   100000).
+5. `transfer(ids, newOwner)` moves ownership wallet-to-wallet and writes a
+   `HistoryEntry`.
+6. `depositDividends()` credits SHELL from any dapp; the dividend index
+   rises by `amount * SCALE / totalWeight`.
+7. `claim(ids)` pays the holder SHELL exactly `weight * index / SCALE`
+   (verified: 0.1 SHELL per 1000-weight SIIR on a 10 SHELL deposit).
+
+Verified on-chain mechanics learned while building:
+
+- Externally-deployed (self-rooted) contracts live at `<own>::<own>`;
+  children inherit the parent's dapp id (`<factory>::<company>`).
+- `tvm-cli genaddr --setkey --save` bakes the pubkey into the tvc;
+  deploy must pass `--dst-dapp-id <own>` and the key-baked tvc.
+- ABI address params use legacy `0:hex`; CLI `--addr`/`account` use the
+  extended `dapp::acct` form.
+- External messages arrive with `msg.sender` = an `addr_extern`, so
+  founder auth keys off `msg.pubkey()` (see `_isFounder`).
+- SHELL (ecc) is message-attached: read via `msg.currencies[2]`, send via
+  `dest.transfer({currencies: {2: x}})`; it crosses dapps, VMSHELL does not.
+- Wallet contracts holding/trading SHELL need SHELL credited to their ecc
+  balance (giver `sendCurrency`, no flag 16); VMSHELL gas is separate.
 
 ## Guiding Principle
 
