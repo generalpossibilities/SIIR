@@ -144,28 +144,38 @@ CompanySIIR.transfer(ids: [1, 3], newOwner: 0:e313c6…)
 
 ### 5.2 Deposit dividends (anyone)
 
-Any wallet from **any dapp** can drop SHELL dividends into the register:
+Any wallet from **any dapp** can drop dividends into the register — in
+**SHELL** (ecc currency 2), in **eccUSDC** (ecc currency 3), or both in
+one message:
 
 ```
-depositDividends()   — attach SHELL as currency {2: <amount>} in the message
+depositDividends()   — attach SHELL as currency {2: <amount>} and/or
+                       eccUSDC as currency {3: <amount>} in the message
 ```
 
-- The register raises the global **dividend index** by
-  `amount ÷ totalWeight`. No fund-raising, no whitelist.
-- Deposits are tracked: `DividendDeposited(depositor, amount, dividendIndex)`.
+- The two payout tracks are independent: each raises its own **dividend
+  index** by `amount ÷ totalWeight`. No fund-raising, no whitelist.
+- Deposits are tracked per track:
+  `DividendDeposited(depositor, currency, amount, dividendIndex)`.
+- The sending wallet must actually hold the currency it attaches — a
+  wallet that tries to send more SHELL/USDC than it owns bounces its own
+  transfer before it leaves.
 
 ### 5.3 Claim dividends (holders)
 
-The owner of a SIIR claims its pending payout:
+The owner of a SIIR claims its pending payout — **both tracks settle in
+the one claim**:
 
 ```
 claim(ids: [1, 3])
 ```
 
-- Payout for each SIIR = `weight × (index − checkpoint) ÷ SCALE`; the
-  checkpoint then moves up so you never double-claim.
-- Payment is **SHELL** and arrives at the claiming wallet **immediately**.
-- Anyone can see what a deed is owed at any moment: `getClaimable(id)`.
+- Payout per SIIR per track = `weight × (index − checkpoint) ÷ SCALE`;
+  the checkpoints then move up so you never double-claim.
+- Payment is SHELL **and** eccUSDC, and arrives at the claiming wallet
+  **immediately**.
+- Anyone can see what a deed is owed at any moment:
+  `getClaimable(id)` → `(shell, usdc)`.
 
 ---
 
@@ -179,7 +189,7 @@ After any step you can verify on-chain with the getters — no trust needed:
 ✅ getSIIRsOf(wallet) -> exactly the deeds that wallet owns
 ✅ getFingerprint(id) -> stable identity hash (weight, createdAt, round, label, uri)
 ✅ getHistory(id)     -> every transfer, oldest → newest
-✅ getClaimable(id)   -> exact SHELL owed right now
+✅ getClaimable(id)   -> exact SHELL + eccUSDC owed right now
 ✅ getCompanyImage()  -> on-chain company logo
 ✅ getSIIRImage()     -> on-chain deed card image
 ✅ getCharter()       -> the founder's immutable commitments + ratified flag
@@ -209,7 +219,8 @@ commitments, promises to investors).
 > charter honest.
 
 A sensible charter covers: no silent minting; dividends belong to the
-SIIR and are paid in SHELL; transfers are recorded forever; founder
+SIIR and are paid in SHELL and/or eccUSDC per the declared payout policy;
+transfers are recorded forever; founder
 obligations and deadlines; commitment not to alter dividend accounting.
 
 ---

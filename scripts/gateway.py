@@ -149,7 +149,9 @@ def company_page(addr):
     issued: {info.get('issuedCount',0)} ·
     totalWeight: {info.get('totalWeight',0)} ·
     deposited: {escape((info or {}).get('deposited','0'))} SHELL ·
-    dividendIndex: {escape((info or {}).get('dividendIndex','0'))}</p>
+    deposited: {escape((info or {}).get('depositedUsdc','0'))} USDC ·
+    dividendIndex: {escape((info or {}).get('dividendIndex','0'))} ·
+    dividendIndexUsdc: {escape((info or {}).get('dividendIndexUsdc','0'))}</p>
 </div>
 <div class="card"><h3>Deed card</h3>
  <img src="/company/{addr}/deed" alt="deed" onerror="this.style.display='none'">

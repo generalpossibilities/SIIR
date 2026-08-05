@@ -189,8 +189,13 @@ cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
 
 # ---------- 5. issue genesis ----------
 echo "== 5. issue genesis =="
-ISSUED=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["issuedCount"])')
+ISSUED=""
+for attempt in $(seq 1 8); do
+  ISSUED=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("issuedCount","x"))' 2>/dev/null || echo x)
+  [ "$ISSUED" != "x" ] && break
+  sleep 2
+done
 if [ "$ISSUED" = "0" ]; then
   for attempt in $(seq 1 6); do
     cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m issue '{}' >/dev/null 2>&1 || true
@@ -235,26 +240,48 @@ else
   cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 fi
 
-# ---------- 8. deposit dividends (10 SHELL) ----------
-echo "== 8. deposit 10 SHELL dividends =="
-cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{\"2\":10000000000},\"bounce\":true,\"flags\":1,\
-    \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{}')\"}" >/dev/null || true
+# ---------- 8. deposit dividends (10 SHELL + 5,000 eccUSDC) ----------
+echo "== 8. deposit 10 SHELL + 5000 eccUSDC dividends =="
+# the founder wallet must actually hold both payout currencies to attach them
+FBAL=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("3",0))' 2>/dev/null || echo 0)
+FBAL2=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("2",0))' 2>/dev/null || echo 0)
+[ "${FBAL:-0}" -lt 5000000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
+  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"3\":5000000000000}}" >/dev/null || true
+[ "${FBAL2:-0}" -lt 20000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
+  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"2\":20000000000}}" >/dev/null || true
 sleep 3
+PRE_USDC=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("depositedUsdc","0"))' 2>/dev/null || echo 0)
+cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{\"2\":10000000000,\"3\":5000000000000},\"bounce\":true,\"flags\":1,\
+    \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{}')\"}" >/dev/null || true
+for attempt in $(seq 1 15); do
+  NOW_USDC=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("depositedUsdc","0"))' 2>/dev/null || echo 0)
+  [ "$NOW_USDC" != "$PRE_USDC" ] && break
+  sleep 2
+done
+[ "$NOW_USDC" = "$PRE_USDC" ] && { echo "  [fail] deposit never landed (pre=$PRE_USDC post=$NOW_USDC)"; exit 1; }
 cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
 cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 
 # ---------- 9. claim ----------
-echo "== 9. holder claims =="
+echo "== 9. holder claims (SHELL + eccUSDC in one transfer) =="
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
   "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/CompanySIIR.abi.json" claim '{"ids":["1"]}')\"}" >/dev/null || true
-sleep 3
+for attempt in $(seq 1 15); do
+  OUT=$(cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null || true)
+  SHELL_LEFT=$(echo "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("shell","x"))' 2>/dev/null || echo x)
+  USDC_LEFT=$(echo "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("usdc","x"))' 2>/dev/null || echo x)
+  [ "$SHELL_LEFT" = "0" ] && [ "$USDC_LEFT" = "0" ] && break
+  sleep 2
+done
 echo "  after claim:"
-cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
-cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
-cli run "$COMPANY" getHistory '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
-cli account "$HOLDER" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  holder ecc:", d.get("ecc_balance"), "vmshell:", d.get("balance"))'
+cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
+cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
+cli run "$COMPANY" getHistory '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
+cli account "$HOLDER" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  holder ecc:", d.get("ecc_balance"), "vmshell:", d.get("balance"))' || true
 
 # ---------- 10. MODEL_ROUNDS: second company, incremental rounds ----------
 echo "== 10. model-B company (rounds) =="
@@ -282,7 +309,7 @@ if ! cli account "$COMPANY_B" 2>/dev/null | grep -q '"Active"'; then
   wait_active "$COMPANY_B" "rounds company" 120
 fi
 run_info_b() { cli run "$COMPANY_B" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    issuedCount=%s totalWeight=%s model=%s"%(d["issuedCount"],d["totalWeight"],d["issuanceModel"]))'; }
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    issuedCount=%s totalWeight=%s model=%s"%(d.get("issuedCount","?"),d.get("totalWeight","?"),d.get("issuanceModel","?")))'; }
 b_count() { cli run "$COMPANY_B" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("issuedCount","0"))' 2>/dev/null || echo 0; }
 issue_until() { # issue_until <keys-file> <target-count> — founder = holder
@@ -349,7 +376,7 @@ if [ "$R_RAT" != "true" ]; then
   [ "$FP" = "$FP2" ] && echo "  [ok] charter fingerprint stable ($FP)" || echo "  [fail] fingerprint changed!"
   echo "  second ratification (expect ERR_ALREADY_RATIFIED exit 112):"
   cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m ratifyCharter '{}' 2>&1 \
-    | python3 -c 'import json,sys,re; t=sys.stdin.read(); m=re.search(r"\"exit_code\":\s*(-?\d+)", t); print("  exit_code:", m.group(1) if m else ("none:", t[:160]))'
+    | python3 -c 'import json,sys,re; t=sys.stdin.read(); m=re.search(r"\"exit_code\":\s*(-?\d+)", t); print("  exit_code:", m.group(1) if m else ("none:", t[:160]))' || true
 else
   echo "  (already ratified on a previous run)"
 fi

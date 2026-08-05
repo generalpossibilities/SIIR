@@ -366,6 +366,35 @@ Two silent comparison bugs in the charter verification:
   correct data. **Fix:** compare against
   `python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "$CHARTER"`.
 
+### 6.23 eccUSDC (ecc currency 3) — verified on shellnet
+The giver's ecc map `{1: NACKL, 2: SHELL, 3: eccUSDC}` is real: GiverV3
+`sendCurrency` with `"ecc":{"3":...}` lands as USDC in a wallet's ecc
+balance (`ecc_balance -> "3"`). The company's treasury accepts it in
+`depositDividends()` next to SHELL — each currency tracks its own index
+and per-SIIR checkpoint, and `claim()` returns both in one transfer.
+
+### 6.24 A wallet bounces a send it can't cover — top up the sender
+The founder wallet creazily "deposited" 10 SHELL + 5000 USDC into the
+company and it never landed, with no error. Cause: the wallet had spent
+its SHELL on an earlier demo run and held only 9 SHELL — `sendTransaction`
+with `cc: {2: 1e10, 3: 5e12}` bounces at the **wallet**, before reaching
+the company. **Fix:** top up the *sender's* ecc balances (giver
+`sendCurrency`, both currencies) before the deposit; check
+`ecc_balance.{2,.3}` rather than assuming.
+
+### 6.25 `tvm-cli` exits non-zero on an expected rejection — kill `pipefail`
+Under `set -euo pipefail`, the charter's "second ratification (expect
+exit 112)" check aborted the whole run: `tvm-cli callx` exits non-zero on
+an aborted message and pipefail propagates it. **Fix:** `|| true` at the
+end of any call whose non-zero exit is the *expected* result.
+
+### 6.26 Mirror-node reads flake — poll, don't trust single reads
+`tvm-cli run` intermittently returns `Resource not found` /
+`Invalid dapp_id` on freshly-processed accounts. `set -e` turned one bad
+read into a run abort. **Fix:** retry-tolerant pollers (`for attempt...;
+sleep 2`) around every account read that must succeed, parse with
+`.get(...)` defaults, and only `exit 1` after the whole retry window.
+
 ---
 
 ## 7. Why these components exist (map of responsibilities)
@@ -378,8 +407,9 @@ Two silent comparison bugs in the charter verification:
 | statics `_factory/_founder/_founderPubkey` | bake identity into the company address | address = promise of immutability; verifiable forever |
 | `SCALE=1e9` | fixed-point for the dividend index | non-integer per-SIIR claims (decimals = SHELL's) |
 | `getFingerprint` | `hash(weight, createdAt, round, label, metadataUri)` | auditable deed identity, never changes |
-| SHELL currency | dividend medium | cross-Dapp proof; drop-in separable from accounting |
+| SHELL + eccUSDC (ecc 2/3) | dividend media | two independent tracks — cross-Dapp proof; payout token is a parameter, not an accounting change |
 | `scripts/deploy.sh` | one-shot reproducible shellnet demo | proves the whole contract stack, replays anytime |
+| `scripts/gateway.py` | serves on-chain UI/images/charter over HTTP | browsers need URL-shaped reads; content stays on-chain |
 
 ---
 
@@ -388,12 +418,16 @@ Two silent comparison bugs in the charter verification:
 **Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
 (`SIIRFactory`, `CompanySIIR`), `Makefile`, `scripts/deploy.sh`, docs
 (`giver3.md`, `wallet.md`, `project.md`, `usage.md`, `gateway.md`), full
-dividend-paying lifecycle, the Model-B (rounds) issuance path, and on-chain
+dividend-paying lifecycle, the Model-B (rounds) issuance path, on-chain
 company content: logo + deed image + UI bundle (base64 data URIs,
-size-capped, byte-exact round-trips) and the **founder's charter**
-(immutable text, founder-key ratification, stable fingerprint) — all
-servable through the on-chain content gateway (`scripts/gateway.py`).
+size-capped, byte-exact round-trips), the **founder's charter**
+(immutable text, founder-key ratification, stable fingerprint), and the
+**dual-track treasury**: dividends paid in SHELL (ecc 2) *and* eccUSDC
+(ecc 3), each with its own index and per-SIIR checkpoint, both settled in
+one `claim()` — verified live with byte-exact amounts (a 1000-weight SIIR
+of 100000 total collects 0.1 SHELL per 10-SHELL deposit and 50 eccUSDC
+per 5000-eccUSDC deposit). All servable through the on-chain content
+gateway (`scripts/gateway.py`).
 
 **Next:** wallet integration (claim button, deed view);
-TIP-3/eccUSDC payout module;
 governance & dissolution safeguards; marketplace hooks.

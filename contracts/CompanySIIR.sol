@@ -22,13 +22,15 @@ pragma AbiHeader pubkey;
 
 contract CompanySIIR {
     // ---------- constants ----------
-    string constant version = "1.1.0";
+    string constant version = "1.2.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
 
-    // SHELL is ecc currency id 2 (the computation token, cross-DAPP transferable)
+    // SHELL is ecc currency id 2 (the computation token, cross-DAPP transferable).
+    // eccUSDC (TIP-3-style ecc id 3) is the second supported dividend currency.
     uint32 constant CURRENCY_SHELL = 2;
+    uint32 constant CURRENCY_USDC  = 3;
 
     // Gas kept on the company contract for its own operations
     uint128 constant GAS_RESERVE = 1 vmshell;
@@ -98,9 +100,15 @@ contract CompanySIIR {
     uint256 _nextId;
 
     // ---------- treasury / dividends ----------
-    uint128 _dividendIndex;     // accumulated value per weight unit, x SCALE
-    uint128 _totalWeight;       // sum of weights of all issued SIIRs
-    uint128 _deposited;         // total value ever deposited (nano SHELL)
+    // Two independent tracks, one per supported payout currency (SHELL and
+    // eccUSDC). Each has its own accumulated index and total deposited, and
+    // every SIIR carries a per-track checkpoint. A single deposit may credit
+    // either or both tracks; claim() pays out both in one transfer.
+    uint128 _dividendIndex;      // accumulated SHELL value per weight unit, x SCALE
+    uint128 _dividendIndexUsdc;  // accumulated eccUSDC value per weight unit, x SCALE
+    uint128 _totalWeight;        // sum of weights of all issued SIIRs
+    uint128 _deposited;          // total SHELL ever deposited
+    uint128 _depositedUsdc;      // total eccUSDC ever deposited
 
     struct TierPlan {
         uint128 count;          // SIIRs in this plan
@@ -112,7 +120,8 @@ contract CompanySIIR {
     struct SIIR {
         uint128 weight;
         address owner;
-        uint128 checkpoint;     // dividend index at last claim
+        uint128 checkpoint;     // SHELL dividend index at last claim
+        uint128 checkpointUsdc; // eccUSDC dividend index at last claim
         uint64 createdAt;
         uint32 round;           // plan/round index this SIIR came from
         string label;           // display tier label
@@ -133,8 +142,8 @@ contract CompanySIIR {
     event CompanyCreated(address factory, address founder, string name, uint8 issuanceModel);
     event SIIRMinted(uint256 id, uint32 round, address owner, uint128 weight, string label, string metadataUri);
     event SIIRTransferred(uint256 id, address from, address to, uint64 timestamp);
-    event DividendDeposited(address depositor, uint128 amount, uint128 dividendIndex);
-    event DividendClaimed(uint256 id, address holder, uint128 amount, uint128 dividendIndex);
+    event DividendDeposited(address depositor, uint32 currency, uint128 amount, uint128 dividendIndex);
+    event DividendClaimed(uint256 id, address holder, uint32 currency, uint128 amount, uint128 dividendIndex);
     event CharterRatified(uint256 founderPubkey, uint64 timestamp);
 
     // ---------- constructor ----------
@@ -252,40 +261,62 @@ contract CompanySIIR {
     }
 
     // ---------- treasury / dividends ----------
-    /// Anyone may deposit SHELL (ecc currency id 2). Unlike VMSHELL, SHELL
-    /// transfers across Dapp IDs, so contributors are never bound by app
-    /// boundaries. The dividend index rises by amount / totalWeight.
+    /// Anyone may deposit SHELL (ecc currency id 2) and/or eccUSDC (ecc
+    /// currency id 3). Unlike VMSHELL, these transfer across Dapp IDs, so
+    /// contributors are never bound by app boundaries. Each track has its own
+    /// index; the deposit is split by what the message actually carried.
     function depositDividends() public internalMsg {
-        uint128 amount = uint128(msg.currencies[CURRENCY_SHELL]);
-        require(amount > 0, ERR_NOTHING_DEPOSITED);
+        uint128 shell = uint128(msg.currencies[CURRENCY_SHELL]);
+        uint128 usdc  = uint128(msg.currencies[CURRENCY_USDC]);
+        require(shell > 0 || usdc > 0, ERR_NOTHING_DEPOSITED);
         require(_totalWeight > 0, ERR_BAD_ISSUANCE);
         tvm.accept();
-        _deposited += amount;
-        _dividendIndex += amount * SCALE / _totalWeight;
-        emit DividendDeposited(msg.sender, amount, _dividendIndex);
+        if (shell > 0) {
+            _deposited += shell;
+            _dividendIndex += shell * SCALE / _totalWeight;
+            emit DividendDeposited(msg.sender, CURRENCY_SHELL, shell, _dividendIndex);
+        }
+        if (usdc > 0) {
+            _depositedUsdc += usdc;
+            _dividendIndexUsdc += usdc * SCALE / _totalWeight;
+            emit DividendDeposited(msg.sender, CURRENCY_USDC, usdc, _dividendIndexUsdc);
+        }
     }
 
-    /// Claim pending dividends for owned SIIRs. Value is sent as SHELL to the
-    /// caller, so it reaches the wallet on any Dapp ID.
+    /// Claim pending dividends for owned SIIRs. Both tracks are settled in one
+    /// transfer: the caller receives its share of SHELL and of eccUSDC in the
+    /// same message, so funds arrive at the wallet on any Dapp ID.
     function claim(uint256[] ids) public internalMsg {
-        uint128 total = 0;
+        uint128 totalShell = 0;
+        uint128 totalUsdc  = 0;
         for (uint256 i = 0; i < ids.length; i++) {
             uint256 id = ids[i];
             require(_siirs.exists(id), ERR_NO_SIIR);
             require(_siirs[id].owner == msg.sender, ERR_NOT_OWNER);
             SIIR s = _siirs[id];
-            uint128 pending = s.weight * (_dividendIndex - s.checkpoint) / SCALE;
-            if (pending > 0) {
+            uint128 pendingShell = s.weight * (_dividendIndex - s.checkpoint) / SCALE;
+            if (pendingShell > 0) {
                 _siirs[id].checkpoint = _dividendIndex;
-                total += pending;
-                emit DividendClaimed(id, msg.sender, pending, _dividendIndex);
+                totalShell += pendingShell;
+                emit DividendClaimed(id, msg.sender, CURRENCY_SHELL, pendingShell, _dividendIndex);
+            }
+            uint128 pendingUsdc = s.weight * (_dividendIndexUsdc - s.checkpointUsdc) / SCALE;
+            if (pendingUsdc > 0) {
+                _siirs[id].checkpointUsdc = _dividendIndexUsdc;
+                totalUsdc += pendingUsdc;
+                emit DividendClaimed(id, msg.sender, CURRENCY_USDC, pendingUsdc, _dividendIndexUsdc);
             }
         }
-        require(total > 0, ERR_NO_CLAIM);
+        require(totalShell > 0 || totalUsdc > 0, ERR_NO_CLAIM);
         tvm.accept();
-        if (address(this).currencies[CURRENCY_SHELL] >= total) {
+        if (totalShell > 0 && address(this).currencies[CURRENCY_SHELL] >= totalShell) {
             mapping(uint32 => varuint32) c;
-            c[CURRENCY_SHELL] = total;
+            c[CURRENCY_SHELL] = totalShell;
+            msg.sender.transfer({value: varuint16(0), flag: 1, currencies: c});
+        }
+        if (totalUsdc > 0 && address(this).currencies[CURRENCY_USDC] >= totalUsdc) {
+            mapping(uint32 => varuint32) c;
+            c[CURRENCY_USDC] = totalUsdc;
             msg.sender.transfer({value: varuint16(0), flag: 1, currencies: c});
         }
     }
@@ -303,14 +334,16 @@ contract CompanySIIR {
         uint128 totalWeight,
         uint128 issuedCount,
         uint128 dividendIndex,
+        uint128 dividendIndexUsdc,
         uint128 deposited,
+        uint128 depositedUsdc,
         uint256 nextId
     ) {
         return (
             _name, _description, _website, _metadataUri,
             _factory, _founder, _founderPubkey,
             _issuanceModel, _totalWeight, _issuedCount,
-            _dividendIndex, _deposited, _nextId
+            _dividendIndex, _dividendIndexUsdc, _deposited, _depositedUsdc, _nextId
         );
     }
 
@@ -322,6 +355,7 @@ contract CompanySIIR {
         uint128 weight,
         address owner,
         uint128 checkpoint,
+        uint128 checkpointUsdc,
         uint64 createdAt,
         uint32 round,
         string label,
@@ -329,7 +363,7 @@ contract CompanySIIR {
     ) {
         require(_siirs.exists(id), ERR_NO_SIIR);
         SIIR s = _siirs[id];
-        return (s.weight, s.owner, s.checkpoint, s.createdAt, s.round, s.label, s.metadataUri);
+        return (s.weight, s.owner, s.checkpoint, s.checkpointUsdc, s.createdAt, s.round, s.label, s.metadataUri);
     }
 
     function getOwnerOf(uint256 id) external view returns (address) {
@@ -337,17 +371,19 @@ contract CompanySIIR {
         return _siirs[id].owner;
     }
 
-    function getClaimable(uint256 id) external view returns (uint128) {
+    function getClaimable(uint256 id) external view returns (uint128 shell, uint128 usdc) {
         require(_siirs.exists(id), ERR_NO_SIIR);
         SIIR s = _siirs[id];
-        return s.weight * (_dividendIndex - s.checkpoint) / SCALE;
+        shell = s.weight * (_dividendIndex - s.checkpoint) / SCALE;
+        usdc = s.weight * (_dividendIndexUsdc - s.checkpointUsdc) / SCALE;
     }
 
-    function getClaimableOf(address owner) external view returns (uint128 total) {
+    function getClaimableOf(address owner) external view returns (uint128 shell, uint128 usdc) {
         uint256[] ids = _idsOf(owner);
         for (uint256 i = 0; i < ids.length; i++) {
             SIIR s = _siirs[ids[i]];
-            total += s.weight * (_dividendIndex - s.checkpoint) / SCALE;
+            shell += s.weight * (_dividendIndex - s.checkpoint) / SCALE;
+            usdc += s.weight * (_dividendIndexUsdc - s.checkpointUsdc) / SCALE;
         }
     }
 
