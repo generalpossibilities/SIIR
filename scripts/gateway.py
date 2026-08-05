@@ -820,6 +820,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(b"missing address", "text/plain", 400)
             addr = parts[1]
             return self.company_resource(addr, parts[2:], qs)
+        if parts[0] == "static":
+            # static client-side explorer (static/index.html + core/app/fields.js)
+            rel = "/".join(parts[1:]) or "index.html"
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "static")
+            fp = os.path.normpath(os.path.join(base, rel))
+            if not fp.startswith(os.path.normpath(base)):
+                return self._send(b"forbidden", "text/plain", 403)
+            if not os.path.isfile(fp):
+                return self._send(b"not found", "text/plain", 404)
+            ctype = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "text/javascript",
+                ".css": "text/css",
+            }.get(os.path.splitext(fp)[1], "application/octet-stream")
+            with open(fp, "rb") as f:
+                return self._send(f.read(), ctype)
         return self._send(b"not found", "text/plain", 404)
 
     def index(self):

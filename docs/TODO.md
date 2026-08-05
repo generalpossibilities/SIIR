@@ -38,14 +38,20 @@ State of the work in `scripts/mirror.py`:
   `docs/gateway.md` with the mirror mode; commit.
 
 ### 2. Independence: zero paid server, zero tvm-cli
+- [x] **Static client-side explorer** (`static/`): plain JS port of the whole
+  mirror decode (`core.js` — BOC, dicts, cell breaks, cell_hash with
+  `crypto.subtle`, BigInt math) + single-page app (`index.html`, `app.js`).
+  Verified byte-identical to the Python client (17/17 parity checks) and
+  live against shellnet; renders company/register/holders/SIIR/holder pages
+  and fingerprints from **`file://` with no server process** (CORS is open
+  on the mirror). Served by the gateway at `/static/`.
 - [ ] Remove the tvm-cli dependency from `gateway.py` entirely (reads via
   mirror; the only tvm-cli uses left are wallet writes — see item 3).
-- [ ] Ship the explorer as a **static client-side app** (plain JS talking to
-  the public mirror node GraphQL + the chain directly) so the whole UI can be
-  hosted anywhere free (local machine, GitHub Pages, or already on-chain via
-  the content gateway). Python gateway becomes optional.
+- [ ] Ship the explorer to a free static host (GitHub Pages) and/or embed it
+  as the on-chain UI bundle via the content gateway.
 - [ ] Prove it from a clean machine with only a browser: register, holders,
-  plans, treasury, history, claims, deed all work with no server process.
+  plans, treasury, history, claims (amounts; signing is item 3), deed all
+  work with no server process.
 
 ### 3. Everything deployable from the UI
 Replace the CLI lifecycle (`scripts/deploy.sh`) with browser flows:
