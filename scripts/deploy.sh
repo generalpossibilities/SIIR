@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SIIR shellnet demo " full lifecycle:
-#   factory -> company -> issue -> holder -> transfer -> deposit (SHELL) -> claim
+#   factory -> company -> issue -> holder -> transfer -> deposit (any ecc currency) -> claim
 #
 # Requires: sold, tvm-cli (v3+, extended dapp_id::account_id addresses).
 #
@@ -241,42 +241,49 @@ else
 fi
 
 # ---------- 8. deposit dividends (10 SHELL + 5,000 eccUSDC) ----------
-echo "== 8. deposit 10 SHELL + 5000 eccUSDC dividends =="
-# the founder wallet must actually hold both payout currencies to attach them
+echo "== 8. deposit 10 SHELL + 5000 eccUSDC + 1 NACKL dividends =="
+# the founder wallet must actually hold every attached currency (ecc 2, 3, 1)
 FBAL=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("3",0))' 2>/dev/null || echo 0)
 FBAL2=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("2",0))' 2>/dev/null || echo 0)
+FBAL1=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("1",0))' 2>/dev/null || echo 0)
 [ "${FBAL:-0}" -lt 5000000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
   "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"3\":5000000000000}}" >/dev/null || true
 [ "${FBAL2:-0}" -lt 20000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
   "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"2\":20000000000}}" >/dev/null || true
+[ "${FBAL1:-0}" -lt 1000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
+  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"1\":1000000000}}" >/dev/null || true
 sleep 3
-PRE_USDC=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("depositedUsdc","0"))' 2>/dev/null || echo 0)
+div_dep() { cli run "$COMPANY" getDividendCurrencies {} --abi "$CT/CompanySIIR.abi.json" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); ids=d.get('ids') or d.get('value0') or []; deps=d.get('deposits') or d.get('value2') or []; print(deps[ids.index('$1')] if '$1' in ids else 0)" 2>/dev/null || echo 0; }
+PRE_USDC=$(div_dep 3)
 cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{\"2\":10000000000,\"3\":5000000000000},\"bounce\":true,\"flags\":1,\
-    \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{}')\"}" >/dev/null || true
+  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{\"2\":10000000000,\"3\":5000000000000,\"1\":1000000000},\"bounce\":true,\"flags\":1,\
+    \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["2","3","1"]}')\"}" >/dev/null || true
 for attempt in $(seq 1 15); do
-  NOW_USDC=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("depositedUsdc","0"))' 2>/dev/null || echo 0)
+  NOW_USDC=$(div_dep 3)
   [ "$NOW_USDC" != "$PRE_USDC" ] && break
   sleep 2
 done
 [ "$NOW_USDC" = "$PRE_USDC" ] && { echo "  [fail] deposit never landed (pre=$PRE_USDC post=$NOW_USDC)"; exit 1; }
 cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
+cli run "$COMPANY" getDividendCurrencies {} --abi "$CT/CompanySIIR.abi.json"
 cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 
 # ---------- 9. claim ----------
-echo "== 9. holder claims (SHELL + eccUSDC in one transfer) =="
+echo "== 9. holder claims (SHELL + eccUSDC + NACKL in one transfer) =="
+# the claim costs ~1e9 VMSHELL to send from the wallet; top up if it ran dry
+HB=$(cli account "$HOLDER" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
+[ "${HB:-0}" -lt 3000000000 ] && { echo "  holder vmshell low (${HB}); funding..."; fund "$HOLDER" 50000000000; sleep 3; }
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
   "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/CompanySIIR.abi.json" claim '{"ids":["1"]}')\"}" >/dev/null || true
 for attempt in $(seq 1 15); do
   OUT=$(cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null || true)
-  SHELL_LEFT=$(echo "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("shell","x"))' 2>/dev/null || echo x)
-  USDC_LEFT=$(echo "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("usdc","x"))' 2>/dev/null || echo x)
-  [ "$SHELL_LEFT" = "0" ] && [ "$USDC_LEFT" = "0" ] && break
+  LEFT=$(echo "$OUT" | python3 -c 'import json,sys; a=json.load(sys.stdin).get("amounts") or []; print(sum(int(x) for x in a))' 2>/dev/null || echo x)
+  [ "$LEFT" = "0" ] && break
   sleep 2
 done
+[ "$LEFT" = "0" ] || { echo "  [fail] claim never settled (pending=$LEFT)"; exit 1; }
 echo "  after claim:"
 cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
 cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true

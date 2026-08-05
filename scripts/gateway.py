@@ -130,6 +130,19 @@ def company_page(addr):
             return _b, _m
 
     name = (info or {}).get("name", addr)
+    money_rows = ""
+    divs = run_getter(addr, "getDividendCurrencies") or {}
+    div_ids = divs.get("ids") or divs.get("value0") or []
+    div_idx = divs.get("indices") or divs.get("value1") or []
+    div_dep = divs.get("deposits") or divs.get("value2") or []
+    if div_ids:
+        bodies = []
+        for cid, idx, dep in zip(div_ids, div_idx, div_dep):
+            bodies.append(
+                f"<p>track ecc:{cid} - deposited {escape(str(dep))} - "
+                f"index {escape(str(idx))}</p>"
+            )
+        money_rows = "".join(bodies)
     body = f"""<!doctype html><html><head><meta charset="utf-8"><title>{escape(name)}</title>
 <style>
  body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
@@ -144,14 +157,12 @@ def company_page(addr):
 <div class="card"><h3>Company</h3>
  <img src="/company/{addr}/logo" alt="logo" onerror="this.style.display='none'">
  <p><b>{escape((info or {}).get('description',''))}</b></p>
- <p>website: {escape((info or {}).get('website','') or '—')} ·
-    model: {info.get('issuanceModel',0)} ·
-    issued: {info.get('issuedCount',0)} ·
-    totalWeight: {info.get('totalWeight',0)} ·
-    deposited: {escape((info or {}).get('deposited','0'))} SHELL ·
-    deposited: {escape((info or {}).get('depositedUsdc','0'))} USDC ·
-    dividendIndex: {escape((info or {}).get('dividendIndex','0'))} ·
-    dividendIndexUsdc: {escape((info or {}).get('dividendIndexUsdc','0'))}</p>
+<p>website: {escape((info or {}).get('website','') or '—')} ·
+     model: {info.get('issuanceModel',0)} ·
+     issued: {info.get('issuedCount',0)} ·
+     totalWeight: {info.get('totalWeight',0)} ·
+     payoutTracks: {info.get('dividendCount',0)}</p>
+  {money_rows}</p>
 </div>
 <div class="card"><h3>Deed card</h3>
  <img src="/company/{addr}/deed" alt="deed" onerror="this.style.display='none'">

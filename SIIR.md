@@ -246,17 +246,19 @@ Protocol rule — pending dividends belong to the SIIR, not the holder:
   SIIR with unclaimed value. The owner can claim at any time.
 - No record-date snapshot, no per-holder accounting, no settlement on
   transfer. Only the SIIR's checkpoint ever changes.
-- Dividends are paid in **SHELL** (ecc currency id 2) and **eccUSDC**
-  (ecc currency id 3), the TIP-3-style ecc token for the USDC leg. Both
-  transfer across Dapp IDs — so contributors and holders are never bound
+- Dividends are paid in **any ecc currency** that the network (or any
+  wallet's dapp) creates — SHELL (ecc id 2), eccUSDC (ecc id 3), NACKL
+  (ecc id 1), or a token that does not even exist yet. Ecc currencies
+  transfer across Dapp IDs, so contributors and holders are never bound
   by the app boundary VMSHELL imposes.
-- The treasury is a **dual track**: SHELL and eccUSDC each have their own
-  dividend index, their own total deposited, and their own checkpoint on
-  every SIIR. A single `depositDividends()` message may credit either or
-  both tracks (whatever the message actually attached), and a single
-  `claim(ids)` settles both tracks in one transfer to the caller. There is
-  never a need to migrate accounting between payout tokens — the tracks
-  are independent.
+- The treasury is **currency-agnostic**: every currency id ever attached
+  to a `depositDividends()` message becomes a payout track with its own
+  dividend index, its own total deposited, and its own checkpoint per
+  SIIR. A deposit message names the ids it carries; a single `claim(ids)`
+  settles **all** tracks in one transfer to the caller (up to 64 tracks,
+  `ERR_TOO_MANY_CURRENCIES` beyond that). A future token needs zero
+  protocol changes — a wallet attaches its ecc id and holders claim it
+  like any other.
 
 ## Transfer
 
@@ -352,14 +354,14 @@ end to end in one pass:
    100000).
 5. `transfer(ids, newOwner)` moves ownership wallet-to-wallet and writes a
    `HistoryEntry`.
-6. `depositDividends()` credits whatever the message attached — SHELL
-   (ecc 2) and/or eccUSDC (ecc 3) — into each independent track; the
-   per-track index rises by `amount * SCALE / totalWeight`.
-7. `claim(ids)` pays the holder its share of **both** tracks in one
-   transfer, exactly `weight * index / SCALE` per track (verified:
-   a 1000-weight SIIR of 100000 total gets 0.1 SHELL on a 10 SHELL
-   deposit and 50 eccUSDC on a 5000 eccUSDC deposit; both settle in the
-   same claim).
+6. `depositDividends(currencyIds)` credits the currencies the message
+   actually carried (whatever ids the caller declared); each currency gets
+   its own track, and its index rises by `amount * SCALE / totalWeight`.
+7. `claim(ids)` pays the holder its share of **every** active track in one
+   transfer, exactly `weight * index / SCALE` per track (verified live:
+   a 1000-weight SIIR of 100000 total collects 0.1 SHELL, 50 eccUSDC and
+   0.01 NACKL per 10-SHELL / 5000-USDC / 1-NACKL deposit, all in one
+   claim; `getDividendCurrencies()` lists every track).
 
 Model B (rounds) is verified too: Genesis → Round 1 → Round 2 issue
 50/1000 → 75/200000 → 100/200000, each `issue()` minting exactly the next
@@ -390,9 +392,9 @@ Verified on-chain mechanics learned while building:
   extended `dapp::acct` form.
 - External messages arrive with `msg.sender` = an `addr_extern`, so
   founder auth keys off `msg.pubkey()` (see `_isFounder`).
-- SHELL (ecc) is message-attached: read via `msg.currencies[2]`, send via
-  `dest.transfer({currencies: {2: x}})`; eccUSDC is ecc id 3, same
-  mechanics (`{3: x}`); both cross dapps, VMSHELL does not.
+- Ecc currencies are message-attached: read via `msg.currencies[id]`, send
+  via `dest.transfer({currencies: {id: x}})`; ids cross dapps (e.g. 1 =
+  NACKL, 2 = SHELL, 3 = eccUSDC, and any future token), VMSHELL does not.
 - Wallet contracts holding/trading these currencies need them credited to
   their ecc balance (giver `sendCurrency`, no flag 16); VMSHELL gas is
   separate. A wallet that tries to attach more of a currency than it holds

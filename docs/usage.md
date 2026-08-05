@@ -145,37 +145,41 @@ CompanySIIR.transfer(ids: [1, 3], newOwner: 0:e313c6…)
 ### 5.2 Deposit dividends (anyone)
 
 Any wallet from **any dapp** can drop dividends into the register — in
-**SHELL** (ecc currency 2), in **eccUSDC** (ecc currency 3), or both in
-one message:
+**any ecc currency** the network has: SHELL (ecc 2), eccUSDC (ecc 3),
+NACKL (ecc 1), even a token created after this company was deployed:
 
 ```
-depositDividends()   — attach SHELL as currency {2: <amount>} and/or
-                       eccUSDC as currency {3: <amount>} in the message
+depositDividends(currencyIds)  — name the ids you attach, e.g. ["2","3","1"];
+                                 the message must actually carry those
+                                 currencies ({2: ..., 3: ..., 1: ...})
 ```
 
-- The two payout tracks are independent: each raises its own **dividend
-  index** by `amount ÷ totalWeight`. No fund-raising, no whitelist.
+- Every currency ever deposited becomes its own payout track with its own
+  **dividend index** (`amount ÷ totalWeight`). No fund-raising, no
+  whitelist, no protocol changes for new tokens.
 - Deposits are tracked per track:
   `DividendDeposited(depositor, currency, amount, dividendIndex)`.
-- The sending wallet must actually hold the currency it attaches — a
-  wallet that tries to send more SHELL/USDC than it owns bounces its own
-  transfer before it leaves.
+- The sending wallet must actually hold the currencies it attaches — a
+  wallet that tries to send more than it owns bounces its own transfer
+  before it leaves.
 
 ### 5.3 Claim dividends (holders)
 
-The owner of a SIIR claims its pending payout — **both tracks settle in
-the one claim**:
+The owner of a SIIR claims its pending payout — **every active track
+settles in the one claim**:
 
 ```
 claim(ids: [1, 3])
 ```
 
-- Payout per SIIR per track = `weight × (index − checkpoint) ÷ SCALE`;
+- Payout per SIIR per currency = `weight × (index − checkpoint) ÷ SCALE`;
   the checkpoints then move up so you never double-claim.
-- Payment is SHELL **and** eccUSDC, and arrives at the claiming wallet
-  **immediately**.
+- Payment is the same mix of currencies the company ever received, and
+  arrives at the claiming wallet **immediately**.
 - Anyone can see what a deed is owed at any moment:
-  `getClaimable(id)` → `(shell, usdc)`.
+  `getClaimable(id)` → `(currencies[], amounts[])`.
+- Full money picture of the company: `getDividendCurrencies()` →
+  every track with its index and total deposited.
 
 ---
 
@@ -189,7 +193,8 @@ After any step you can verify on-chain with the getters — no trust needed:
 ✅ getSIIRsOf(wallet) -> exactly the deeds that wallet owns
 ✅ getFingerprint(id) -> stable identity hash (weight, createdAt, round, label, uri)
 ✅ getHistory(id)     -> every transfer, oldest → newest
-✅ getClaimable(id)   -> exact SHELL + eccUSDC owed right now
+✅ getClaimable(id)   -> exact amounts owed per currency right now
+✅ getDividendCurrencies() -> every payout track: id, index, total deposited
 ✅ getCompanyImage()  -> on-chain company logo
 ✅ getSIIRImage()     -> on-chain deed card image
 ✅ getCharter()       -> the founder's immutable commitments + ratified flag
@@ -219,8 +224,8 @@ commitments, promises to investors).
 > charter honest.
 
 A sensible charter covers: no silent minting; dividends belong to the
-SIIR and are paid in SHELL and/or eccUSDC per the declared payout policy;
-transfers are recorded forever; founder
+SIIR and are paid in the ecc currencies the company declares as its
+payout media; transfers are recorded forever; founder
 obligations and deadlines; commitment not to alter dividend accounting.
 
 ---

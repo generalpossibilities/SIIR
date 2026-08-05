@@ -22,7 +22,7 @@ pragma AbiHeader pubkey;
 
 contract CompanySIIR {
     // ---------- constants ----------
-    string constant version = "1.2.0";
+    string constant version = "1.3.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
@@ -100,15 +100,19 @@ contract CompanySIIR {
     uint256 _nextId;
 
     // ---------- treasury / dividends ----------
-    // Two independent tracks, one per supported payout currency (SHELL and
-    // eccUSDC). Each has its own accumulated index and total deposited, and
-    // every SIIR carries a per-track checkpoint. A single deposit may credit
-    // either or both tracks; claim() pays out both in one transfer.
-    uint128 _dividendIndex;      // accumulated SHELL value per weight unit, x SCALE
-    uint128 _dividendIndexUsdc;  // accumulated eccUSDC value per weight unit, x SCALE
-    uint128 _totalWeight;        // sum of weights of all issued SIIRs
-    uint128 _deposited;          // total SHELL ever deposited
-    uint128 _depositedUsdc;      // total eccUSDC ever deposited
+    // Payout is currency-agnostic: every ecc currency id ever deposited
+    // (SHELL=2, eccUSDC=3, NACKL=1, or any future token a network wallet
+    // creates with its own ecc id) becomes a dividend track. Each track has
+    // its own accumulated index, its own total deposited, and its own
+    // checkpoint per SIIR. A deposit message names the ids it attaches;
+    // claim() pays out every track in one transfer.
+    mapping(uint32 => uint128) _dividendIndex;  // accumulated value per weight unit x SCALE, per currency
+    mapping(uint32 => uint128) _deposited;      // total ever deposited, per currency
+    uint32[] _divCurrencies;                    // active tracks, insertion order
+    uint128 _totalWeight;                       // sum of weights of all issued SIIRs
+
+    uint32 constant MAX_DIV_CURRENCIES = 64;    // tracks a treasury may ever register
+    uint16 constant ERR_TOO_MANY_CURRENCIES = 121;
 
     struct TierPlan {
         uint128 count;          // SIIRs in this plan
@@ -120,13 +124,15 @@ contract CompanySIIR {
     struct SIIR {
         uint128 weight;
         address owner;
-        uint128 checkpoint;     // SHELL dividend index at last claim
-        uint128 checkpointUsdc; // eccUSDC dividend index at last claim
         uint64 createdAt;
         uint32 round;           // plan/round index this SIIR came from
         string label;           // display tier label
         string metadataUri;     // deed artwork / document URI
     }
+
+    // per-SIIR dividend checkpoint, per currency: value of _dividendIndex[cur]
+    // when the SIIR last claimed cur
+    mapping(uint256 => mapping(uint32 => uint128)) _checkpoint;
 
     struct HistoryEntry {
         address from;
@@ -225,6 +231,7 @@ contract CompanySIIR {
 
     function _mintPlan(TierPlan plan) private {
         for (uint256 i = 0; i < plan.count; i++) {
+            uint256 id = _nextId;
             SIIR s;
             s.weight = plan.weight;
             s.owner = _founder;
@@ -232,8 +239,13 @@ contract CompanySIIR {
             s.round = _planIndex;
             s.label = plan.label;
             s.metadataUri = _metadataUri;
-            _siirs[_nextId] = s;
-            emit SIIRMinted(_nextId, s.round, s.owner, s.weight, s.label, s.metadataUri);
+            // a freshly minted SIIR starts at every track's current index, so
+            // it never inherits dividend value deposited before it was issued
+            for (uint256 c = 0; c < _divCurrencies.length; c++) {
+                _checkpoint[id][_divCurrencies[c]] = _dividendIndex[_divCurrencies[c]];
+            }
+            _siirs[id] = s;
+            emit SIIRMinted(id, s.round, s.owner, s.weight, s.label, s.metadataUri);
             _nextId++;
         }
         _issuedCount += plan.count;
@@ -265,59 +277,62 @@ contract CompanySIIR {
     /// currency id 3). Unlike VMSHELL, these transfer across Dapp IDs, so
     /// contributors are never bound by app boundaries. Each track has its own
     /// index; the deposit is split by what the message actually carried.
-    function depositDividends() public internalMsg {
-        uint128 shell = uint128(msg.currencies[CURRENCY_SHELL]);
-        uint128 usdc  = uint128(msg.currencies[CURRENCY_USDC]);
-        require(shell > 0 || usdc > 0, ERR_NOTHING_DEPOSITED);
+    function depositDividends(uint32[] currencyIds) public internalMsg {
+        uint128 total = 0;
         require(_totalWeight > 0, ERR_BAD_ISSUANCE);
         tvm.accept();
-        if (shell > 0) {
-            _deposited += shell;
-            _dividendIndex += shell * SCALE / _totalWeight;
-            emit DividendDeposited(msg.sender, CURRENCY_SHELL, shell, _dividendIndex);
+        for (uint256 i = 0; i < currencyIds.length; i++) {
+            uint32 cur = currencyIds[i];
+            uint128 amount = uint128(msg.currencies[cur]);
+            if (amount == 0) continue;
+            require(_divCurrencies.length < MAX_DIV_CURRENCIES ||
+                    _dividendIndex.exists(cur), ERR_TOO_MANY_CURRENCIES);
+            if (!_dividendIndex.exists(cur)) {
+                // first deposit in this currency; it becomes a payout track
+                _divCurrencies.push(cur);
+            }
+            _deposited[cur] += amount;
+            _dividendIndex[cur] += amount * SCALE / _totalWeight;
+            total += amount;
+            emit DividendDeposited(msg.sender, cur, amount, _dividendIndex[cur]);
         }
-        if (usdc > 0) {
-            _depositedUsdc += usdc;
-            _dividendIndexUsdc += usdc * SCALE / _totalWeight;
-            emit DividendDeposited(msg.sender, CURRENCY_USDC, usdc, _dividendIndexUsdc);
-        }
+        require(total > 0, ERR_NOTHING_DEPOSITED);
     }
 
-    /// Claim pending dividends for owned SIIRs. Both tracks are settled in one
-    /// transfer: the caller receives its share of SHELL and of eccUSDC in the
-    /// same message, so funds arrive at the wallet on any Dapp ID.
+    /// Claim pending dividends for owned SIIRs. Every active payout track is
+    /// settled in one transfer: the caller receives its share of SHELL,
+    /// eccUSDC, and any other currency the company treasury has ever received
+    /// — in the same message, so funds arrive at the wallet on any Dapp ID,
+    /// including currency ids created after this company was deployed.
     function claim(uint256[] ids) public internalMsg {
-        uint128 totalShell = 0;
-        uint128 totalUsdc  = 0;
+        mapping(uint32 => uint128) totals;
+        uint128 combined = 0;
         for (uint256 i = 0; i < ids.length; i++) {
             uint256 id = ids[i];
             require(_siirs.exists(id), ERR_NO_SIIR);
             require(_siirs[id].owner == msg.sender, ERR_NOT_OWNER);
             SIIR s = _siirs[id];
-            uint128 pendingShell = s.weight * (_dividendIndex - s.checkpoint) / SCALE;
-            if (pendingShell > 0) {
-                _siirs[id].checkpoint = _dividendIndex;
-                totalShell += pendingShell;
-                emit DividendClaimed(id, msg.sender, CURRENCY_SHELL, pendingShell, _dividendIndex);
-            }
-            uint128 pendingUsdc = s.weight * (_dividendIndexUsdc - s.checkpointUsdc) / SCALE;
-            if (pendingUsdc > 0) {
-                _siirs[id].checkpointUsdc = _dividendIndexUsdc;
-                totalUsdc += pendingUsdc;
-                emit DividendClaimed(id, msg.sender, CURRENCY_USDC, pendingUsdc, _dividendIndexUsdc);
+            for (uint256 c = 0; c < _divCurrencies.length; c++) {
+                uint32 cur = _divCurrencies[c];
+                uint128 pending = s.weight * (_dividendIndex[cur] - _checkpoint[id][cur]) / SCALE;
+                if (pending > 0) {
+                    _checkpoint[id][cur] = _dividendIndex[cur];
+                    totals[cur] += pending;
+                    combined += pending;
+                    emit DividendClaimed(id, msg.sender, cur, pending, _dividendIndex[cur]);
+                }
             }
         }
-        require(totalShell > 0 || totalUsdc > 0, ERR_NO_CLAIM);
+        require(combined > 0, ERR_NO_CLAIM);
         tvm.accept();
-        if (totalShell > 0 && address(this).currencies[CURRENCY_SHELL] >= totalShell) {
-            mapping(uint32 => varuint32) c;
-            c[CURRENCY_SHELL] = totalShell;
-            msg.sender.transfer({value: varuint16(0), flag: 1, currencies: c});
-        }
-        if (totalUsdc > 0 && address(this).currencies[CURRENCY_USDC] >= totalUsdc) {
-            mapping(uint32 => varuint32) c;
-            c[CURRENCY_USDC] = totalUsdc;
-            msg.sender.transfer({value: varuint16(0), flag: 1, currencies: c});
+        for (uint256 c = 0; c < _divCurrencies.length; c++) {
+            uint32 cur = _divCurrencies[c];
+            uint128 amount = totals[cur];
+            if (amount > 0 && address(this).currencies[cur] >= amount) {
+                mapping(uint32 => varuint32) cc2;
+                cc2[cur] = amount;
+                msg.sender.transfer({value: varuint16(0), flag: 1, currencies: cc2});
+            }
         }
     }
 
@@ -334,17 +349,33 @@ contract CompanySIIR {
         uint128 totalWeight,
         uint128 issuedCount,
         uint128 dividendIndex,
-        uint128 dividendIndexUsdc,
         uint128 deposited,
-        uint128 depositedUsdc,
+        uint128 dividendCount,
         uint256 nextId
     ) {
         return (
             _name, _description, _website, _metadataUri,
             _factory, _founder, _founderPubkey,
             _issuanceModel, _totalWeight, _issuedCount,
-            _dividendIndex, _dividendIndexUsdc, _deposited, _depositedUsdc, _nextId
+            _dividendIndex[CURRENCY_SHELL], _deposited[CURRENCY_SHELL],
+            uint128(_divCurrencies.length), _nextId
         );
+    }
+
+    /// Every active payout track: currency id, its accumulated index, and its
+    /// total deposited. This is the full money picture — any coin ever attached
+    /// to the treasury, including tokens created after deployment.
+    function getDividendCurrencies() external view returns (
+        uint32[] ids,
+        uint128[] indices,
+        uint128[] deposits
+    ) {
+        for (uint256 i = 0; i < _divCurrencies.length; i++) {
+            uint32 cur = _divCurrencies[i];
+            ids.push(cur);
+            indices.push(_dividendIndex[cur]);
+            deposits.push(_deposited[cur]);
+        }
     }
 
     function getPlans() external view returns (TierPlan[] plans) {
@@ -354,8 +385,6 @@ contract CompanySIIR {
     function getSIIR(uint256 id) external view returns(
         uint128 weight,
         address owner,
-        uint128 checkpoint,
-        uint128 checkpointUsdc,
         uint64 createdAt,
         uint32 round,
         string label,
@@ -363,7 +392,7 @@ contract CompanySIIR {
     ) {
         require(_siirs.exists(id), ERR_NO_SIIR);
         SIIR s = _siirs[id];
-        return (s.weight, s.owner, s.checkpoint, s.checkpointUsdc, s.createdAt, s.round, s.label, s.metadataUri);
+        return (s.weight, s.owner, s.createdAt, s.round, s.label, s.metadataUri);
     }
 
     function getOwnerOf(uint256 id) external view returns (address) {
@@ -371,19 +400,32 @@ contract CompanySIIR {
         return _siirs[id].owner;
     }
 
-    function getClaimable(uint256 id) external view returns (uint128 shell, uint128 usdc) {
+    function getClaimable(uint256 id) external view returns (uint32[] currencies, uint128[] amounts) {
         require(_siirs.exists(id), ERR_NO_SIIR);
         SIIR s = _siirs[id];
-        shell = s.weight * (_dividendIndex - s.checkpoint) / SCALE;
-        usdc = s.weight * (_dividendIndexUsdc - s.checkpointUsdc) / SCALE;
+        for (uint256 i = 0; i < _divCurrencies.length; i++) {
+            uint32 cur = _divCurrencies[i];
+            uint128 pending = s.weight * (_dividendIndex[cur] - _checkpoint[id][cur]) / SCALE;
+            currencies.push(cur);
+            amounts.push(pending);
+        }
     }
 
-    function getClaimableOf(address owner) external view returns (uint128 shell, uint128 usdc) {
+    function getClaimableOf(address owner) external view returns (uint32[] currencies, uint128[] amounts) {
         uint256[] ids = _idsOf(owner);
+        mapping(uint32 => uint128) totals;
         for (uint256 i = 0; i < ids.length; i++) {
-            SIIR s = _siirs[ids[i]];
-            shell += s.weight * (_dividendIndex - s.checkpoint) / SCALE;
-            usdc += s.weight * (_dividendIndexUsdc - s.checkpointUsdc) / SCALE;
+            uint256 id = ids[i];
+            SIIR s = _siirs[id];
+            for (uint256 c = 0; c < _divCurrencies.length; c++) {
+                uint32 cur = _divCurrencies[c];
+                totals[cur] += s.weight * (_dividendIndex[cur] - _checkpoint[id][cur]) / SCALE;
+            }
+        }
+        for (uint256 i = 0; i < _divCurrencies.length; i++) {
+            uint32 cur = _divCurrencies[i];
+            currencies.push(cur);
+            amounts.push(totals[cur]);
         }
     }
 

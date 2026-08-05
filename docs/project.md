@@ -366,12 +366,14 @@ Two silent comparison bugs in the charter verification:
   correct data. **Fix:** compare against
   `python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "$CHARTER"`.
 
-### 6.23 eccUSDC (ecc currency 3) — verified on shellnet
-The giver's ecc map `{1: NACKL, 2: SHELL, 3: eccUSDC}` is real: GiverV3
-`sendCurrency` with `"ecc":{"3":...}` lands as USDC in a wallet's ecc
-balance (`ecc_balance -> "3"`). The company's treasury accepts it in
-`depositDividends()` next to SHELL — each currency tracks its own index
-and per-SIIR checkpoint, and `claim()` returns both in one transfer.
+### 6.23 ecc currencies (1 = NACKL, 2 = SHELL, 3 = eccUSDC) — verified on shellnet
+The giver's ecc map is real and the treasury is currency-agnostic:
+GiverV3 `sendCurrency` with `"ecc":{"1":...}` / `{"3":...}` lands in a
+wallet's ecc balance, a company `depositDividends(["2","3","1"])` opens
+one track per currency (index + total deposited + per-SIIR checkpoint),
+and a single `claim()` pays all of them in one transfer — verified with
+all three currencies at once (including NACKL, ecc id 1). Any future
+token with a new ecc id works with zero protocol changes.
 
 ### 6.24 A wallet bounces a send it can't cover — top up the sender
 The founder wallet creazily "deposited" 10 SHELL + 5000 USDC into the
@@ -395,6 +397,28 @@ read into a run abort. **Fix:** retry-tolerant pollers (`for attempt...;
 sleep 2`) around every account read that must succeed, parse with
 `.get(...)` defaults, and only `exit 1` after the whole retry window.
 
+### 6.27 Python int vs JSON string in the probe — silent "never landed"
+`div_dep 3` probed `getDividendCurrencies` with `ids.index(3)` — but
+tvm-cli returns ids as JSON **strings** (`"3"`), so the lookup raised
+ValueError and the probe printed `0` forever: the deposit poll then
+declared "[fail] deposit never landed" even though the deposit landed
+fine. **Fix:** compare string-to-string (`ids.index('$1')`).
+
+### 6.28 A wallet can be too poor to send its own claim
+The holder's VMSHELL balance had decayed to 822M nano — below the 1e9
+`sendTransaction` value plus fees — so the claim message was
+`aborted: True` and nothing was ever paid, with no error anywhere else.
+**Fix:** top up the sender wallet's VMSHELL gas (`fund` with flag 16)
+before claiming, and make the claim poll fail hard if pending never
+reaches zero.
+
+### 6.29 Concurrent script runs double-deposit and interleave logs
+An aborted run's shell kept executing and raced the next run: two
+deposits landed (amounts doubled) and both runs wrote into the same log
+file. **Fix:** don't start a new run while another is alive; the deposit
+poll now keyed on the per-currency deposited amount makes double-landing
+visible.
+
 ---
 
 ## 7. Why these components exist (map of responsibilities)
@@ -407,7 +431,7 @@ sleep 2`) around every account read that must succeed, parse with
 | statics `_factory/_founder/_founderPubkey` | bake identity into the company address | address = promise of immutability; verifiable forever |
 | `SCALE=1e9` | fixed-point for the dividend index | non-integer per-SIIR claims (decimals = SHELL's) |
 | `getFingerprint` | `hash(weight, createdAt, round, label, metadataUri)` | auditable deed identity, never changes |
-| SHELL + eccUSDC (ecc 2/3) | dividend media | two independent tracks — cross-Dapp proof; payout token is a parameter, not an accounting change |
+| ecc currencies (ids 1, 2, 3, …) | dividend media | any currency the network or a wallet's dapp creates — payout token is a parameter, not an accounting change |
 | `scripts/deploy.sh` | one-shot reproducible shellnet demo | proves the whole contract stack, replays anytime |
 | `scripts/gateway.py` | serves on-chain UI/images/charter over HTTP | browsers need URL-shaped reads; content stays on-chain |
 
@@ -421,13 +445,15 @@ sleep 2`) around every account read that must succeed, parse with
 dividend-paying lifecycle, the Model-B (rounds) issuance path, on-chain
 company content: logo + deed image + UI bundle (base64 data URIs,
 size-capped, byte-exact round-trips), the **founder's charter**
-(immutable text, founder-key ratification, stable fingerprint), and the
-**dual-track treasury**: dividends paid in SHELL (ecc 2) *and* eccUSDC
-(ecc 3), each with its own index and per-SIIR checkpoint, both settled in
-one `claim()` — verified live with byte-exact amounts (a 1000-weight SIIR
-of 100000 total collects 0.1 SHELL per 10-SHELL deposit and 50 eccUSDC
-per 5000-eccUSDC deposit). All servable through the on-chain content
-gateway (`scripts/gateway.py`).
+(immutable text, founder-key ratification, stable fingerprint), and a
+**currency-agnostic treasury**: dividends are paid in *any* ecc currency
+the network has (SHELL=2, eccUSDC=3, NACKL=1, or a token created after
+deployment) — each currency gets its own track (index, total deposited,
+per-SIIR checkpoint), one `depositDividends(currencyIds)` credits them,
+one `claim(ids)` settles them all. Verified live byte-for-byte across
+three currencies in a single claim (a 1000-weight SIIR of 100000 total
+collects 0.1 SHELL + 50 eccUSDC + 0.01 NACKL per deposit round).
+All servable through the on-chain content gateway (`scripts/gateway.py`).
 
 **Next:** wallet integration (claim button, deed view);
 governance & dissolution safeguards; marketplace hooks.
