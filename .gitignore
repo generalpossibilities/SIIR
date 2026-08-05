@@ -25,3 +25,7 @@ contracts/*.debug.json
 # Demo runtime state (keys/addresses must never be committed)
 scripts/.work/
 scripts/*.addr
+
+# Python bytecode
+scripts/__pycache__/
+

@@ -51,8 +51,13 @@ Then open `http://127.0.0.1:8000/`.
 
 ## How it works
 
-- Content is read on-demand with `tvm-cli run ... --abi CompanySIIR.abi.json`
-  (5-second cache per getter — the on-chain state is the source of truth).
+- Getter reads are served from `scripts/mirror.py`: **one GraphQL call per
+  company** fetches the persistent state (a BOC), which `MirrorState`
+  decodes locally and turns into every getter result (`run_getter`).
+  tvm-cli is only a fallback if the mirror fetch/decode fails (5-second
+  cache per (address, method, params)). Verified 17/17 getters byte-identical
+  to live tvm-cli on shellnet, including `getFingerprint`/`getCharterFingerprint`
+  (cell-hash reimplementation) and `getClaimableOf`.
 - Stored payloads are base64 data URIs (`data:<mime>;base64,...`); the
   gateway decodes and serves them with the correct `Content-Type`.
 - If a company stored a `ui` bundle, `/company/<addr>/` returns it directly —
@@ -65,13 +70,14 @@ Then open `http://127.0.0.1:8000/`.
 ## Notes / limits
 
 - Read-only and localhost-bound by default; production would put a real
-  mirror-node client or GraphQL behind it.
+  mirror-node client or GraphQL behind it. The mirror client already does
+  the GraphQL work in-process (see `docs/shellnet-decoding.md`).
 - The gateway is a wallet **only for its own holder account** (`/claim`):
   every other operation stays read-only. Other holders still claim by signing
   their own wallet (see `usage.md`).
-- Any tvm-cli networking quirk (e.g. message-delivery races) is invisible
-  here — getters are local emulation against the mirror node.
-- Reading a whole register is expensive: each SIIR needs its own getter, so
-  register/holder scans run through a small thread pool (8 workers) with a
-  time budget (~25 s) and pagination; `truncated: true` means the budget was
-  hit before the scan finished.
+- `POST /claim` still requires tvm-cli (it signs and sends the external
+  message); a pure-`/v2/messages` sender is a future step (see `docs/TODO.md`).
+- Reading a whole register is cheap with the mirror client: the whole state
+  is one GraphQL call, so register/holder scans are pure local decodes with
+  no per-SIIR round trips; `truncated` only applies when the scan is huge
+  (time budget ~25 s).

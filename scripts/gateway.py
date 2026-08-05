@@ -51,6 +51,9 @@ WORK = os.path.join(ROOT, "scripts", ".work")
 COMPANIES_JSON = os.path.join(WORK, "companies.json")
 COMPANY_ABI = os.path.join(CT, "CompanySIIR.abi.json")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mirror as mirror_mod
+
 CACHE = {}
 CACHE_LOCK = threading.Lock()
 CACHE_TTL = 5.0  # seconds
@@ -73,6 +76,71 @@ def tvm_cli(*args):
     )
 
 
+# ---------- mirror-mode reads (no tvm-cli) ----------
+
+MIRROR = True
+MIRROR_CACHE = {}
+MIRROR_LOCK = threading.Lock()
+MIRROR_TTL = 5.0  # seconds: one GraphQL state fetch per company per window
+
+
+def mirror_state(address):
+    with MIRROR_LOCK:
+        hit = MIRROR_CACHE.get(address)
+        if hit and time.time() - hit[0] < MIRROR_TTL:
+            return hit[1]
+    ms = mirror_mod.MirrorState(address, COMPANY_ABI, net=NET)
+    with MIRROR_LOCK:
+        MIRROR_CACHE[address] = (time.time(), ms)
+    return ms
+
+
+def mirror_getter(address, method, params):
+    """Answer a getter from the decoded mirror state, shaped like tvm-cli.
+    Returns None when the mirror path cannot serve this call."""
+    ms = mirror_state(address)
+    p = json.loads(params) if params else {}
+    if method == "getCompanyInfo":
+        return ms.company_info()
+    if method == "getDividendCurrencies":
+        return ms.dividends()
+    if method == "getPlans":
+        return {"plans": ms.plans_abi()}
+    if method == "getSIIR":
+        return ms.siir(int(p["id"]))
+    if method == "getOwnerOf":
+        return {"value0": ms.owner_of(int(p["id"]))}
+    if method == "getClaimable":
+        c, a = ms.claimable(int(p["id"]))
+        return {"currencies": c, "amounts": a}
+    if method == "getClaimableOf":
+        c, a = ms.claimable_of(p["owner"])
+        return {"currencies": c, "amounts": a}
+    if method == "getBalanceOf":
+        return {"count": "0x%064x" % ms.balance_of(p["owner"])}
+    if method == "getSIIRsOf":
+        return {"ids": ["0x%064x" % i for i in ms.ids_of(p["owner"])]}
+    if method == "getFingerprint":
+        return {"fp": ms.fingerprint(int(p["id"]))}
+    if method == "getHistory":
+        return {"entries": ms.history(int(p["id"]))}
+    if method == "getCompanyImage":
+        return {"img": ms.state.get("_logoImage") or ""}
+    if method == "getSIIRImage":
+        return {"img": ms.state.get("_siirImage") or ""}
+    if method == "getUI":
+        return {"ui": ms.state.get("_ui") or ""}
+    if method == "getCharter":
+        return ms.charter()
+    if method == "getCharterFingerprint":
+        return {"fp": ms.charter_fingerprint()}
+    if method == "getContentInfo":
+        return {k: str(v) for k, v in ms.content_info().items()}
+    if method == "getVersion":
+        return {"value0": "1.3.0", "value1": "CompanySIIR"}
+    return None
+
+
 def run_getter(address, method, params="{}"):
     key = (address, method, params)
     now = time.time()
@@ -80,12 +148,20 @@ def run_getter(address, method, params="{}"):
         hit = CACHE.get(key)
         if hit and now - hit[0] < CACHE_TTL:
             return hit[1]
-    out = tvm_cli("run", address, method, params, "--abi", COMPANY_ABI)
-    try:
-        data = json.loads(out.stdout)
-    except json.JSONDecodeError:
-        log(f"{method}@{address}: bad json: {out.stdout[:200]}")
-        data = None
+    data = None
+    if MIRROR:
+        try:
+            data = mirror_getter(address, method, params)
+        except Exception as e:
+            log(f"mirror {method}@{address} failed ({e}); falling back to tvm-cli")
+            data = None
+    if data is None:
+        out = tvm_cli("run", address, method, params, "--abi", COMPANY_ABI)
+        try:
+            data = json.loads(out.stdout)
+        except json.JSONDecodeError:
+            log(f"{method}@{address}: bad json: {out.stdout[:200]}")
+            data = None
     with CACHE_LOCK:
         CACHE[key] = (now, data)
     # keep cache small
