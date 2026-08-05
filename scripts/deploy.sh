@@ -74,7 +74,7 @@ LOGO_SVG=$(img_uri '<rect width="64" height="64" fill="#1d4ed8"/><text x="32" y=
 )
 SIIRIMG_SVG=$(img_uri '<rect width="64" height="64" fill="#111827"/><text x="32" y="40" font-size="22" fill="#fbbf24" text-anchor="middle">SIIR</text>'
 )
-UI_BUNDLE=$(python3 - <<'PY'
+UI_BUNDLE=$(python3 static/bundle.py --emit 2>/dev/null || python3 - <<'PY'
 import base64
 html = "<!doctype html><html><body><h1>NJD Ventures</h1><p>shareholder register on-chain</p></body></html>"
 print("data:text/html;base64," + base64.b64encode(html.encode()).decode())

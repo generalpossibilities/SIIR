@@ -45,6 +45,12 @@ State of the work in `scripts/mirror.py`:
   live against shellnet; renders company/register/holders/SIIR/holder pages
   and fingerprints from **`file://` with no server process** (CORS is open
   on the mirror). Served by the gateway at `/static/`.
+- [x] **On-chain UI embedding path**: `static/bundle.py` inlines the explorer
+  into a single self-contained HTML (~40 KB) and `--emit`s it as a
+  `data:text/html;base64,…`; `deploy.sh` now ships that as the `CompanySIIR`
+  UI unit (`_ui`, 4 MiB cap; the gateway already serves a stored `_ui`
+  verbatim at `/company/<addr>/` and `/app`). The bundle decodes through
+  `decode_data_uri` in the gateway.
 - [ ] Remove the tvm-cli dependency from `gateway.py` entirely (reads via
   mirror; the only tvm-cli uses left are wallet writes — see item 3).
 - [ ] Ship the explorer to a free static host (GitHub Pages) and/or embed it
