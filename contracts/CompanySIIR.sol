@@ -22,7 +22,7 @@ pragma AbiHeader pubkey;
 
 contract CompanySIIR {
     // ---------- constants ----------
-    string constant version = "1.0.0";
+    string constant version = "1.1.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
@@ -46,6 +46,18 @@ contract CompanySIIR {
     uint16 constant ERR_SUPPLY_EXCEEDED   = 105;
     uint16 constant ERR_ALREADY_ISSUED    = 106;
     uint16 constant ERR_NOTHING_DEPOSITED = 107;
+    uint16 constant ERR_LOGO_TOO_LARGE    = 108;
+    uint16 constant ERR_SIIR_IMG_TOO_LARGE = 109;
+    uint16 constant ERR_UI_TOO_LARGE      = 110;
+    uint16 constant ERR_CHARTER_TOO_LARGE = 111;
+    uint16 constant ERR_ALREADY_RATIFIED  = 112;
+
+    // On-chain content caps (Acki Nacki storage is free, but bounded so a
+    // single account never becomes pathological). Base64 data-URI strings.
+    uint32 constant MAX_LOGO_SIZE        = 1 << 20;  // 1 MiB
+    uint32 constant MAX_SIIR_IMAGE_SIZE  = 1 << 20;  // 1 MiB
+    uint32 constant MAX_UI_SIZE          = 4 << 20;  // 4 MiB (static HTML/JS bundle)
+    uint32 constant MAX_CHARTER_SIZE     = 1 << 20;  // 1 MiB (immutable commitment text)
 
     modifier accept() {
         tvm.accept();
@@ -62,6 +74,18 @@ contract CompanySIIR {
     string _description;
     string _website;
     string _metadataUri;
+
+    // ---------- on-chain content (supplied at deployment, immutable) ----------
+    // Base64 data-URI strings, stored on-chain; Acki Nacki storage is free.
+    // _logoImage:      company logo / brand.
+    // _siirImage:      the deed card image shown for every SIIR of this company.
+    // _ui:             optional static app bundle (HTML/JS) served by a gateway.
+    // _charter:        the founder's immutable commitments / rules of the company.
+    string _logoImage;
+    string _siirImage;
+    string _ui;
+    string _charter;
+    bool _charterRatified;   // once the founder's own key acknowledges the charter
 
     // ---------- issuance ----------
     uint8 _issuanceModel;
@@ -111,6 +135,7 @@ contract CompanySIIR {
     event SIIRTransferred(uint256 id, address from, address to, uint64 timestamp);
     event DividendDeposited(address depositor, uint128 amount, uint128 dividendIndex);
     event DividendClaimed(uint256 id, address holder, uint128 amount, uint128 dividendIndex);
+    event CharterRatified(uint256 founderPubkey, uint64 timestamp);
 
     // ---------- constructor ----------
     constructor(
@@ -119,18 +144,30 @@ contract CompanySIIR {
         string website,
         string metadataUri,
         uint8 issuanceModel,
-        TierPlan[] plans
+        TierPlan[] plans,
+        string logoImage,
+        string siirImage,
+        string ui,
+        string charter
     ) accept {
         gosh.cnvrtshellq(0);
         tvm.accept();
         require(msg.sender == _factory, ERR_NOT_OWNER);
         require(issuanceModel == MODEL_FULL_CAP || issuanceModel == MODEL_ROUNDS, ERR_BAD_ISSUANCE);
+        require(bytes(logoImage).length <= MAX_LOGO_SIZE, ERR_LOGO_TOO_LARGE);
+        require(bytes(siirImage).length <= MAX_SIIR_IMAGE_SIZE, ERR_SIIR_IMG_TOO_LARGE);
+        require(bytes(ui).length <= MAX_UI_SIZE, ERR_UI_TOO_LARGE);
+        require(bytes(charter).length <= MAX_CHARTER_SIZE, ERR_CHARTER_TOO_LARGE);
         _name = name;
         _description = description;
         _website = website;
         _metadataUri = metadataUri;
         _issuanceModel = issuanceModel;
         _plans = plans;
+        _logoImage = logoImage;
+        _siirImage = siirImage;
+        _ui = ui;
+        _charter = charter;
         _nextId = 1;
         emit CompanyCreated(_factory, _founder, _name, _issuanceModel);
     }
@@ -149,6 +186,18 @@ contract CompanySIIR {
     }
 
     /// Owners act through their wallet contracts (internal messages).
+
+    // ---------- charter ----------
+    /// The founder personally acknowledges the immutable charter with their
+    /// own key. One-time, timestamped, irreversible. If the founder later acts
+    /// contrary to what the charter promises, the acknowledgment + original
+    /// statement are on-chain proof — usable against them.
+    function ratifyCharter() public {
+        _isFounder();
+        require(!_charterRatified, ERR_ALREADY_RATIFIED);
+        _charterRatified = true;
+        emit CharterRatified(_founderPubkey, uint64(block.timestamp));
+    }
 
     // ---------- issuance ----------
     /// Mint the next declared plan/round in batches.
@@ -340,6 +389,47 @@ contract CompanySIIR {
             entries[i] = _history[id][i];
         }
         return entries;
+    }
+
+    // ---------- on-chain content getters ----------
+    /// Logo image (base64 data URI), supplied by the company at deployment.
+    function getCompanyImage() external view returns (string img) {
+        return _logoImage;
+    }
+
+    /// Deed card image used for every SIIR of this company.
+    function getSIIRImage() external view returns (string img) {
+        return _siirImage;
+    }
+
+    /// Optional static app bundle (HTML/JS) — served by a gateway, stored on-chain.
+    function getUI() external view returns (string ui) {
+        return _ui;
+    }
+
+    /// The founder's immutable commitments. `ratified` is true only after the
+    /// founder's own key acknowledged it on-chain (see ratifyCharter).
+    function getCharter() external view returns (string charter, bool ratified) {
+        return (_charter, _charterRatified);
+    }
+
+    /// Stable hash of the charter text — investors can pin this to a copy they
+    /// keep, confident the on-chain text can never change.
+    function getCharterFingerprint() external view returns (uint256 fp) {
+        return tvm.hash(abi.encode(_charter));
+    }
+
+    /// Sizes of the on-chain content (for clients that need them up front).
+    function getContentInfo() external view returns (
+        uint32 logoSize,
+        uint32 siirImageSize,
+        uint32 uiSize
+    ) {
+        return (
+            uint32(bytes(_logoImage).length),
+            uint32(bytes(_siirImage).length),
+            uint32(bytes(_ui).length)
+        );
     }
 
     function getVersion() external pure returns (string, string) {

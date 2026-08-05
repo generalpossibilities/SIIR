@@ -42,14 +42,22 @@ Only the company creator interacts with the factory. One call
 | `description` | one-line description | `"early-stage VC holdings"` |
 | `website` | link, may be `""` | `"https://njd.example"` |
 | `metadataUri` | link to logo / docs, may be `""` | `"ipfs://…"` |
+| `logoImage` | **company logo, stored on-chain** (base64 data URI) | `"data:image/svg+xml;base64,…"` |
+| `siirImage` | **deed card image** used for every SIIR, on-chain | `"data:image/svg+xml;base64,…"` |
+| `ui` | optional static app bundle (HTML/JS), on-chain | `"data:text/html;base64,…"` |
+| `charter` | **your immutable commitments** — how SIIRs & the company will be run | see below |
 | `founder` | the founder's **wallet address** (legacy `0:hex`) | `0:4de04d6a…` |
 | `founderPubkey` | the founder's signing **public key** | `0x4f1d97fa…` |
 | `issuanceModel` | `0` = full cap now, `1` = rounds | `0` |
 | `plans` | your share classes — a list of `{count, weight, label, issued}` | see below |
 | `initialValue` | VMSHELL gas to give the new company | `100000000` |
 
-A `plans` entry — **a tier/plan is mints `count` SIIRs, each with
-unignored `weight`**:
+Images and the charter ride along at deployment and are **stored in the
+company contract itself** — Acki Nacki storage is free. They are
+immutable for life and never referenced from a URL.
+
+A `plans` entry — a tier/plan mints `count` SIIRs, each with equal
+`weight`:
 
 ```json
 {"plans": [
@@ -61,7 +69,8 @@ unignored `weight`**:
 The factory then creates your `CompanySIIR` at a **deterministic address** —
 you can know its address before it exists. From that moment the company
 contract is **immutable for life**: the founder can issue, but nobody can
-change the rules, the share classes, or the code ever again.
+change the rules, the share classes, the images, the charter, or the code
+ever again.
 
 ---
 
@@ -171,11 +180,41 @@ After any step you can verify on-chain with the getters — no trust needed:
 ✅ getFingerprint(id) -> stable identity hash (weight, createdAt, round, label, uri)
 ✅ getHistory(id)     -> every transfer, oldest → newest
 ✅ getClaimable(id)   -> exact SHELL owed right now
+✅ getCompanyImage()  -> on-chain company logo
+✅ getSIIRImage()     -> on-chain deed card image
+✅ getCharter()       -> the founder's immutable commitments + ratified flag
+✅ getCharterFingerprint() -> stable hash to pin an off-chain copy against
 ```
 
 ---
 
-## 7. What you *don't* need
+## 7. The charter — the founder's word, frozen
+
+When you start a company you also supply a **charter**: your written,
+up-front statement of how the company and its SIIRs will be run (rules,
+commitments, promises to investors).
+
+- It is **frozen at deployment** inside the immutable company contract.
+  Not even you can edit it afterwards.
+- **You ratify it personally**: one call to `ratifyCharter()` marks it
+  `ratified = true` and records a timestamped acknowledgment under your
+  own key (`CharterRatified` event). This is your signature on the rules.
+- **Investors can query it** at any time: the full text, the ratification
+  flag, and a stable fingerprint.
+
+> Why it matters: if you ever act differently than you promised in the
+> charter, anyone can prove it. The immutable text, the on-chain register
+> state (declared plan, dividend accounting), and your key-signed
+> ratification form an evidentiary record usable against you. Make the
+> charter honest.
+
+A sensible charter covers: no silent minting; dividends belong to the
+SIIR and are paid in SHELL; transfers are recorded forever; founder
+obligations and deadlines; commitment not to alter dividend accounting.
+
+---
+
+## 8. What you *don't* need
 
 - **No special "SIIR wallet" contract.** Ordinary Acki Nacki multisig or
   smart wallets already hold SIIRs — ownership is just the register's `owner`

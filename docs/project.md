@@ -327,6 +327,45 @@ the factory's VMSHELL**). The call exited 0; only the account query showed
 "Not found". **Fix:** check the factory VMSHELL balance before each company
 deploy and refill (`fund`) when below the reserve threshold.
 
+### 6.19 Multi-line text in ABI JSON params breaks the call
+Supplying the charter as a plain base64/raw string with literal newlines
+inside the `deployCompany` JSON made the message malformed (tvm-cli would
+reject or silently ignore it). **Fix:** JSON-encode multi-line/escapable
+strings first — `python3 -c 'import json; print(json.dumps(s))'` — and embed
+the result *without* extra quotes (`"charter":$CHARTER`). The returned literal
+already carries its own quotes and escapes.
+
+### 6.20 Free storage is real, but cap on-chain content anyway
+Acki Nacki officially runs a freemium model ("store data without paying
+fees", terabytes-scale state) and the storage-as-git-on-chain design (GOSH)
+is built for enormous datasets. Storing company images + charter in the
+contract works — verified byte-for-byte round-trips. Still cap every payload
+(logo/deed image 1 MiB, UI 4 MiB, charter 1 MiB) so a single account can
+never become pathological to mirror/emulate, and so getters stay cheap.
+
+### 6.21 Content caps are server-side; the CLI can't push near them
+Trying to exercise the 1 MiB cap with an oversized upload failed twice, on
+the tooling, not the chain:
+- **`Argument list too long`** — a single argv element is limited to
+  `MAX_ARG_STRLEN` (128 KiB), so tvm-cli can't even receive a >128 KiB
+  param; and `tvm-cli message` + `sendfile` hit the client cell-builder
+  depth limit (`depth 2049 > 2048`) and then a node endpoint that expects
+  a JSON body, not a raw BOC POST. The contract `require`s (factory
+  202–205, company 108–111) therefore guarantee the cap, but this CLI
+  cannot demonstrate the rejection. Realistic single-message content
+  should stay well under ~128 KiB; larger assets belong in a chunked
+  upload or a GOSH repo.
+
+### 6.22 Python `True` vs JSON `true` (and JSON-escaped vs raw text)
+Two silent comparison bugs in the charter verification:
+- `json.load` returns Python bools; `print(d.get("ratified"))` prints
+  `True`, not `true` — `[ "$R_RAT" = "true" ]` never matched even though
+  ratification landed. **Fix:** `| tr '[:upper:]' '[:lower:]'`.
+- The charter sent to the chain was JSON-escaped (`\n` literals) while the
+  getter returns real newlines, so string equality failed on perfectly
+  correct data. **Fix:** compare against
+  `python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "$CHARTER"`.
+
 ---
 
 ## 7. Why these components exist (map of responsibilities)
@@ -349,11 +388,12 @@ deploy and refill (`fund`) when below the reserve threshold.
 **Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
 (`SIIRFactory`, `CompanySIIR`), `Makefile`, `scripts/deploy.sh`, docs
 (`giver3.md`, `wallet.md`, `project.md`, `usage.md`), full dividend-paying
-lifecycle **and the Model-B (rounds) issuance path**:
-Genesis → Round 1 → Round 2 (50/1000 → 75/200000 → 100/200000 issued and
-weighted), and a 4th `issue()` correctly reverts with `ERR_SUPPLY_EXCEEDED`
-(exit 105).
+lifecycle, the Model-B (rounds) issuance path, and on-chain company content:
+logo + deed image + UI bundle (base64 data URIs, size-capped, byte-exact
+round-trips) and the **founder's charter** (immutable text, founder-key
+ratification, stable fingerprint).
 
-**Next:** commit milestone; explorer/API tooling;
-wallet integration (claim button, deed view); TIP-3/eccUSDC payout module;
+**Next:** explorer/API tooling;
+wallet integration (claim button, deed view); serving the on-chain UI bundle
+plus images through a gateway; TIP-3/eccUSDC payout module;
 governance & dissolution safeguards; marketplace hooks.

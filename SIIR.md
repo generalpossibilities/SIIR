@@ -134,6 +134,53 @@ any company or by the factory:
     In both models, supply can only ever grow in ways the founder
     declared on day one.
 
+4.  **The company's charter (immutable commitments) is stored on-chain
+    and can never be edited.** At deployment the founder supplies the
+    charter — a written statement of how the company and its SIIRs will
+    be run — and it is frozen into the company contract for life.
+    Investors read it with `getCharter()`; its hash is pinned by
+    `getCharterFingerprint()`. Because the company contract is
+    immutable, the text can never be silently amended or withdrawn.
+
+5.  **Company artwork, the deed image, and an optional app bundle are
+    stored on-chain.** Acki Nacki provides free storage (freemium
+    model), so the company logo, the deed card image used for every
+    SIIR, and optionally a static UI bundle are supplied at deployment
+    and kept in the contract — no external hosting is required to
+    render an SIIR card. Each payload is size-capped (1 MiB logo/deed,
+    4 MiB UI) and rejected at deploy if exceeded.
+
+## The Founder's Charter
+
+The charter makes the founder's promises **verifiable and usable
+against them**:
+
+1.  **Frozen at creation.** The charter text is a constructor argument
+    shipped inside the immutable company contract. It cannot be edited,
+    and nothing in the protocol (not even the founder) can change it.
+
+2.  **Ratified under the founder's own key.** After deployment the
+    founder calls `ratifyCharter()`, which:
+    - only the founder (their `_founderPubkey` or the `_founder` wallet)
+      may call;
+    - permanently sets `ratified = true`;
+    - emits `CharterRatified(founderPubkey, block.timestamp)` — a
+      timestamped, key-signed acknowledgment.
+
+    This is stronger than a factory signature: the *founder personally*
+    acknowledges the text under their identity.
+
+3.  **Queryable by any investor.** `getCharter()` returns the text and
+    the ratification flag; `getCharterFingerprint()` returns a stable
+    hash so anyone can pin an off-chain copy to the on-chain original.
+
+4.  **Enforcement.** If the founder later issues beyond the declared
+    plan, alters dividend accounting, or otherwise acts at odds with
+    what the charter promised, the mismatch is provable: the immutable
+    text, the fixed issued-plan and dividend-index state, and the
+    key-signed ratification together form an evidentiary record that can
+    be used against them (arbitration, courts, community enforcement).
+
 ## Issuance
 
 The company chooses its issuance model at creation:
@@ -307,6 +354,20 @@ Model B (rounds) is verified too: Genesis → Round 1 → Round 2 issue
 50/1000 → 75/200000 → 100/200000, each `issue()` minting exactly the next
 declared plan; a fourth `issue()` reverts with `ERR_SUPPLY_EXCEEDED`
 (exit 105) — declared supply is never exceeded, silently or otherwise.
+
+On-chain company content is verified too:
+
+- Logo, deed image and UI bundle are supplied at `deployCompany` as
+  base64 data-URI strings, stored in the immutable company contract, and
+  readable via `getCompanyImage()` / `getSIIRImage()` / `getUI()` —
+  round-trip verified (byte-for-byte). Sizes are capped (1 MiB logo/deed,
+  4 MiB UI); an oversized upload reverts at the factory with
+  `ERR_LOGO_TOO_LARGE` (exit 202).
+- The **founder's charter** is frozen with the company and verified:
+  `getCharter()` returns the full text, `ratifyCharter()` flips it to
+  founder-ratified under the founder's own key (second ratification
+  reverts with `ERR_ALREADY_RATIFIED`, exit 112), and
+  `getCharterFingerprint()` is stable.
 
 Verified on-chain mechanics learned while building:
 

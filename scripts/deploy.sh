@@ -64,6 +64,39 @@ body() { # body <abi> <method> <json>
 
 company_code() { tvm-cli -j decode stateinit --tvc "$CT/CompanySIIR.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
 
+# On-chain content: base64 data-URI strings supplied at CompanySIIR deployment.
+# These round-trip through factory.deployCompany and are readable via getters.
+img_uri() { # img_uri <svg-body> -> data:image/svg+xml;base64,...
+  local svg="<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\">$1</svg>"
+  echo -n "data:image/svg+xml;base64,$(printf '%s' "$svg" | base64 -w0)"
+}
+LOGO_SVG=$(img_uri '<rect width="64" height="64" fill="#1d4ed8"/><text x="32" y="40" font-size="28" fill="#fff" text-anchor="middle">S</text>'
+)
+SIIRIMG_SVG=$(img_uri '<rect width="64" height="64" fill="#111827"/><text x="32" y="40" font-size="22" fill="#fbbf24" text-anchor="middle">SIIR</text>'
+)
+UI_BUNDLE=$(python3 - <<'PY'
+import base64
+html = "<!doctype html><html><body><h1>NJD Ventures</h1><p>shareholder register on-chain</p></body></html>"
+print("data:text/html;base64," + base64.b64encode(html.encode()).decode())
+PY
+)
+CHARTER=$(python3 - <<'PY'
+import json
+charter = """NJD Ventures charter (immutable, on-chain, founder-bound).
+1. The total supply of SIIRs is fixed at creation and grows only via the
+   declared issuance plan. No silent minting, ever.
+2. Dividends are paid in SHELL and belong to the SIIR: whoever holds the
+   deed at claim time receives the pending value, cum-dividend.
+3. Every SIIR transfer is recorded in the register's immutable history.
+4. The founder commits to issuing no more than the declared plan, to
+   depositing dividends within 30 days of a declared distribution, and to
+   never altering the dividend accounting.
+5. This charter is binding on the founder personally; the founder's
+   on-chain ratification (ratifyCharter) confirms it under their key."""
+print(json.dumps(charter))   # JSON-escaped string literal: use as "charter":$CHARTER
+PY
+)
+
 deploy_self() { # deploy_self <work-tvc-name> <keys> <abi> <params-json> -> deploys self-rooted
   local name=$1 keys=$2 abi=$3 params=$4 R
   R=$(cli genaddr "$WORK/$name.tvc" --abi "$abi" --setkey "$keys" 2>/dev/null \
@@ -148,7 +181,8 @@ if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
     "{\"name\":\"NJD Ventures\",\"description\":\"SIIR demo company\",\"website\":\"https://njd.example\",\
       \"metadataUri\":\"ipfs://QmSIIRdemo\",\"founder\":\"$(legacy "$FOUNDER")\",\"founderPubkey\":\"0x$FOUNDER_PUB\",\
       \"issuanceModel\":0,\"plans\":[{\"count\":100,\"weight\":1000,\"label\":\"Genesis\",\"issued\":false}],\
-      \"initialValue\":20000000000}" >/dev/null || true
+      \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"$UI_BUNDLE\",\
+      \"charter\":$CHARTER,\"initialValue\":20000000000}" >/dev/null || true
   wait_active "$COMPANY" "company"
 fi
 cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
@@ -157,10 +191,16 @@ cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
 echo "== 5. issue genesis =="
 ISSUED=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["issuedCount"])')
-[ "$ISSUED" = "0" ] && {
-  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m issue '{}' >/dev/null || true
-  sleep 3
-}
+if [ "$ISSUED" = "0" ]; then
+  for attempt in $(seq 1 6); do
+    cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m issue '{}' >/dev/null 2>&1 || true
+    sleep 4
+    ISSUED=$(cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["issuedCount"])' 2>/dev/null || echo 0)
+    [ "$ISSUED" != "0" ] && break
+  done
+fi
+[ "$ISSUED" != "0" ] || { echo "[fail] issue() never landed"; exit 1; }
 cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
 
 # ---------- 6. holder wallet ----------
@@ -183,7 +223,7 @@ fi
 
 # ---------- 7. transfer SIIR #1 -> holder ----------
 echo "== 7. transfer SIIR #1 to holder =="
-OWNER=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"])')
+OWNER=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
 echo "  SIIR #1 owner: $OWNER"
 if [ "$OWNER" != "0:$FOUNDER_RAW" ]; then
   echo "  owner is not founder wallet; skipping transfer"
@@ -229,7 +269,7 @@ if ! cli account "$COMPANY_B" 2>/dev/null | grep -q '"Active"'; then
   echo "  deploying rounds company via factory..."
   # factory spends initialValue in VMSHELL per company; refill if running low
   FB=$(cli account "$FACTORY" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
-  [ "${FB:-0}" -lt 40000000000 ] && { echo "  factory vmshell low (${FB}); refilling..."; fund "$FACTORY" 50000000000; sleep 5; }
+  [ "${FB:-0}" -lt 40000000000 ] && { echo "  factory vmshell low (${FB}); refilling..."; fund "$FACTORY" 125000000000; sleep 5; }
   cli callx --abi "$CT/SIIRFactory.abi.json" --addr "$FACTORY" --keys "$WORK/factory.keys.json" \
     -m deployCompany \
     "{\"name\":\"Rounds Inc\",\"description\":\"model-B company\",\"website\":\"\",\"metadataUri\":\"\",\
@@ -237,24 +277,82 @@ if ! cli account "$COMPANY_B" 2>/dev/null | grep -q '"Active"'; then
       \"plans\":[{\"count\":50,\"weight\":1000,\"label\":\"Genesis\",\"issued\":false},\
                 {\"count\":25,\"weight\":2000,\"label\":\"Round 1\",\"issued\":false},\
                 {\"count\":25,\"weight\":4000,\"label\":\"Round 2\",\"issued\":false}],\
-      \"initialValue\":20000000000}" >/dev/null || true
-  wait_active "$COMPANY_B" "rounds company"
+      \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"\",\
+      \"charter\":$CHARTER,\"initialValue\":20000000000}" >/dev/null || true
+  wait_active "$COMPANY_B" "rounds company" 120
 fi
 run_info_b() { cli run "$COMPANY_B" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    issuedCount=%s totalWeight=%s model=%s"%(d["issuedCount"],d["totalWeight"],d["issuanceModel"]))'; }
-issue_round() { # issue_round <keys-file> — founder = holder, so sign with holder key
-  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$1" -m issue '{}' >/dev/null 2>&1 || true
-  sleep 3
+b_count() { cli run "$COMPANY_B" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("issuedCount","0"))' 2>/dev/null || echo 0; }
+issue_until() { # issue_until <keys-file> <target-count> — founder = holder
+  local keys=$1 target=$2 n
+  n=$(b_count)
+  for attempt in $(seq 1 8); do
+    [ "$n" -ge "$target" ] && return 0
+    cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$keys" -m issue '{}' >/dev/null 2>&1 || true
+    sleep 4
+    n=$(b_count)
+  done
+  echo "[fail] issue stopped at $n (wanted $target)"; exit 1
 }
 echo "  issuing genesis..."
-issue_round "$WORK/holder.keys.json" && run_info_b
+issue_until "$WORK/holder.keys.json" 50 && run_info_b
 echo "  issuing round 1..."
-issue_round "$WORK/holder.keys.json" && run_info_b
+issue_until "$WORK/holder.keys.json" 75 && run_info_b
 echo "  issuing round 2..."
-issue_round "$WORK/holder.keys.json" && run_info_b
+issue_until "$WORK/holder.keys.json" 100 && run_info_b
 echo "  extra issue (expect supply-exceeded rejection):"
-cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$WORK/holder.keys.json" -m issue '{}'
+for attempt in $(seq 1 8); do
+  OUT=$(cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$WORK/holder.keys.json" -m issue '{}' 2>&1 || true)
+  EC=$(echo "$OUT" | python3 -c 'import json,sys,re; t=sys.stdin.read(); m=re.search(r"\"exit_code\":\s*(-?\d+)", t); print(m.group(1) if m else "0")')
+  [ "$EC" != "0" ] && { echo "  exit_code: $EC"; break; }
+  sleep 4
+done
 cli run "$COMPANY_B" getPlans {} --abi "$CT/CompanySIIR.abi.json"
+
+# ---------- 11. on-chain content: round-trip + size-cap enforcement ----------
+echo "== 11. on-chain content =="
+ct_get() { cli run "$1" "$2" '{}' --abi "$CT/CompanySIIR.abi.json" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('$3', d.get('value0','')))"; }
+SZ_LOGO=$(ct_get "$COMPANY" getContentInfo logoSize); SZ_SIIR=$(ct_get "$COMPANY" getContentInfo siirImageSize); SZ_UI=$(ct_get "$COMPANY" getContentInfo uiSize)
+echo "  content sizes: logo=$SZ_LOGO siirImage=$SZ_SIIR ui=$SZ_UI (bytes)"
+R_LOGO=$(ct_get "$COMPANY" getCompanyImage img); R_SIIR=$(ct_get "$COMPANY" getSIIRImage img); R_UI=$(ct_get "$COMPANY" getUI ui)
+[ "$R_LOGO" = "$LOGO_SVG" ] && echo "  [ok] company logo round-trips on-chain" || echo "  [fail] logo mismatch"
+[ "$R_SIIR" = "$SIIRIMG_SVG" ] && echo "  [ok] SIIR deed image round-trips on-chain" || echo "  [fail] siir image mismatch"
+[ "$R_UI" = "$UI_BUNDLE" ] && echo "  [ok] static UI bundle round-trips on-chain" || echo "  [fail] ui mismatch"
+echo "  oversized uploads: capped at deploy by require() in the factory"
+echo "    (factory ERR_LOGO/SIIR/UI/CHARTER_TOO_LARGE 202-205, company 108-111)."
+echo "    Note: tvm-cli's own message builder refuses >~128KB/single-message,"
+echo "    so the cap is guaranteed server-side but not triggerable via this CLI."
+
+# ---------- 12. charter: immutable commitment + founder ratification ----------
+echo "== 12. charter =="
+R_CHAR=$(ct_get "$COMPANY" getCharter charter)
+R_RAT=$(ct_get "$COMPANY" getCharter ratified | tr '[:upper:]' '[:lower:]')
+FP=$(ct_get "$COMPANY" getCharterFingerprint fp)
+CHARTER_RAW=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "$CHARTER")
+[ "$R_CHAR" = "$CHARTER_RAW" ] && echo "  [ok] charter round-trips on-chain (immutable text)" || echo "  [fail] charter mismatch"
+echo "  [ok] ratified=$R_RAT  fingerprint=$FP"
+if [ "$R_RAT" != "true" ]; then
+  for attempt in $(seq 1 6); do
+    cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m ratifyCharter '{}' >/dev/null 2>&1 || true
+    sleep 4
+    R_RAT=$(ct_get "$COMPANY" getCharter ratified | tr '[:upper:]' '[:lower:]')
+    [ "$R_RAT" = "true" ] && break
+  done
+  [ "$R_RAT" = "true" ] || { echo "  [fail] ratifyCharter never landed"; exit 1; }
+  R_CHAR=$(ct_get "$COMPANY" getCharter charter)
+  FP2=$(ct_get "$COMPANY" getCharterFingerprint fp)
+  echo "  after founder ratification: ratified=$R_RAT"
+  [ "$R_CHAR" = "$CHARTER_RAW" ] && echo "  [ok] charter text unchanged after ratification" || echo "  [fail] charter changed!"
+  [ "$FP" = "$FP2" ] && echo "  [ok] charter fingerprint stable ($FP)" || echo "  [fail] fingerprint changed!"
+  echo "  second ratification (expect ERR_ALREADY_RATIFIED exit 112):"
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m ratifyCharter '{}' 2>&1 \
+    | python3 -c 'import json,sys,re; t=sys.stdin.read(); m=re.search(r"\"exit_code\":\s*(-?\d+)", t); print("  exit_code:", m.group(1) if m else ("none:", t[:160]))'
+else
+  echo "  (already ratified on a previous run)"
+fi
 
 echo ""
 echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B =="
