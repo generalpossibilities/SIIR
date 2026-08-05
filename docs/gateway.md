@@ -20,6 +20,16 @@ HTTP face, so the gateway translates getter calls into web responses:
 | `GET /company/<addr>/deed` | on-chain SIIR deed card image |
 | `GET /company/<addr>/info` | `getCompanyInfo` as JSON |
 | `GET /company/<addr>/charter` | charter text + `ratified` flag + fingerprint as JSON |
+| `GET /company/<addr>/explore` | explorer page: search, SIIR register (paginated), payout tracks, issuance plans |
+| `GET /company/<addr>/full` | `getCompanyInfo` + treasury + plans + content sizes + version as JSON |
+| `GET /company/<addr>/register.json` | paginated SIIR register: `?offset=&limit=` (default offset 0, limit 25, max 100) |
+| `GET /company/<addr>/holders.json` | holders aggregated from the register (`{owner: {count, weight}}`); full scan, so large registers are capped by a time budget (`truncated`) |
+| `GET /company/<addr>/holder/<owner>` | holder page (SIIRs + balance + claimable). Accepts `64-hex`, `0:64-hex`, or `dapp_id::account_id`; the same data is on `.../holder.json/<owner>` |
+| `GET /company/<addr>/siir/<id>` | SIIR page (weight, owner, round, label, metadata, fingerprint, claimable, transfer history); same data on `.../siir.json/<id>` |
+| `GET /company/<addr>/plans` | `getPlans` as JSON |
+| `GET /company/<addr>/treasury` | `getDividendCurrencies` as JSON |
+| `GET /company/<addr>/history/<id>` | `getHistory` entries as JSON |
+| `GET /company/<addr>/search?q=...` | if `q` is an owner address -> holder page; otherwise substring scan of labels, metadata URIs and owner addresses. The same data is on `.../search.json?q=` |
 
 ## Run
 
@@ -51,3 +61,7 @@ Then open `http://127.0.0.1:8000/`.
   signed transactions (see `usage.md`).
 - Any tvm-cli networking quirk (e.g. message-delivery races) is invisible
   here — getters are local emulation against the mirror node.
+- Reading a whole register is expensive: each SIIR needs its own getter, so
+  register/holder scans run through a small thread pool (8 workers) with a
+  time budget (~25 s) and pagination; `truncated: true` means the budget was
+  hit before the scan finished.

@@ -433,7 +433,7 @@ visible.
 | `getFingerprint` | `hash(weight, createdAt, round, label, metadataUri)` | auditable deed identity, never changes |
 | ecc currencies (ids 1, 2, 3, …) | dividend media | any currency the network or a wallet's dapp creates — payout token is a parameter, not an accounting change |
 | `scripts/deploy.sh` | one-shot reproducible shellnet demo | proves the whole contract stack, replays anytime |
-| `scripts/gateway.py` | serves on-chain UI/images/charter over HTTP | browsers need URL-shaped reads; content stays on-chain |
+| `scripts/gateway.py` | serves on-chain UI/images/charter over HTTP, plus the SIIR explorer (register, holders, plans, treasury, history, search) | browsers need URL-shaped reads; content stays on-chain |
 
 ---
 
@@ -454,6 +454,12 @@ one `claim(ids)` settles them all. Verified live byte-for-byte across
 three currencies in a single claim (a 1000-weight SIIR of 100000 total
 collects 0.1 SHELL + 50 eccUSDC + 0.01 NACKL per deposit round).
 All servable through the on-chain content gateway (`scripts/gateway.py`).
+The gateway also ships an **explorer**: paginated SIIR register, holder
+lookup (address, balance, claimable), plans, payout tracks, per-SIIR
+fingerprint + history, and free-text/address search — everything read
+live from the contracts (see `docs/gateway.md`).
 
-**Next:** wallet integration (claim button, deed view);
-governance & dissolution safeguards; marketplace hooks.
+**Next:** gateway hardening (real mirror-node client instead of a
+tvm-cli spawn per getter, then bind/override options); wallet
+integration (claim button, deed view); governance & dissolution
+safeguards; marketplace hooks.
