@@ -367,6 +367,8 @@ def abi_type_size(t):
         return (591, 0)  # AddressInfo::maxBitLength (anycast var worst case)
     if t == "string" or t == "bytes":
         return (0, 1)
+    if t == "cell":
+        return (0, 1)  # TvmCell: stored as a cell reference
     if t.startswith("map("):
         return (1, 1)
     if t == "tuple":
@@ -527,6 +529,10 @@ class MirrorState:
                     ref_idx += 1
                     self.state[name] = self._raw_string(r)
                     self._raw_cells[name] = r
+                elif t == "cell":
+                    if ref_idx < len(cur.refs):
+                        ref_idx += 1  # TvmCell: one ref
+                    self.state[name] = None
                 elif t.startswith("map("):
                     if cur.bits[bit_off] == "0":
                         self.state[name] = {}

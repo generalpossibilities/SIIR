@@ -4,6 +4,10 @@
 #
 # Requires: sold, tvm-cli (v3+, extended dapp_id::account_id addresses).
 #
+# FORCE=1 discards the current deployment: fresh factory keys (new dapp-id),
+# fresh companies, fresh marketplace — and bakes the new addresses into the
+# UI bundle before deploying the companies.
+#
 # Addressing model on Acki Nacki:
 #   * self-rooted (deployed via external message) contracts live at <own>::<own>
 #   * children deployed by a contract inherit the parent's dapp_id
@@ -63,6 +67,7 @@ body() { # body <abi> <method> <json>
 }
 
 company_code() { tvm-cli -j decode stateinit --tvc "$CT/CompanySIIR.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
+marketplace_code() { tvm-cli -j decode stateinit --tvc "$CT/SIIRMarketplace.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
 
 # On-chain content: base64 data-URI strings supplied at CompanySIIR deployment.
 # These round-trip through factory.deployCompany and are readable via getters.
@@ -114,13 +119,18 @@ deploy_self() { # deploy_self <work-tvc-name> <keys> <abi> <params-json> -> depl
 
 run() { cli run "$1" "$2" "$3" --abi "$4" 2>&1; }
 
-# does the deployed factory hold the current CompanySIIR code cell?
-factory_code_stale() {
-  local local_code stored
-  local_code=$(company_code)
-  stored=$(cli run "$1" getCompanyCode '{}' --abi "$CT/SIIRFactory.abi.json" \
+# does the deployed factory hold the current code cells (company + marketplace)?
+factory_stale() {
+  local local_cc stored_cc local_mc stored_mc ver
+  local_cc=$(company_code)
+  stored_cc=$(cli run "$1" getCompanyCode '{}' --abi "$CT/SIIRFactory.abi.json" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"])' 2>/dev/null || echo "")
-  [ "$stored" != "$local_code" ]
+  local_mc=$(marketplace_code)
+  stored_mc=$(cli run "$1" getMarketplaceCode '{}' --abi "$CT/SIIRFactory.abi.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+  ver=$(cli run "$1" getFactoryInfo '{}' --abi "$CT/SIIRFactory.abi.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ver",""))' 2>/dev/null || echo "")
+  [ "$stored_cc" != "$local_cc" ] || [ "$stored_mc" != "$local_mc" ] || [ "$ver" != "2.0.0" ]
 }
 
 # ---------- 1. build ----------
@@ -133,21 +143,30 @@ echo "== 2. factory =="
 FACTORY_RAW=$(bake SIIRFactory "$WORK/factory.keys.json" "$CT/SIIRFactory.abi.json"); save_baked factory "$FACTORY_RAW"
 FACTORY=$(self "$FACTORY_RAW")
 echo "  factory: $FACTORY"
-if ! cli account "$FACTORY" 2>/dev/null | grep -q '"Active"' || factory_code_stale "$FACTORY"; then
-  if factory_code_stale "$FACTORY"; then
-    echo "  factory holds stale company code; redeploying..."
+if ! cli account "$FACTORY" 2>/dev/null | grep -q '"Active"' || factory_stale "$FACTORY" || [ "${FORCE:-0}" = "1" ]; then
+  if factory_stale "$FACTORY" || [ "${FORCE:-0}" = "1" ]; then
+    echo "  factory holds stale code/version or FORCE=1; redeploying (new dapp-id)..."
     cli genphrase --dump "$WORK/factory.keys.json" >/dev/null
     FACTORY_RAW=$(bake SIIRFactory "$WORK/factory.keys.json" "$CT/SIIRFactory.abi.json"); save_baked factory "$FACTORY_RAW"
     FACTORY=$(self "$FACTORY_RAW")
   fi
   fund "$FACTORY" 100000000000
   sleep 5
-  echo "  deploying factory..."
+  echo "  deploying factory (with marketplace code)..."
   deploy_self SIIRFactory "$WORK/factory.keys.json" "$CT/SIIRFactory.abi.json" \
-    "{\"value\":10000000000,\"companyCode\":\"$(company_code)\"}"
+    "{\"value\":10000000000,\"companyCode\":\"$(company_code)\",\"marketplaceCode\":\"$(marketplace_code)\"}"
   wait_active "$FACTORY" "factory"
 fi
 cli run "$FACTORY" getFactoryInfo {} --abi "$CT/SIIRFactory.abi.json"
+MARKET_RAW=$(cli run "$FACTORY" getMarketplaceAddress '{}' --abi "$CT/SIIRFactory.abi.json" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"].split(":")[1])' 2>/dev/null || echo "")
+MARKET="$FACTORY_RAW::$MARKET_RAW"   # marketplace is factory's child: same dapp-id
+echo "  marketplace: $MARKET"
+if ! cli account "$MARKET" 2>/dev/null | grep -q '"Active"'; then
+  fund "$MARKET" 50000000000
+  sleep 3
+  cli account "$MARKET" 2>/dev/null | grep -q '"Active"' || echo "  [warn] marketplace not active yet"
+fi
 
 # ---------- 3. founder wallet (self-rooted multisig) ----------
 echo "== 3. founder wallet =="
@@ -174,6 +193,11 @@ COMPANY_RAW=$(cli run "$FACTORY" getCompanyAddress \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"].split(":")[1])')
 COMPANY="$FACTORY_RAW::$COMPANY_RAW"
 echo "  company (in factory dapp): $COMPANY"
+# bake the live addresses into the UI bundle so the on-chain explorer opens
+# its own factory directory and demo company (bundle is rebuilt only here:
+# the addresses are only known once the factory is deployed above)
+UI_BUNDLE=$(python3 "$ROOT/static/bundle.py" --set "FACTORY_ADDR=$FACTORY" --set "DEMO_ADDR=$COMPANY" --emit)
+echo "  ui bundle: $(echo -n "$UI_BUNDLE" | wc -c) bytes base64 (cap ~46k)"
 if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
   echo "  deploying company via factory..."
   cli callx --abi "$CT/SIIRFactory.abi.json" --addr "$FACTORY" --keys "$WORK/factory.keys.json" \
@@ -388,8 +412,46 @@ else
   echo "  (already ratified on a previous run)"
 fi
 
+# ---------- 13. marketplace: escrow listing -> bid -> accept ----------
+echo "== 13. marketplace =="
+echo "  marketplace: $MARKET"
+# 13a. seller (holder) escrows SIIR #1 into the marketplace (it owns it after step 7)
+OWNER1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+echo "  SIIR #1 owner: $OWNER1 (seller escrows it)"
+if [ "$OWNER1" = "0:$HOLDER_RAW" ]; then
+  cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer "{\"ids\":[\"1\"],\"newOwner\":\"$(legacy "$MARKET")\"}")\"}" >/dev/null || true
+  sleep 4
+fi
+echo "  SIIR #1 owner after escrow:"
+cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
+# 13b. seller lists it for 5 SHELL
+cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
+  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+    \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" list "{\"company\":\"$(legacy "$COMPANY")\",\"ids\":[\"1\"],\"askPrice\":5000000000,\"currencyId\":2}")\"}" >/dev/null || true
+sleep 4
+echo "  listings:"
+cli run "$MARKET" getListings '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
+# 13c. buyer (founder) bids 5 SHELL, valid 1 hour
+cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":1000000000,\"cc\":{\"2\":5000000000},\"bounce\":true,\"flags\":1,\
+    \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" bid "{\"company\":\"$(legacy "$COMPANY")\",\"ids\":[\"1\"],\"price\":5000000000,\"currencyId\":2,\"validUntil\":$(( $(date +%s) + 3600 ))}")\"}" >/dev/null || true
+sleep 4
+echo "  bids:"
+cli run "$MARKET" getBids '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
+# 13d. seller accepts the top bid
+cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
+  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+    \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" acceptBid '{"listingId":1,"bidId":1}')\"}" >/dev/null || true
+sleep 4
+echo "  after settlement — SIIR #1 owner:"
+cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
+echo "  listing state:"
+cli run "$MARKET" getListing '{"listingId":1}' --abi "$CT/SIIRMarketplace.abi.json" || true
+
 echo ""
-echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B =="
+echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B  marketplace: $MARKET =="
 # register companies for the content gateway (scripts/gateway.py)
 echo "{\"companies\":[{\"address\":\"$COMPANY\",\"tag\":\"model-a\"},{\"address\":\"$COMPANY_B\",\"tag\":\"rounds\"}]}" > "$WORK/companies.json"
 echo "  gateway index -> $WORK/companies.json"

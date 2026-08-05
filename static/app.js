@@ -1,6 +1,9 @@
 "use strict";
 /* app.js - single-page explorer on top of core.js.
    Hash routes:
+     #/                                  -> factory directory (default)
+     #/factory/<dapp>::<acct>           company directory, searchable by name
+     #/marketplace/<dapp>::<acct>       ask listings + buy offers
      #/company/<dapp>::<acct>
      #/company/<addr>/register  #/company/<addr>/holders
      #/company/<addr>/siir/<id> #/company/<addr>/holder/<owner>
@@ -10,7 +13,7 @@
 const NET = "shellnet.ackinacki.org";
 const main = document.getElementById("main");
 const inp = document.getElementById("addr");
-const state = { ms: null, addr: null };
+const state = { ms: null, addr: null, fact: null, mkt: null };
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -180,6 +183,89 @@ async function holderPage(addr, owner) {
             <div class="card"><h2>total claimable</h2><table><tr><th>currency</th><th>pending</th></tr>${claimRows}</table></div>`;
 }
 
+async function factoryPage(addr) {
+    if (state.fact && state.fact.address === addr && state.fact._decoded) {
+        // reload once per navigation; stale cache is fine for a demo
+    } else {
+        state.fact = new FactoryState(addr, NET);
+        await state.fact.load();
+    }
+    const f = state.fact;
+    if (!f._decoded) return error(f.error);
+    const info = f.factoryInfo();
+    const companies = f.companies();
+    const rows = companies.map((c) => `
+        <tr data-name="${esc(c.name.toLowerCase())}"><td>${c.index}</td>
+            <td><a href="#/company/${c.address}">${esc(c.name) || "(unnamed)"}</a></td>
+            <td>${esc(c.issuanceModel === "1" ? "rounds" : "full-cap")}</td>
+            <td><a class="addr" href="#/company/${c.address}">${esc(c.address)}</a></td></tr>`).join("");
+    const html = `
+    <div class="card">
+      <h1>company directory</h1>
+      <p class="mut">decoded from the factory's on-chain registry (map index → company). Search is case-insensitive — "njd" finds "NJD Ventures".</p>
+      <div class="kv"><div class="k">factory</div><div class="v addr">${esc(addr)}</div></div>
+      <div class="kv"><div class="k">marketplace</div><div class="v addr"><a href="#/marketplace/${info.marketplace}">${esc(info.marketplace)}</a></div></div>
+      <div class="kv"><div class="k">companies</div><div class="v">${esc(info.count)}</div></div>
+      <p><input id="fsearch" placeholder="filter by company name…" spellcheck="false"></p>
+    </div>
+    <div class="card"><h2 id="fcount">registered (${companies.length})</h2>
+      <table id="frows"><tr><th>#</th><th>name</th><th>model</th><th>company (dapp::acct)</th></tr>${rows}</table></div>
+    ${companies.length ? "" : '<div class="err">no companies registered in this factory yet.</div>'}`;
+    main.innerHTML = html;
+    const box = document.getElementById("fsearch");
+    if (!box) return;
+    box.addEventListener("keyup", () => {
+        const q = box.value.trim().toLowerCase();
+        let shown = 0;
+        document.querySelectorAll("#frows tr[data-name]").forEach((tr) => {
+            const hit = !q || tr.getAttribute("data-name").includes(q);
+            tr.style.display = hit ? "" : "none";
+            if (hit) shown++;
+        });
+        const count = document.getElementById("fcount");
+        if (count) count.textContent = "registered (" + shown + "/" + companies.length + (q ? ' matching "' + box.value + '"' : "") + ")";
+    });
+}
+
+async function marketplacePage(addr) {
+    if (!(state.mkt && state.mkt.address === addr && state.mkt._decoded)) {
+        state.mkt = new MarketplaceState(addr, NET);
+        await state.mkt.load();
+    }
+    const m = state.mkt;
+    if (!m._decoded) return error(m.error);
+    const listings = m.listings();
+    const bids = m.bids();
+    const cur = (id) => ({ "2": "SHELL", "3": "eccUSDC", "1": "NACKL" })[String(id)] || String(id);
+    const t = (n) => { const d = new Date(Number(n) * 1000); return d.toISOString ? d.toISOString().replace("T", " ").slice(0, 19) : n; };
+    const lrows = listings.map((l) => `
+        <tr><td>${esc(l.id)}</td>
+            <td><a href="#/company/${l.company}">${esc(l.company.split("::")[1].slice(0, 10))}…</a></td>
+            <td><a href="#/company/${l.company}/siir/${l.siirId}">#${esc(l.siirId)}</a></td>
+            <td class="addr">${esc(l.seller)}</td>
+            <td>${fmtBig(l.askPrice)} ${esc(cur(l.currencyId))}</td>
+            <td>${esc(t(l.listedAt))}</td>
+            <td>${l.active ? "open" : "closed"}</td></tr>`).join("");
+    const brows = bids.map((b) => `
+        <tr><td>${esc(b.id)}</td>
+            <td class="addr">${esc(b.bidder)}</td>
+            <td><a href="#/company/${b.company}/siir/${b.siirId}">#${esc(b.siirId)}</a></td>
+            <td>${fmtBig(b.price)} ${esc(cur(b.currencyId))}</td>
+            <td>${esc(b.validUntil === "0" ? "never" : b.validUntil)}</td>
+            <td>${b.accepted ? "spent" : "open"}</td></tr>`).join("");
+    return `
+    <div class="card">
+      <h1>marketplace</h1>
+      <p class="mut">custodial escrow exchange for SIIR deeds, decoded from the marketplace contract state.</p>
+      <div class="kv"><div class="k">marketplace</div><div class="v addr">${esc(addr)}</div></div>
+      <div class="kv"><div class="k">listings / bids</div><div class="v">${esc(m.listingCount())} / ${esc(m.bidCount())}</div></div>
+    </div>
+    <div class="card"><h2>ask listings (${listings.filter((l) => l.active).length} open)</h2>
+      <table><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>listed (utc)</th><th>state</th></tr>${lrows}</table></div>
+    <div class="card"><h2>buy offers (${bids.filter((b) => !b.accepted).length} open)</h2>
+      <table><tr><th>id</th><th>bidder</th><th>deed</th><th>price</th><th>valid until</th><th>state</th></tr>${brows}</table></div>`;
+}
+
 async function route() {
     const h = location.hash;
     try {
@@ -198,8 +284,12 @@ async function route() {
             } else if (crumbs[0] === "holder") {
                 main.innerHTML = await holderPage(addr, decodeURIComponent(crumbs[1]));
             }
-        } else if (h.startsWith("#/company/demo")) {
-            location.hash = "#/company/" + DEMO_ADDR;
+        } else if (h.startsWith("#/factory/")) {
+            await factoryPage(decodeURIComponent(h.slice("#/factory/".length)));
+        } else if (h.startsWith("#/marketplace/")) {
+            main.innerHTML = await marketplacePage(decodeURIComponent(h.slice("#/marketplace/".length)));
+        } else if (h === "" || h === "#/" || h.startsWith("#/company/demo")) {
+            location.hash = "#/factory/" + FACTORY_ADDR;
         }
     } catch (e) {
         main.innerHTML = error((e && e.message) || String(e));
@@ -217,5 +307,6 @@ document.getElementById("go").addEventListener("click", () => {
 inp.addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("go").click(); });
 window.addEventListener("hashchange", route);
 
-const DEMO_ADDR = "ce31c59c80895b5075efdacc9b0fe1d419937b81df0804f93fd5455d06a87f22::7b7c826d72140cb3640f1429bd813475e89874355104f3eb1c7f2a4aaf17a255";
+const FACTORY_ADDR = "e8589bfa0c19221b3f433e656147395c25c573ecce6582cc07294058a7602ce8::e8589bfa0c19221b3f433e656147395c25c573ecce6582cc07294058a7602ce8";
+const DEMO_ADDR = "e8589bfa0c19221b3f433e656147395c25c573ecce6582cc07294058a7602ce8::e41675736c22180617c668583100209ea6ade8e2ecd45ae621881c019fd0434b";
 route();

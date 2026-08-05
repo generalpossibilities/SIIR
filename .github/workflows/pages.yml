@@ -27,6 +27,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install terser (bundle minifier)
+        run: npm install -g terser
+
       - name: Build the single-file on-chain bundle
         run: python3 static/bundle.py
 

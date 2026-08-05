@@ -50,6 +50,22 @@ CT = os.path.join(ROOT, "contracts")
 WORK = os.path.join(ROOT, "scripts", ".work")
 COMPANIES_JSON = os.path.join(WORK, "companies.json")
 COMPANY_ABI = os.path.join(CT, "CompanySIIR.abi.json")
+FACTORY_ABI = os.path.join(CT, "SIIRFactory.abi.json")
+MARKETPLACE_ABI = os.path.join(CT, "SIIRMarketplace.abi.json")
+
+# default factory: the self-rooted factory from the last full deploy
+# (scripts/.work/factory.addr holds its dapp-id == account-id)
+def default_factory():
+    try:
+        with open(os.path.join(WORK, "factory.addr")) as f:
+            h = f.read().strip()
+        if re.fullmatch(r"[0-9a-f]{64}", h):
+            return f"{h}::{h}"
+        if re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", h):
+            return h
+    except OSError:
+        pass
+    return None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mirror as mirror_mod
@@ -84,12 +100,13 @@ MIRROR_LOCK = threading.Lock()
 MIRROR_TTL = 5.0  # seconds: one GraphQL state fetch per company per window
 
 
-def mirror_state(address):
+def mirror_state(address, abi=COMPANY_ABI):
     with MIRROR_LOCK:
         hit = MIRROR_CACHE.get(address)
-        if hit and time.time() - hit[0] < MIRROR_TTL:
+        if hit and hit[1].abi_path == abi and time.time() - hit[0] < MIRROR_TTL:
             return hit[1]
-    ms = mirror_mod.MirrorState(address, COMPANY_ABI, net=NET)
+    ms = mirror_mod.MirrorState(address, abi, net=NET)
+    ms.abi_path = abi
     with MIRROR_LOCK:
         MIRROR_CACHE[address] = (time.time(), ms)
     return ms
@@ -138,10 +155,59 @@ def mirror_getter(address, method, params):
         return {k: str(v) for k, v in ms.content_info().items()}
     if method == "getVersion":
         return {"value0": "1.3.0", "value1": "CompanySIIR"}
+    if method == "getCompanyCount":
+        ms = mirror_state(address, FACTORY_ABI)
+        return {"count": str(ms.state.get("_companyCount", 0))}
+    if method == "getMarketplaceAddress":
+        ms = mirror_state(address, FACTORY_ABI)
+        dapp = address.split("::")[0]
+        mkt = ms.state.get("_marketplace") or ""
+        return {"value0": f"{dapp}::{mkt.split(':')[-1]}" if mkt else ""}
+    if method == "getCompanyList":
+        ms = mirror_state(address, FACTORY_ABI)
+        dapp = address.split("::")[0]
+        companies = ms.state.get("_companies") or {}
+        idx = sorted(companies, key=lambda k: int(k))
+        return {
+            "company": [f"{dapp}::{companies[i][0].split(':')[-1]}" for i in idx],
+            "name": [companies[i][1] for i in idx],
+            "issuanceModel": [companies[i][2] for i in idx],
+            "founder": [companies[i][3] for i in idx],
+        }
+    if method in ("getListingCount", "getBidCount"):
+        ms = mirror_state(address, MARKETPLACE_ABI)
+        return {"count": str(ms.state.get("_listingCount" if method == "getListingCount" else "_bidCount", 0))}
+    if method in ("getListings", "getBids"):
+        ms = mirror_state(address, MARKETPLACE_ABI)
+        dapp = ms.state.get("_factory", "").split(":")[-1] or ""
+        src = ms.state.get("_listings" if method == "getListings" else "_bids", {})
+        ids = sorted(src, key=lambda k: int(k))
+        rows = [src[i] for i in ids]
+        if method == "getListings":
+            return {
+                "ids": ids,
+                "company": [f"{dapp}::{r[0].split(':')[-1]}" for r in rows],
+                "siirIds": [str(r[1]) for r in rows],
+                "seller": [r[2] for r in rows],
+                "askPrice": [str(r[3]) for r in rows],
+                "currencyId": [str(r[4]) for r in rows],
+                "listedAt": [str(r[5]) for r in rows],
+                "active": [bool(r[6]) for r in rows],
+            }
+        return {
+            "ids": ids,
+            "bidder": [r[0] for r in rows],
+            "company": [f"{dapp}::{r[1].split(':')[-1]}" for r in rows],
+            "siirIds": [str(r[2]) for r in rows],
+            "price": [str(r[3]) for r in rows],
+            "currencyId": [str(r[4]) for r in rows],
+            "validUntil": [str(r[5]) for r in rows],
+            "accepted": [bool(r[6]) for r in rows],
+        }
     return None
 
 
-def run_getter(address, method, params="{}"):
+def run_getter(address, method, params="{}", abi=COMPANY_ABI):
     key = (address, method, params)
     now = time.time()
     with CACHE_LOCK:
@@ -156,7 +222,7 @@ def run_getter(address, method, params="{}"):
             log(f"mirror {method}@{address} failed ({e}); falling back to tvm-cli")
             data = None
     if data is None:
-        out = tvm_cli("run", address, method, params, "--abi", COMPANY_ABI)
+        out = tvm_cli("run", address, method, params, "--abi", abi)
         try:
             data = json.loads(out.stdout)
         except json.JSONDecodeError:
@@ -170,7 +236,38 @@ def run_getter(address, method, params="{}"):
     return data
 
 
+def load_companies_from(factory):
+    """Decode the factory's on-chain company registry (mirror state)."""
+    if not factory:
+        return []
+    try:
+        ms = mirror_state(factory, FACTORY_ABI)
+        dapp = factory.split("::")[0]
+        companies = ms.state.get("_companies") or {}
+        rows = []
+        for i in sorted(companies, key=lambda k: int(k)):
+            e = companies[i]
+            rows.append({
+                "address": f"{dapp}::{e[0].split(':')[-1]}",
+                "name": e[1],
+                "issuanceModel": e[2],
+                "founder": e[3],
+                "index": int(i),
+                "source": "factory-registry",
+            })
+        return rows
+    except Exception as e:
+        log(f"factory registry decode failed ({e})")
+        return []
+
+
 def load_companies():
+    """Company directory straight off the factory's on-chain registry
+    (map index -> CompanyEntry), decoded from the mirror node. Falls back to
+    scripts/.work/companies.json when the factory is unreachable."""
+    rows = load_companies_from(default_factory())
+    if rows:
+        return rows
     if not os.path.exists(COMPANIES_JSON):
         return []
     try:
@@ -718,6 +815,76 @@ a{{color:#1d4ed8}} li{{margin:6px 0}}</style></head><body>
     return body
 
 
+def factory_page(addr):
+    info = run_getter(addr, "getCompanyList") or {}
+    count = run_getter(addr, "getCompanyCount") or {}
+    mkt = run_getter(addr, "getMarketplaceAddress") or {}
+    rows = "".join(
+        f"<li><a href=\"/company/{a}/\">{escape(n)}</a> "
+        f"(model {'rounds' if int(m or 0) == 1 else 'full-cap'}) "
+        f"<a href=\"/company/{a}/explore\">explore</a> "
+        f"<small><code>{escape(a)}</code></small></li>"
+        for a, n, m in zip(
+            info.get("company", []), info.get("name", []), info.get("issuanceModel", []))
+    )
+    mkt_href = f"<a href=\"/marketplace/{escape(mkt.get('value0',''))}/\">{escape(mkt.get('value0',''))}</a>" if mkt.get("value0") else "<em>none</em>"
+    body = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR factory directory</title>
+<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
+a{{color:#1d4ed8}} li{{margin:6px 0}} code{{font-size:12px}}</style></head><body>
+<h1>SIIR factory directory</h1>
+<p>companies registered in <code>{escape(addr)}</code> — read straight from the factory's
+on-chain registry (mirror decode).</p>
+<p><strong>{count.get('count', '?')}</strong> registered · marketplace: {mkt_href}</p>
+<ul>{rows or '<li>no companies registered</li>'}</ul>
+<p><small><a href="/factory/">back to factory index</a></small></p></body></html>"""
+    return body
+
+
+def marketplace_page(addr):
+    listings = run_getter(addr, "getListings") or {}
+    bids = run_getter(addr, "getBids") or {}
+    n_list = run_getter(addr, "getListingCount") or {}
+    n_bids = run_getter(addr, "getBidCount") or {}
+    cur = {"1": "NACKL", "2": "SHELL", "3": "eccUSDC"}
+    lrows = "".join(
+        f"<tr><td>{i}</td><td><a href=\"/company/{escape(c)}/\">{escape(c.split('::')[1][:10])}…</a></td>"
+        f"<td><a href=\"/company/{escape(c)}/siir/{escape(s)}\">#{escape(s)}</a></td>"
+        f"<td><code>{escape(seller)}</code></td><td>{price} {escape(cur.get(cid, cid))}</td>"
+        f"<td>{'open' if act else 'closed'}</td></tr>"
+        for i, c, s, seller, price, cid, _t, act in zip(
+            listings.get("ids", []), listings.get("company", []), listings.get("siirIds", []),
+            listings.get("seller", []), listings.get("askPrice", []),
+            listings.get("currencyId", []), listings.get("listedAt", []),
+            listings.get("active", []))
+    )
+    brows = "".join(
+        f"<tr><td>{i}</td><td><code>{escape(bidder)}</code></td>"
+        f"<td><a href=\"/company/{escape(c)}/siir/{escape(s)}\">#{escape(s)}</a></td>"
+        f"<td>{price} {escape(cur.get(cid, cid))}</td>"
+        f"<td>{'spent' if acc else 'open'}</td></tr>"
+        for i, bidder, c, s, price, cid, _v, acc in zip(
+            bids.get("ids", []), bids.get("bidder", []), bids.get("company", []),
+            bids.get("siirIds", []), bids.get("price", []), bids.get("currencyId", []),
+            bids.get("validUntil", []), bids.get("accepted", []))
+    )
+    body = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR marketplace</title>
+<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111}}
+a{{color:#1d4ed8}} table{{border-collapse:collapse;width:100%;margin:10px 0}}
+th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #ddd;font-size:14px}}
+code{{font-size:12px}}</style></head><body>
+<h1>SIIR marketplace</h1>
+<p>custodial escrow exchange for SIIR deeds at <code>{escape(addr)}</code> —
+state decoded from the marketplace contract.</p>
+<p><strong>{n_list.get('count', '?')}</strong> listings · <strong>{n_bids.get('count', '?')}</strong> bids</p>
+<h2>ask listings</h2>
+<table><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>state</th></tr>{lrows or '<tr><td colspan=6>none</td></tr>'}</table>
+<h2>buy offers</h2>
+<table><tr><th>id</th><th>bidder</th><th>deed</th><th>price</th><th>state</th></tr>{brows or '<tr><td colspan=5>none</td></tr>'}</table>
+<p><small>all values are read on-chain; nothing is cached by the gateway for longer than a few seconds.</small></p>
+</body></html>"""
+    return body
+
+
 def company_page(addr):
     info = run_getter(addr, "getCompanyInfo")
     charter = run_getter(addr, "getCharter")
@@ -820,6 +987,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(b"missing address", "text/plain", 400)
             addr = parts[1]
             return self.company_resource(addr, parts[2:], qs)
+        if parts[0] == "factory":
+            if len(parts) < 2:
+                return self.factory_index()
+            addr = parts[1]
+            if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", addr):
+                return self._send(b"bad address (want dapp_id::account_id)",
+                                  "text/plain", 400)
+            data = run_getter(addr, "getCompanyList", abi=FACTORY_ABI)
+            if data is None:
+                return self._send(b"factory unreachable", "text/plain", 503)
+            if len(parts) > 2 and parts[2] == "companies.json":
+                return self._send(json.dumps({
+                    "companies": load_companies_from(addr),
+                    "count": (run_getter(addr, "getCompanyCount", abi=FACTORY_ABI) or {}).get("count"),
+                    "marketplace": (run_getter(addr, "getMarketplaceAddress", abi=FACTORY_ABI) or {}).get("value0", ""),
+                }).encode(), "application/json")
+            return self._send(factory_page(addr).encode(),
+                              "text/html; charset=utf-8")
+        if parts[0] == "marketplace":
+            if len(parts) < 2:
+                return self._send(b"missing address", "text/plain", 400)
+            addr = parts[1]
+            if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", addr):
+                return self._send(b"bad address (want dapp_id::account_id)",
+                                  "text/plain", 400)
+            data = run_getter(addr, "getListings", abi=MARKETPLACE_ABI)
+            if data is None:
+                return self._send(b"marketplace unreachable", "text/plain", 503)
+            if len(parts) > 2 and parts[2] in ("listings.json", "bids.json"):
+                key = "getListings" if parts[2] == "listings.json" else "getBids"
+                return self._send(
+                    json.dumps(run_getter(addr, key, abi=MARKETPLACE_ABI) or {}).encode(),
+                    "application/json")
+            return self._send(marketplace_page(addr).encode(),
+                              "text/html; charset=utf-8")
         if parts[0] == "static":
             # static client-side explorer (static/index.html + core/app/fields.js)
             rel = "/".join(parts[1:]) or "index.html"
@@ -839,20 +1041,34 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(b"not found", "text/plain", 404)
 
     def index(self):
+        factory = default_factory()
         rows = []
         for c in load_companies():
             addr = c.get("address", "")
-            info = run_getter(addr, "getCompanyInfo") or {}
             rows.append(
-                f'<li><a href="/company/{addr}/">{escape(info.get("name", addr))}</a> '
+                f'<li><a href="/company/{addr}/">{escape(c.get("name") or addr)}</a> '
                 f'<a href="/company/{addr}/explore">explore</a> '
                 f'<small><code>{escape(addr)}</code></small></li>'
             )
+        mkt = ""
+        if factory:
+            mkt = (run_getter(factory, "getMarketplaceAddress", abi=FACTORY_ABI) or {}).get("value0", "")
+        mkt_link = f' · <a href="/marketplace/{escape(mkt)}/">marketplace</a>' if mkt else ""
         html = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR gateway</title></head>
 <body><h1>SIIR gateway — companies on shellnet</h1>
-<ul>{''.join(rows) if rows else '<li>none registered in scripts/.work/companies.json</li>'}</ul>
+<p>directory reads the factory registry on-chain:
+<code>{escape(factory) if factory else 'no factory in scripts/.work/factory.addr'}</code>
+<a href="/factory/{escape(factory)}/">{'open directory' if factory else ''}</a>{mkt_link}</p>
+<ul>{''.join(rows) if rows else '<li>none registered (factory unreachable or empty)</li>'}</ul>
 <p><small>everything rendered here is read from the contracts on-chain.</small></p></body></html>"""
         return self._send(html.encode(), "text/html; charset=utf-8")
+
+    def factory_index(self):
+        factory = default_factory()
+        if not factory:
+            return self._send(b"no factory configured (scripts/.work/factory.addr)",
+                              "text/plain", 404)
+        return self._send(factory_page(factory).encode(), "text/html; charset=utf-8")
 
     def do_POST(self):
         parsed = urlparse(self.path)

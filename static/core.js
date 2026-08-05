@@ -301,6 +301,7 @@ function abiTypeSize(t) {
     if (t === "bool") return [1, 0];
     if (t === "address") return [591, 0];
     if (t === "string" || t === "bytes") return [0, 1];
+    if (t === "cell") return [0, 1]; // TvmCell stores as a cell reference
     if (t.startsWith("map(")) return [1, 1];
     return [0, 0];
 }
@@ -329,6 +330,13 @@ function computeCellBreaks(fields, bitOffset) {
         }
     }
     return breaks;
+}
+
+// ---------- address helpers ----------
+
+function dappAddr(dappId, stdAddr) {
+    if (!dappId || !stdAddr) return "";
+    return dappId + "::" + String(stdAddr).split(":")[1];
 }
 
 // ---------- MirrorState ----------
@@ -518,6 +526,9 @@ class MirrorState {
                     const r = cur.refs[refIdx++];
                     this.state[name] = this.rawString(r);
                     this.rawCells[name] = r;
+                } else if (t === "cell") {
+                    this.state[name] = null;
+                    if (refIdx < cur.refs.length) refIdx++; // TvmCell: one ref
                 } else if (t.startsWith("map(")) {
                     if (cur.bits[bitOff] !== "1") { this.state[name] = {}; bitOff += 1; continue; }
                     bitOff += 1;
@@ -695,7 +706,115 @@ class MirrorState {
     }
 }
 
+// ---------- SIIRFactory state (company directory + marketplace) ----------
+
+class FactoryState extends MirrorState {
+    constructor(addr, net) {
+        super(addr, FIELDS.SIIRFactory, net);
+    }
+
+    companyCount() { return String(this.state._companyCount || 0n); }
+
+    marketplace() { return this.state._marketplace || ""; }
+
+    ownerPubkey() { return hex0x64(this.state._ownerPubkey || 0n); }
+
+    // directory: index -> [company, name, issuanceModel, founder]
+    companies() {
+        const m = this.state._companies || {};
+        const out = [];
+        for (const k in m) {
+            const e = m[k];
+            if (!e) continue;
+            out.push({
+                index: Number(k),
+                address: dappAddr(this.dappId(), e[0]),
+                name: e[1] || "",
+                issuanceModel: String(e[2] || 0),
+                founder: e[3] || "",
+            });
+        }
+        out.sort((a, b) => a.index - b.index);
+        return out;
+    }
+
+    company(addr) {
+        return this.companies().find((c) => c.address === addr) || null;
+    }
+
+    dappId() { return this.address.split("::")[0]; }
+
+    factoryInfo() {
+        return {
+            count: this.companyCount(),
+            marketplace: dappAddr(this.dappId(), this.marketplace()),
+            ownerPubkey: this.ownerPubkey(),
+        };
+    }
+}
+
+// ---------- SIIRMarketplace state (ask listings + buy offers) ----------
+
+class MarketplaceState extends MirrorState {
+    constructor(addr, net) {
+        super(addr, FIELDS.SIIRMarketplace, net);
+    }
+
+    factoryAddr() { return this.state._factory || ""; }
+
+    // the marketplace is a child of a self-rooted factory: its dapp-id is the
+    // factory's own hash, so any standard address under it links as dapp::acct
+    dappId() { return String(this.state._factory || "").split(":")[1] || ""; }
+
+    listingCount() { return String(this.state._listingCount || 0n); }
+
+    bidCount() { return String(this.state._bidCount || 0n); }
+
+    listings() {
+        const m = this.state._listings || {};
+        const out = [];
+        for (const k in m) {
+            const l = m[k];
+            if (!l) continue;
+            out.push({
+                id: k,
+                company: dappAddr(this.dappId(), l[0]),
+                siirId: String(l[1]),
+                seller: l[2] || "",
+                askPrice: String(l[3] || 0n),
+                currencyId: String(l[4] || 0),
+                listedAt: String(l[5] || 0n),
+                active: !!l[6],
+            });
+        }
+        out.sort((a, b) => Number(a.id) - Number(b.id));
+        return out;
+    }
+
+    bids() {
+        const m = this.state._bids || {};
+        const out = [];
+        for (const k in m) {
+            const b = m[k];
+            if (!b) continue;
+            out.push({
+                id: k,
+                bidder: b[0] || "",
+                company: dappAddr(this.dappId(), b[1]),
+                siirId: String(b[2]),
+                price: String(b[3] || 0n),
+                currencyId: String(b[4] || 0),
+                validUntil: String(b[5] || 0n),
+                accepted: !!b[6],
+            });
+        }
+        out.sort((a, b) => Number(a.id) - Number(b.id));
+        return out;
+    }
+}
+
 const XP = {
-    MirrorState, parseBoc, cellHash, cellDepth, computeCellBreaks, decodeDict,
+    MirrorState, FactoryState, MarketplaceState,
+    parseBoc, cellHash, cellDepth, computeCellBreaks, decodeDict, dappAddr,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = XP;

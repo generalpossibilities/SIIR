@@ -49,16 +49,16 @@
 <body>
 <header>
   <span class="brand">SIIR explorer</span>
-  <input id="addr" placeholder="dapp_id::account_id  (paste a company address)" spellcheck="false">
+  <input id="addr" placeholder="dapp_id::account_id  (factory, marketplace, or company)" spellcheck="false">
   <button id="go">open</button>
-  <a href="#/company/demo">demo</a>
+  <a href="#/company/demo">demo company</a>
 </header>
 <main id="main"><div class="card"><h2>how to use</h2>
 <p>The explorer runs entirely in your browser: it fetches one GraphQL snapshot from the public Acki
-Nacki mirror node, decodes the company's persistent state on the fly (no server, no tvm-cli), and
+Nacki mirror node, decodes the contract's persistent state on the fly (no server, no tvm-cli), and
 reconstructs every getter.</p>
-<p>Paste a company address in the bar (format <code>dapp_id::account_id</code>, e.g. the demo above)
-or open a company through its gateway page.</p>
+<p>Paste a <code>dapp_id::account_id</code> address in the bar (factory, marketplace, or company —
+the demo above) or open a company through the factory directory.</p>
 </div></main>
 <footer>read-only · data: shellnet mirror node · decoding: <code>static/core.js</code></footer>
 <script src="fields.js"></script>
