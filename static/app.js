@@ -115,30 +115,51 @@ function overviewSection(ms, c, plans, div, content, fp) {
 }
 
 function registerSection(ms) {
-    const siirs = ms.siirs();
-    const keys = Object.keys(siirs).sort((a, b) => Number(a) - Number(b));
-    const rows = keys.map((k) => {
-        const s = siirs[k];
-        return `<tr><td><a href="#/company/${ms.address}/siir/${k}">${k}</a></td>
-                <td>${esc(s[0])}</td>
-                <td><a class="addr" href="#/company/${ms.address}/holder/${encodeURIComponent(s[1])}">${esc(s[1])}</a></td>
-                <td>${esc(s[2])}</td><td>${esc(s[3])}</td><td>${esc(s[4] || "")}</td></tr>`;
+    const info = ms.companyInfo();
+    const segs = ms.segments();
+    const ovs = ms.overrides();
+    const ovKeys = Object.keys(ovs).sort((a, b) => BigInt(a) > BigInt(b) ? 1 : -1);
+    const rows = segs.map((sg) => {
+        const pid = ms._planOf(sg.start);
+        const p = pid === null ? null : ms._plansRaw()[Number(pid)];
+        const w = p ? p[1] : 0n;
+        const label = p ? (p[2] || "") : "";
+        const n = sg.end - sg.start + 1n;
+        return `<tr><td><a href="#/company/${ms.address}/siir/${sg.start}">${fmtBig(sg.start)}</a> – ${fmtBig(sg.end)}</td>
+                <td>${fmtBig(w)}</td>
+                <td><a class="addr" href="#/company/${ms.address}/holder/${encodeURIComponent(sg.owner)}">${esc(sg.owner)}</a></td>
+                <td>${pid === null ? "" : String(pid)}</td>
+                <td>${esc(label)}</td>
+                <td>${fmtBig(n)}</td></tr>`;
     }).join("");
-    return `<div class="card"><h2>registry (${keys.length})</h2>
-            <table><tr><th>id</th><th>weight</th><th>owner</th><th>created</th><th>round</th><th>label</th></tr>${rows}</table></div>`;
+    const ovRows = ovKeys.map((k) => {
+        const o = ovs[k];
+        const s = ms.siir(k);
+        if (!s) return "";
+        return `<tr><td><a href="#/company/${ms.address}/siir/${k}">${fmtBig(BigInt(k))}</a></td>
+                <td>${esc(s.weight)}</td>
+                <td><a class="addr" href="#/company/${ms.address}/holder/${encodeURIComponent(s.owner)}">${esc(s.owner)}</a></td>
+                <td>${esc(s.round)}</td>
+                <td>${esc(o[0] || "")}</td>
+                <td>1</td></tr>`;
+    }).join("");
+    return `<div class="card"><h2>registry (${fmtBig(BigInt(info.issuedCount))} SIIRs)</h2>
+            <table><tr><th>range</th><th>weight</th><th>owner</th><th>round</th><th>label</th><th>size</th></tr>${rows}${ovRows}</table>
+            <p class="mut">ownership lives in compact ranges; rows with custom labels are per-id overrides.</p></div>`;
 }
 
 function holdersSection(ms) {
-    const siirs = ms.siirs();
     const h = {};
-    for (const k in siirs) {
-        const s = siirs[k];
-        if (!h[s[1]]) h[s[1]] = { count: 0, weight: 0n };
-        h[s[1]].count += 1;
-        h[s[1]].weight += s[0];
+    for (const s of ms.segments()) {
+        const pid = ms._planOf(s.start);
+        const w = pid === null ? 0n : ms._plansRaw()[Number(pid)][1];
+        const n = s.end - s.start + 1n;
+        if (!h[s.owner]) h[s.owner] = { count: 0n, weight: 0n };
+        h[s.owner].count += n;
+        h[s.owner].weight += w * n;
     }
     const rows = Object.keys(h).map((o) => `<tr><td><a class="addr" href="#/company/${ms.address}/holder/${encodeURIComponent(o)}">${esc(o)}</a></td>
-        <td>${h[o].count}</td><td>${fmtBig(h[o].weight)}</td></tr>`).join("");
+        <td>${fmtBig(h[o].count)}</td><td>${fmtBig(h[o].weight)}</td></tr>`).join("");
     return `<div class="card"><h2>holders (${Object.keys(h).length})</h2>
             <table><tr><th>owner</th><th>siirs</th><th>weight</th></tr>${rows}</table></div>`;
 }
@@ -170,16 +191,32 @@ async function siirPage(addr, id) {
 async function holderPage(addr, owner) {
     const ms = await loadCompany(addr);
     if (!ms._decoded) return error(ms.error);
-    const ids = ms.idsOf(owner);
-    if (ids.length === 0) return error("No SIIRs for " + esc(owner));
+    const ranges = ms.idsOf(owner);
+    if (ranges.length === 0) return error("No SIIRs for " + esc(owner));
+    const total = ms.balanceOf(owner);
     const [cur, amt] = ms.claimableOf(owner);
-    const rows = ids.map((id) => {
-        const s = ms.siir(id);
-        return `<tr><td><a href="#/company/${addr}/siir/${id}">${id}</a></td><td>${esc(s.weight)}</td><td>${esc(s.round)}</td></tr>`;
-    }).join("");
+    let rows;
+    if (total <= 200n) {
+        const ids = [];
+        for (const r of ranges) {
+            for (let i = r.start; i <= r.end; i++) ids.push(i);
+        }
+        rows = ids.map((id) => {
+            const s = ms.siir(id);
+            return `<tr><td><a href="#/company/${addr}/siir/${id}">${fmtBig(id)}</a></td><td>${esc(s.weight)}</td><td>${esc(s.round)}</td></tr>`;
+        }).join("");
+    } else {
+        rows = ranges.map((r) => {
+            const s = ms.siir(r.start);
+            const n = r.end - r.start + 1n;
+            return `<tr><td><a href="#/company/${addr}/siir/${r.start}">${fmtBig(r.start)}</a> – ${fmtBig(r.end)}</td>
+                <td>${esc(s.weight)}</td><td>${esc(s.round)}</td><td>${fmtBig(n)}</td></tr>`;
+        }).join("");
+    }
     const claimRows = cur.map((c, i) => `<tr><td>${esc(c)}</td><td>${amt[i]}</td></tr>`).join("");
-    return `<div class="card"><h1>holder</h1><p class="addr">${esc(owner)}</p></div>
-            <div class="card"><h2>owned (${ids.length})</h2><table><tr><th>id</th><th>weight</th><th>round</th></tr>${rows}</table></div>
+    return `<div class="card"><h1>holder</h1><p class="addr">${esc(owner)}</p>
+            <p class="mut">${fmtBig(total)} SIIRs in ${ranges.length} range(s)</p></div>
+            <div class="card"><h2>owned</h2><table><tr><th>id / range</th><th>weight</th><th>round</th>${total <= 200n ? "" : "<th>size</th>"}</tr>${rows}</table></div>
             <div class="card"><h2>total claimable</h2><table><tr><th>currency</th><th>pending</th></tr>${claimRows}</table></div>`;
 }
 

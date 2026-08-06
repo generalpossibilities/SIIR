@@ -60,6 +60,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--emit", action="store_true",
                         help="print data:text/html;base64,... of the bundle")
+    parser.add_argument("--gzip", action="store_true",
+                        help="with --emit: gzip-compress the payload "
+                             "(marker data:text/html;base64,gz,; the gateway "
+                             "decompresses when serving)")
     parser.add_argument("--set", action="append", default=[], metavar="CONST=value",
                         help="override a const in app.js, e.g. --set FACTORY_ADDR=dapp::acct "
                              "(used by deploy.sh to bake the live addresses into the bundle)")
@@ -107,7 +111,16 @@ def main():
 
     if args.emit:
         import base64
-        print("data:text/html;base64," + base64.b64encode(out.encode()).decode())
+        data = out.encode()
+        if args.gzip:
+            import gzip
+            try:
+                data = gzip.compress(data, mtime=0)
+            except TypeError:  # python < 3.8
+                data = gzip.compress(data)
+            print("data:text/html;base64,gz," + base64.b64encode(data).decode())
+            return
+        print("data:text/html;base64," + base64.b64encode(data).decode())
         return
 
     with open(os.path.join(HERE, "bundle.html"), "w") as f:

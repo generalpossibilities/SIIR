@@ -131,7 +131,7 @@ contract SIIRMarketplace {
             // return the deed to the seller
             uint256[] one = new uint256[](1);
             one[0] = id;
-            CompanySIIR(company).transfer{value: varuint16(0), flag: 1}(one, l.seller);
+            CompanySIIR(company).transfer{value: varuint16(1000000000), flag: 1}(one, l.seller);
         }
     }
 
@@ -163,7 +163,7 @@ contract SIIRMarketplace {
         _bids[bidId].accepted = true; // funds already returned: mark spent
         mapping(uint32 => varuint32) cc;
         cc[b.currencyId] = b.price;
-        msg.sender.transfer({value: varuint16(0), flag: 1, currencies: cc});
+        msg.sender.transfer({value: varuint16(1000000000), flag: 1, currencies: cc});
         emit BidCancelled(bidId, msg.sender);
     }
 
@@ -191,12 +191,12 @@ contract SIIRMarketplace {
         // deed to buyer
         uint256[] one = new uint256[](1);
         one[0] = l.id;
-        CompanySIIR(l.company).transfer{value: varuint16(0), flag: 1}(one, b.bidder);
+        CompanySIIR(l.company).transfer{value: varuint16(1000000000), flag: 1}(one, b.bidder);
 
         // price to seller (all deposited funds; seller's ask was met)
         mapping(uint32 => varuint32) cc;
         cc[b.currencyId] = b.price;
-        l.seller.transfer({value: varuint16(0), flag: 1, currencies: cc});
+        l.seller.transfer({value: varuint16(1000000000), flag: 1, currencies: cc});
 
         emit Settled(listingId, bidId, l.company, l.id, b.bidder, l.seller, b.price, b.currencyId);
     }
@@ -221,7 +221,7 @@ contract SIIRMarketplace {
             // claim() sends to msg.sender = this contract
             uint256[] one = new uint256[](1);
             one[0] = id;
-            CompanySIIR(company).claim{value: varuint16(0), flag: 1}(one);
+            CompanySIIR(company).claim{value: varuint16(1000000000), flag: 1}(one);
         }
     }
 
@@ -250,7 +250,7 @@ contract SIIRMarketplace {
                 }
             }
             if (total > 0) {
-                l.seller.transfer({value: varuint16(0), flag: 1, currencies: cc});
+                l.seller.transfer({value: varuint16(1000000000), flag: 1, currencies: cc});
                 emit DividendsForwarded(company, id, l.seller, currencyIds);
             }
         }

@@ -136,7 +136,19 @@ def mirror_getter(address, method, params):
     if method == "getBalanceOf":
         return {"count": "0x%064x" % ms.balance_of(p["owner"])}
     if method == "getSIIRsOf":
-        return {"ids": ["0x%064x" % i for i in ms.ids_of(p["owner"])]}
+        # v2: ownership as compact ranges [starts[i], ends[i]]
+        ranges = ms.ids_of(p["owner"])
+        return {
+            "starts": ["0x%064x" % s for s, _e in ranges],
+            "ends": ["0x%064x" % e for _s, e in ranges],
+        }
+    if method == "getSegments":
+        return {"segments": [
+            {"start": "0x%064x" % seg["start"],
+             "end": "0x%064x" % seg["end"],
+             "owner": seg["owner"]}
+            for seg in ms._segments()
+        ]}
     if method == "getFingerprint":
         return {"fp": ms.fingerprint(int(p["id"]))}
     if method == "getHistory":
@@ -154,7 +166,7 @@ def mirror_getter(address, method, params):
     if method == "getContentInfo":
         return {k: str(v) for k, v in ms.content_info().items()}
     if method == "getVersion":
-        return {"value0": "1.3.0", "value1": "CompanySIIR"}
+        return {"value0": "2.0.0", "value1": "CompanySIIR"}
     if method == "getCompanyCount":
         ms = mirror_state(address, FACTORY_ABI)
         return {"count": str(ms.state.get("_companyCount", 0))}
@@ -281,14 +293,20 @@ def load_companies():
 
 
 def decode_data_uri(uri):
-    """data:<mime>;base64,<data> -> (mime, bytes) or (None, None)."""
+    """data:<mime>;base64,<data> -> (mime, bytes) or (None, None).
+    A `;base64,gz,` marker means the payload is gzip-compressed (the on-chain
+    UI bundle is stored compressed when it exceeds the message-size budget)."""
     if not uri:
         return None, None
-    m = re.match(r"data:([^;]+);base64,(.*)$", uri, re.S)
+    m = re.match(r"data:([^;]+);base64,(?:(gz),)?(.*)$", uri, re.S)
     if not m:
         return None, None
     try:
-        return m.group(1), base64.b64decode(m.group(2))
+        raw = base64.b64decode(m.group(3))
+        if m.group(2) == "gz":
+            import gzip
+            raw = gzip.decompress(raw)
+        return m.group(1), raw
     except Exception:
         return None, None
 
@@ -301,7 +319,7 @@ def as_int(v, default=0):
     if v is None:
         return default
     try:
-        return int(v, 0)
+        return int(v) if isinstance(v, int) else int(v, 0)
     except (ValueError, TypeError):
         return default
 
@@ -374,27 +392,111 @@ def scan_siirs(addr, start, end, budget=25.0):
     return fetch_rows(addr, range(start, end), budget)
 
 
+def _mirror_register_rows(ms):
+    """Rows for the whole register from the lazy mirror state: one range row
+    per ownership segment plus one row per per-id override."""
+    rows = []
+    for seg in ms._segments():
+        s = ms.siir(seg["start"])
+        if not s:
+            continue
+        rows.append({
+            "id": str(seg["start"]),
+            "idEnd": str(seg["end"]),
+            "weight": s["weight"],
+            "owner": s["owner"],
+            "createdAt": s["createdAt"],
+            "round": s["round"],
+            "label": s["label"],
+            "metadataUri": s["metadataUri"],
+            "size": str(seg["end"] - seg["start"] + 1),
+            "range": True,
+        })
+    for oid, ov in ms._overrides().items():
+        s = ms.siir(oid)
+        if not s:
+            continue
+        rows.append({
+            "id": str(oid),
+            "idEnd": str(oid),
+            "weight": s["weight"],
+            "owner": s["owner"],
+            "createdAt": s["createdAt"],
+            "round": s["round"],
+            "label": ov[0] or "",
+            "metadataUri": ov[1] or "",
+            "size": "1",
+            "range": False,
+        })
+    rows.sort(key=lambda r: int(r["id"]))
+    return rows
+
+
+def lazy_mirror(addr):
+    """MirrorState serving the v2 lazy layout, or raise when the decoded
+    state does not look like one (old materialized layout / decode failure),
+    so callers can fall back to the legacy per-id path."""
+    ms = mirror_state(addr)
+    starts = ms.state.get("_planStartId")
+    ends = [v for v in (ms.state.get("_planEndId") or {}).values()]
+    issued = ms.state.get("_issuedCount")
+    if starts is None or issued is None:
+        raise ValueError("lazy state unavailable")
+    if (max(ends) if ends else 0) != issued:
+        raise ValueError("lazy state mismatch")
+    return ms
+
+
 def register_data(addr, qs):
     info = run_getter(addr, "getCompanyInfo") or {}
     total = max(0, as_int(info.get("nextId")) - 1)
     offset = max(0, int((qs.get("offset") or ["0"])[0] or 0))
     limit = min(100, max(1, int((qs.get("limit") or ["25"])[0] or 25)))
+    try:
+        ms = lazy_mirror(addr)
+        rows = _mirror_register_rows(ms)
+        page = rows[offset:offset + limit]
+        return {"total": total, "offset": offset, "limit": limit,
+                "truncated": len(page) == limit and offset + limit < len(rows),
+                "rows": page, "lazy": True}
+    except Exception:
+        pass
+    # legacy fallback: per-id scan (materialized registers only)
     end = min(total + 1, offset + limit + 1)
     rows, truncated = scan_siirs(addr, offset + 1, end)
     return {"total": total, "offset": offset, "limit": limit,
-            "truncated": truncated, "rows": rows}
+            "truncated": truncated, "rows": rows, "lazy": False}
 
 
 def holders_data(addr):
     info = run_getter(addr, "getCompanyInfo") or {}
     total = max(0, as_int(info.get("nextId")) - 1)
+    try:
+        ms = lazy_mirror(addr)
+        holders = {}
+        for seg in ms._segments():
+            pid = ms._plan_of(seg["start"])
+            if pid is None:
+                continue
+            p = ms._plans_raw()[pid]
+            w = as_int(p[1])
+            n = as_int(seg["end"]) - as_int(seg["start"]) + 1
+            h = holders.setdefault(seg["owner"], {"count": 0, "weight": 0})
+            h["count"] += n
+            h["weight"] += w * n
+        return {"total": total, "truncated": False, "holders": holders,
+                "lazy": True}
+    except Exception:
+        pass
+    # legacy fallback: per-id scan (materialized registers only)
     rows, truncated = scan_siirs(addr, 1, total + 1)
     holders = {}
     for r in rows:
         h = holders.setdefault(r["owner"], {"count": 0, "weight": 0})
         h["count"] += 1
         h["weight"] += as_int(r.get("weight"))
-    return {"total": total, "truncated": truncated, "holders": holders}
+    return {"total": total, "truncated": truncated, "holders": holders,
+            "lazy": False}
 
 
 def holder_data(addr, owner_raw):
@@ -403,14 +505,33 @@ def holder_data(addr, owner_raw):
         return {"error": "bad owner (want 64-hex, 0:64-hex, or dapp::acct)"}
     info = run_getter(addr, "getCompanyInfo") or {}
     out = run_getter(addr, "getSIIRsOf", '{"owner":"%s"}' % owner) or {}
-    ids = [int(i, 16) for i in out.get("ids", [])]
-    rows, _trunc = fetch_rows(addr, ids)
+    starts = out.get("starts", out.get("value0", []))
+    ends = out.get("ends", out.get("value1", []))
+    ranges = list(zip([int(s, 16) for s in starts],
+                      [int(e, 16) for e in ends]))
     claim = run_getter(addr, "getClaimableOf", '{"owner":"%s"}' % owner) or {}
+    balance = as_int((run_getter(addr, "getBalanceOf",
+                                 '{"owner":"%s"}' % owner)
+                      or {}).get("count"))
+    rows = []
+    if balance <= 200:
+        ids = []
+        for s, e in ranges:
+            ids.extend(range(s, e + 1))
+        for i in ids:
+            r = run_getter(addr, "getSIIR", '{"id":%d}' % i) or {}
+            rows.append({"id": i, "idEnd": i, "weight": r.get("weight"),
+                         "round": r.get("round")})
+    else:
+        for s, e in ranges:
+            r = run_getter(addr, "getSIIR", '{"id":%d}' % s) or {}
+            rows.append({"id": s, "idEnd": e,
+                         "size": e - s + 1,
+                         "weight": r.get("weight"), "round": r.get("round")})
     return {
         "owner": owner,
         "company": info.get("name", ""),
-        "balance": str(as_int((run_getter(addr, "getBalanceOf", '{"owner":"%s"}' % owner)
-                               or {}).get("count"))),
+        "balance": str(balance),
         "siirs": rows,
         "claimable": list(zip(claim.get("currencies", []), claim.get("amounts", []))),
     }

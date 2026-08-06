@@ -10,6 +10,14 @@
  * - Supply grows only as declared at creation (full capitalization or rounds).
  * - SIIR cannot be burned. Ever.
  *
+ * v2.0: lazy derived registry. issue() is O(1): the plan record IS the mint.
+ * Every id in an issued plan is a real SIIR, derived on demand —
+ *   weight/round/label/metadata from the plan, owner from _segments.
+ * Only deviations (custom label/metadata) materialize in _siirs; ownership
+ * moves live in compact range segments, so 10B+ SIIRs mint in one message
+ * and whole ranges transfer in one record. Dividend checkpoints are per
+ * plan (index at issue time) for untouched ids, per id once claimed.
+ *
  * v1 note: dividends are paid in SHELL (ecc currency id 2). Unlike VMSHELL —
  * which is nullified across Dapp IDs — SHELL travels between any Dapp IDs, so
  * any wallet anywhere can deposit and withdraw. The accounting is
@@ -22,7 +30,7 @@ pragma AbiHeader pubkey;
 
 contract CompanySIIR {
     // ---------- constants ----------
-    string constant version = "1.3.0";
+    string constant version = "2.0.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
@@ -31,6 +39,8 @@ contract CompanySIIR {
     // eccUSDC (TIP-3-style ecc id 3) is the second supported dividend currency.
     uint32 constant CURRENCY_SHELL = 2;
     uint32 constant CURRENCY_USDC  = 3;
+
+    uint128 constant MAX_UINT128 = 340282366920938463463374607431768211455;
 
     // Gas kept on the company contract for its own operations
     uint128 constant GAS_RESERVE = 1 vmshell;
@@ -94,10 +104,24 @@ contract CompanySIIR {
     TierPlan[] _plans;          // declared at creation, locked forever
     uint32 _planIndex;          // next plan that may be issued
     uint128 _issuedCount;       // SIIRs issued so far
+    // Lazy per-plan state: a plan's SIIRs are derived, not stored.
+    mapping(uint256 => uint256) _planStartId;   // first id of each issued plan
+    mapping(uint256 => uint256) _planEndId;     // last id of each issued plan
+    mapping(uint256 => uint64)  _planIssuedAt;  // mint timestamp of each plan
 
     // ---------- the register ----------
-    mapping(uint256 => SIIR) _siirs;   // serial id -> record
+    // Only deviations from plan defaults are stored per id (custom label /
+    // metadata). Everything else about an id is derived: weight/createdAt/
+    // round from its plan, owner from _segments.
+    mapping(uint256 => SIIROverride) _siirs;   // id -> deviation override
     uint256 _nextId;
+
+    // ---------- ownership: compact range segments ----------
+    // Every issued SIIR is covered by exactly one segment. Minting appends
+    // the founder's range; a transfer splits one segment into up to three
+    // (O(1) per move), so a range of 10B SIIRs moves in a single record.
+    Segment[] _segments;                       // insertion order, non-overlapping
+    mapping(uint256 => HistoryEntry[]) _rangeHistory;  // range moves, keyed by segment start id
 
     // ---------- treasury / dividends ----------
     // Payout is currency-agnostic: every ecc currency id ever deposited
@@ -122,17 +146,34 @@ contract CompanySIIR {
     }
 
     struct SIIR {
+        // fully derived view of one deed (what the getters return)
         uint128 weight;
         address owner;
         uint64 createdAt;
-        uint32 round;           // plan/round index this SIIR came from
-        string label;           // display tier label
-        string metadataUri;     // deed artwork / document URI
+        uint32 round;
+        string label;
+        string metadataUri;
+    }
+
+    struct SIIROverride {
+        string label;           // deviating display tier label ("" = none)
+        string metadataUri;     // deviating deed artwork / document URI
+    }
+
+    struct Segment {
+        uint256 start;          // first id of the range
+        uint256 end;            // last id of the range
+        address owner;          // every id in the range belongs to this owner
     }
 
     // per-SIIR dividend checkpoint, per currency: value of _dividendIndex[cur]
-    // when the SIIR last claimed cur
+    // when the SIIR last claimed cur (only set once a derived id claims; until
+    // then the plan-level checkpoint applies)
     mapping(uint256 => mapping(uint32 => uint128)) _checkpoint;
+
+    // per-plan dividend checkpoint, per currency: value of _dividendIndex[cur]
+    // at the moment the plan was issued (untouched ids inherit this)
+    mapping(uint256 => mapping(uint32 => uint128)) _planCheckpoint;
 
     struct HistoryEntry {
         address from;
@@ -146,8 +187,9 @@ contract CompanySIIR {
 
     // ---------- events ----------
     event CompanyCreated(address factory, address founder, string name, uint8 issuanceModel);
-    event SIIRMinted(uint256 id, uint32 round, address owner, uint128 weight, string label, string metadataUri);
+    event PlanMinted(uint256 planIndex, uint256 startId, uint256 endId, uint128 weight, uint64 timestamp);
     event SIIRTransferred(uint256 id, address from, address to, uint64 timestamp);
+    event RangeTransferred(uint256 startId, uint256 endId, address from, address to, uint64 timestamp);
     event DividendDeposited(address depositor, uint32 currency, uint128 amount, uint128 dividendIndex);
     event DividendClaimed(uint256 id, address holder, uint32 currency, uint128 amount, uint128 dividendIndex);
     event CharterRatified(uint256 founderPubkey, uint64 timestamp);
@@ -230,26 +272,61 @@ contract CompanySIIR {
     }
 
     function _mintPlan(TierPlan plan) private {
-        for (uint256 i = 0; i < plan.count; i++) {
-            uint256 id = _nextId;
-            SIIR s;
-            s.weight = plan.weight;
-            s.owner = _founder;
-            s.createdAt = uint64(block.timestamp);
-            s.round = _planIndex;
+        require(plan.count > 0, ERR_BAD_ISSUANCE);
+        require(plan.weight <= MAX_UINT128 / plan.count, ERR_SUPPLY_EXCEEDED);
+        uint128 added = plan.weight * plan.count;
+        require(_totalWeight <= MAX_UINT128 - added, ERR_SUPPLY_EXCEEDED);
+        uint256 start = _nextId;
+        uint256 end = start + plan.count - 1;
+        _planStartId[_planIndex] = start;
+        _planEndId[_planIndex] = end;
+        _planIssuedAt[_planIndex] = uint64(block.timestamp);
+        for (uint256 c = 0; c < _divCurrencies.length; c++) {
+            // untouched ids inherit the index at issue, so a plan never
+            // captures dividends deposited before it existed
+            _planCheckpoint[_planIndex][_divCurrencies[c]] = _dividendIndex[_divCurrencies[c]];
+        }
+        _nextId = end + 1;
+        _issuedCount += plan.count;
+        _totalWeight = _totalWeight + added;
+        // the founder owns the whole range from day one; extend the founder's
+        // trailing segment when plans are minted back to back
+        uint256 n = _segments.length;
+        if (n > 0 && _segments[n - 1].owner == _founder && _segments[n - 1].end + 1 == start) {
+            _segments[n - 1].end = end;
+        } else {
+            _segments.push(Segment(start, end, _founder));
+        }
+        emit PlanMinted(_planIndex, start, end, plan.weight, uint64(block.timestamp));
+    }
+
+    // ---------- resolution ----------
+    /// Derive the full deed record for an id: plan defaults overlaid with the
+    /// per-id override (label/metadata) and the owning segment.
+    function _resolve(uint256 id) private view returns (SIIR s, uint256 planIdx) {
+        require(id >= 1 && id < _nextId, ERR_NO_SIIR);
+        for (planIdx = 0; planIdx < _planIndex; planIdx++) {
+            if (id >= _planStartId[planIdx] && id <= _planEndId[planIdx]) break;
+        }
+        require(planIdx < _planIndex, ERR_NO_SIIR);
+        TierPlan plan = _plans[planIdx];
+        s.weight = plan.weight;
+        s.createdAt = _planIssuedAt[planIdx];
+        s.round = uint32(planIdx);
+        if (_siirs.exists(id)) {
+            s.label = _siirs[id].label;
+            s.metadataUri = _siirs[id].metadataUri;
+        } else {
             s.label = plan.label;
             s.metadataUri = _metadataUri;
-            // a freshly minted SIIR starts at every track's current index, so
-            // it never inherits dividend value deposited before it was issued
-            for (uint256 c = 0; c < _divCurrencies.length; c++) {
-                _checkpoint[id][_divCurrencies[c]] = _dividendIndex[_divCurrencies[c]];
-            }
-            _siirs[id] = s;
-            emit SIIRMinted(id, s.round, s.owner, s.weight, s.label, s.metadataUri);
-            _nextId++;
         }
-        _issuedCount += plan.count;
-        _totalWeight += plan.weight * plan.count;
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (id >= _segments[i].start && id <= _segments[i].end) {
+                s.owner = _segments[i].owner;
+                break;
+            }
+        }
+        require(s.owner.value != 0, ERR_NO_SIIR);
     }
 
     // ---------- transfer ----------
@@ -262,13 +339,63 @@ contract CompanySIIR {
         tvm.accept();
         for (uint256 i = 0; i < ids.length; i++) {
             uint256 id = ids[i];
-            require(_siirs.exists(id), ERR_NO_SIIR);
-            require(_siirs[id].owner == msg.sender, ERR_NOT_OWNER);
-            _siirs[id].owner = newOwner;
+            (SIIR s, ) = _resolve(id);
+            require(s.owner == msg.sender, ERR_NOT_OWNER);
+            _splitSegmentFor(id, id, msg.sender, newOwner);
             uint256 n = _historyCount[id];
             _history[id][n] = HistoryEntry(msg.sender, newOwner, uint64(block.timestamp));
             _historyCount[id] = n + 1;
             emit SIIRTransferred(id, msg.sender, newOwner, uint64(block.timestamp));
+        }
+    }
+
+    /// Transfer a whole contiguous range [start, end] in one record. The
+    /// range must lie inside a single segment owned by the caller.
+    function transferRange(uint256 start, uint256 end, address newOwner) public {
+        require(newOwner.value != 0, ERR_NOT_OWNER);
+        require(msg.sender != newOwner, ERR_NOT_OWNER);
+        require(start >= 1 && start <= end && end < _nextId, ERR_NO_SIIR);
+        tvm.accept();
+        uint256 i;
+        bool found = false;
+        for (i = 0; i < _segments.length; i++) {
+            if (_segments[i].start <= start && end <= _segments[i].end) {
+                found = true;
+                break;
+            }
+        }
+        require(found, ERR_NO_SIIR);
+        require(_segments[i].owner == msg.sender, ERR_NOT_OWNER);
+        _splitSegmentFor(start, end, msg.sender, newOwner);
+        _rangeHistory[start].push(HistoryEntry(msg.sender, newOwner, uint64(block.timestamp)));
+        emit RangeTransferred(start, end, msg.sender, newOwner, uint64(block.timestamp));
+    }
+
+    /// Replace the segment containing [start, end] with up to three pieces:
+    /// left remnant (old owner), the moved range (new owner), right remnant
+    /// (old owner). Empty pieces are skipped. (No fixed-size arrays: sold
+    /// 0.79.3 miscompiles `uint256[3]` locals into empty dynamic arrays,
+    /// making any indexed write throw exit 50.)
+    function _splitSegmentFor(uint256 start, uint256 end, address from, address to) private {
+        uint256 i;
+        for (i = 0; i < _segments.length; i++) {
+            if (_segments[i].start <= start && end <= _segments[i].end) break;
+        }
+        uint256 a = _segments[i].start;
+        uint256 b = _segments[i].end;
+        bool left = a < start;
+        bool right = end < b;
+        if (left) {
+            _segments[i] = Segment(a, start - 1, from);
+            _segments.push(Segment(start, end, to));
+            if (right) {
+                _segments.push(Segment(end + 1, b, from));
+            }
+        } else {
+            _segments[i] = Segment(start, end, to);
+            if (right) {
+                _segments.push(Segment(end + 1, b, from));
+            }
         }
     }
 
@@ -309,12 +436,14 @@ contract CompanySIIR {
         uint128 combined = 0;
         for (uint256 i = 0; i < ids.length; i++) {
             uint256 id = ids[i];
-            require(_siirs.exists(id), ERR_NO_SIIR);
-            require(_siirs[id].owner == msg.sender, ERR_NOT_OWNER);
-            SIIR s = _siirs[id];
+            (SIIR s, ) = _resolve(id);
+            require(s.owner == msg.sender, ERR_NOT_OWNER);
             for (uint256 c = 0; c < _divCurrencies.length; c++) {
                 uint32 cur = _divCurrencies[c];
-                uint128 pending = s.weight * (_dividendIndex[cur] - _checkpoint[id][cur]) / SCALE;
+                uint128 cp = _checkpoint[id].exists(cur)
+                    ? _checkpoint[id][cur]
+                    : _planCheckpoint[s.round][cur];
+                uint128 pending = s.weight * (_dividendIndex[cur] - cp) / SCALE;
                 if (pending > 0) {
                     _checkpoint[id][cur] = _dividendIndex[cur];
                     totals[cur] += pending;
@@ -325,14 +454,21 @@ contract CompanySIIR {
         }
         require(combined > 0, ERR_NO_CLAIM);
         tvm.accept();
+        mapping(uint32 => varuint32) cc2;
+        bool any = false;
         for (uint256 c = 0; c < _divCurrencies.length; c++) {
             uint32 cur = _divCurrencies[c];
             uint128 amount = totals[cur];
             if (amount > 0 && address(this).currencies[cur] >= amount) {
-                mapping(uint32 => varuint32) cc2;
                 cc2[cur] = amount;
-                msg.sender.transfer({value: varuint16(0), flag: 1, currencies: cc2});
+                any = true;
             }
+        }
+        // one payout message carrying every track (a 0-gram message bounces
+        // at the receiver and its bounce cannot pay the return fee, losing
+        // the currency; always attach VMSHELL gas)
+        if (any) {
+            msg.sender.transfer({value: varuint16(1000000000), flag: 1, currencies: cc2});
         }
     }
 
@@ -390,36 +526,40 @@ contract CompanySIIR {
         string label,
         string metadataUri
     ) {
-        require(_siirs.exists(id), ERR_NO_SIIR);
-        SIIR s = _siirs[id];
+        (SIIR s, ) = _resolve(id);
         return (s.weight, s.owner, s.createdAt, s.round, s.label, s.metadataUri);
     }
 
     function getOwnerOf(uint256 id) external view returns (address) {
-        require(_siirs.exists(id), ERR_NO_SIIR);
-        return _siirs[id].owner;
+        (SIIR s, ) = _resolve(id);
+        return s.owner;
     }
 
     function getClaimable(uint256 id) external view returns (uint32[] currencies, uint128[] amounts) {
-        require(_siirs.exists(id), ERR_NO_SIIR);
-        SIIR s = _siirs[id];
+        (SIIR s, ) = _resolve(id);
         for (uint256 i = 0; i < _divCurrencies.length; i++) {
             uint32 cur = _divCurrencies[i];
-            uint128 pending = s.weight * (_dividendIndex[cur] - _checkpoint[id][cur]) / SCALE;
+            uint128 cp = _checkpoint[id].exists(cur)
+                ? _checkpoint[id][cur]
+                : _planCheckpoint[s.round][cur];
             currencies.push(cur);
-            amounts.push(pending);
+            amounts.push(s.weight * (_dividendIndex[cur] - cp) / SCALE);
         }
     }
 
     function getClaimableOf(address owner) external view returns (uint32[] currencies, uint128[] amounts) {
-        uint256[] ids = _idsOf(owner);
         mapping(uint32 => uint128) totals;
-        for (uint256 i = 0; i < ids.length; i++) {
-            uint256 id = ids[i];
-            SIIR s = _siirs[id];
-            for (uint256 c = 0; c < _divCurrencies.length; c++) {
-                uint32 cur = _divCurrencies[c];
-                totals[cur] += s.weight * (_dividendIndex[cur] - _checkpoint[id][cur]) / SCALE;
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (_segments[i].owner != owner) continue;
+            for (uint256 id = _segments[i].start; id <= _segments[i].end; id++) {
+                (SIIR s, ) = _resolve(id);
+                for (uint256 c = 0; c < _divCurrencies.length; c++) {
+                    uint32 cur = _divCurrencies[c];
+                    uint128 cp = _checkpoint[id].exists(cur)
+                        ? _checkpoint[id][cur]
+                        : _planCheckpoint[s.round][cur];
+                    totals[cur] += s.weight * (_dividendIndex[cur] - cp) / SCALE;
+                }
             }
         }
         for (uint256 i = 0; i < _divCurrencies.length; i++) {
@@ -430,43 +570,59 @@ contract CompanySIIR {
     }
 
     function getBalanceOf(address owner) external view returns (uint256 count) {
-        return _idsOf(owner).length;
-    }
-
-    function getSIIRsOf(address owner) external view returns (uint256[] ids) {
-        return _idsOf(owner);
-    }
-
-    function _idsOf(address owner) private view returns (uint256[] ids) {
-        uint256[] buf = new uint256[](_nextId - 1);
-        uint256 n = 0;
-        for (uint256 id = 1; id < _nextId; id++) {
-            if (_siirs.exists(id) && _siirs[id].owner == owner) {
-                buf[n] = id;
-                n++;
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (_segments[i].owner == owner) {
+                count += _segments[i].end - _segments[i].start + 1;
             }
         }
-        uint256[] res = new uint256[](n);
-        for (uint256 i = 0; i < n; i++) { res[i] = buf[i]; }
-        return res;
+    }
+
+    /// Ownership as compact ranges: [starts[i], ends[i]] each fully owned by
+    /// `owner`. Enumeration at 10B scale — one record per range, not per id.
+    function getSIIRsOf(address owner) external view returns (uint256[] starts, uint256[] ends) {
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (_segments[i].owner == owner) {
+                starts.push(_segments[i].start);
+                ends.push(_segments[i].end);
+            }
+        }
+    }
+
+    /// The whole ownership picture: every segment of the register.
+    function getSegments() external view returns (Segment[] segments) {
+        return _segments;
     }
 
     /// Fingerprint of the immutable deed data. Anyone can verify forever
     /// that a SIIR's creation data has never changed.
     function getFingerprint(uint256 id) external view returns (uint256 fp) {
-        require(_siirs.exists(id), ERR_NO_SIIR);
-        SIIR s = _siirs[id];
+        (SIIR s, ) = _resolve(id);
         return tvm.hash(abi.encode(s.weight, s.createdAt, s.round, s.label, s.metadataUri));
     }
 
     function getHistory(uint256 id) external view returns (HistoryEntry[] entries) {
-        require(_siirs.exists(id), ERR_NO_SIIR);
-        uint256 n = _historyCount[id];
-        entries = new HistoryEntry[](n);
-        for (uint256 i = 0; i < n; i++) {
-            entries[i] = _history[id][i];
+        require(id >= 1 && id < _nextId, ERR_NO_SIIR);
+        uint256 n = 0;
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (id >= _segments[i].start && id <= _segments[i].end) {
+                n += _rangeHistory[_segments[i].start].length;
+            }
         }
-        return entries;
+        n += _historyCount[id];
+        entries = new HistoryEntry[](n);
+        uint256 k = 0;
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (id >= _segments[i].start && id <= _segments[i].end) {
+                for (uint256 j = 0; j < _rangeHistory[_segments[i].start].length; j++) {
+                    entries[k] = _rangeHistory[_segments[i].start][j];
+                    k++;
+                }
+            }
+        }
+        for (uint256 i = 0; i < _historyCount[id]; i++) {
+            entries[k] = _history[id][i];
+            k++;
+        }
     }
 
     // ---------- on-chain content getters ----------

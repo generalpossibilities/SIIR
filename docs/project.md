@@ -137,6 +137,12 @@ Constants: `SCALE = 1e9` (9 decimals, SHELL's), `CURRENCY_SHELL = 2`,
 `GAS_RESERVE = 1 vmshell`, `MODEL_FULL_CAP = 0`, `MODEL_ROUNDS = 1`; errors are
 `uint16` 100–107.
 
+> The state above is **v1's materialized model**. v2.0.0 replaced the
+> per-id `_siirs` map with the range-derived register (plans + segments +
+> sparse overrides) described in §8. `transfer`, `depositDividends`,
+> `claim`, and the getter set carry over; the deed for any id is derived
+> on demand, never stored.
+
 ### 3.3 `Makefile`
 
 ```make
@@ -419,6 +425,33 @@ file. **Fix:** don't start a new run while another is alive; the deposit
 poll now keyed on the per-currency deposited amount makes double-landing
 visible.
 
+### 6.30 Gateway zeroed every holder count and weight (v2)
+`gateway.as_int` did `int(v, 0)` — a TypeError on native Python ints,
+which the mirror legitimately returns for `_segments()` bounds. Every
+holder row rendered 0/0 while the raw state was correct. Caught by the
+fixture-backed gateway test suite (`as_int` on an int, not a str).
+**Fix:** `int(v) if isinstance(v, int) else int(v, 0)`.
+
+### 6.31 Legacy fallback returned empty rows for old v1 companies
+`mirror._resolve` only understood the v2 compact `_siirs` overrides
+(label/metadata pairs) and treated *materialized* v1 deed records as
+garbage, so the legacy gateway fallback served empty registers for
+contracts deployed before v2. **Fix:** `_siirs` entries with ≥6 elements
+are decoded as `[weight, owner, createdAt, round, label, metadataUri]`.
+
+### 6.32 `deploy.sh: OWNER: unbound variable` (line 295)
+A prior edit had collapsed the newline between an `echo` banner and the
+following assignment — `…=="OWNER=$(…)"` — making `OWNER` parse as an
+assignment inside the echo. Under `set -u` the script died mid-run.
+**Fix:** restore the newline between the banner and the assignment.
+
+### 6.33 `deployCompany` from the script never activated the company
+The script's attempt reported `[fail] company not active after 60s`
+even though the message itself was fine (the gzip UI path worked — the
+bundle was stored). **Fix:** called `deployCompany` directly via
+`tvm-cli callx` with the same payload (deterministic state-init → the
+address is identical either way); company came up Active.
+
 ---
 
 ## 7. Why these components exist (map of responsibilities)
@@ -433,11 +466,134 @@ visible.
 | `getFingerprint` | `hash(weight, createdAt, round, label, metadataUri)` | auditable deed identity, never changes |
 | ecc currencies (ids 1, 2, 3, …) | dividend media | any currency the network or a wallet's dapp creates — payout token is a parameter, not an accounting change |
 | `scripts/deploy.sh` | one-shot reproducible shellnet demo | proves the whole contract stack, replays anytime |
+| `scripts/mirror.py` | v2 lazy mirror: decodes raw account state and derives every deed from plans + segments + overrides (`_resolve` mirrors the contract 1:1) | browsers/APIs must read per-id data without the chain iterating 10B ids |
+| `SIIRMarketplace` | range-based listings (sell a range, buy a range) | secondary market with the same O(1) compactness as the register |
 | `scripts/gateway.py` | serves on-chain UI/images/charter over HTTP, plus the SIIR explorer (register, holders, plans, treasury, history, search) | browsers need URL-shaped reads; content stays on-chain |
 
 ---
 
-## 8. Current status and next steps
+## 8. v2.0.0 — the lazy cap table (SIIRs for 10-billion-share registers)
+
+### 8.1 The problem
+
+v1 stored one materialized `SIIR` record per id. That caps out hard:
+a 10-billion-share company would need 10 billion on-chain records —
+impossible in deploy gas, state size, and getter iteration. A cap
+table is a *range* ("ids 1..10B belong to Alice"), not a list of
+records, so the register is stored as ranges and every deed is
+**derived on demand** — the chain holds a compact spec, and anyone
+(mirror, explorer, wallet) can materialize any single id or any page
+in O(1).
+
+### 8.2 The design (nothing per-id is stored)
+
+Three compact structures replace the per-id map:
+
+| structure | holds | size |
+|---|---|---|
+| `_plans[]` + `_planStartId[]`/`_planEndId[]` | one row per *plan*: `count`, `weight`, `label`, `issued`, `issuedAt` — every id in the range defaults to these | O(plans) |
+| `_segments[]` | ownership ranges `[start, end, owner]` — one segment per contiguous same-owner block | O(segments) |
+| `_siirs` override map | only per-id *deviations* (label/metadata) | O(overrides) |
+
+- `issue()` appends one segment and bumps counters — **O(1) no matter
+  how large the plan** (genesis of 10B ids = 1 segment row).
+- `transfer(ids)` / `transferRange(start, end)` call `_splitSegmentFor`
+  which replaces the containing segment with ≤3 pieces (left remnant /
+  moved range / right remnant; empty pieces skipped). History and
+  events stay per-id but sparse.
+- `getSIIRsOf` returns **compact hex start–end pairs**, not id lists.
+- Claim math is unchanged: weight comes from the plan, checkpoint per
+  id; nothing else needs per-id state.
+- The resolution rule (contract `_resolve`, mirrored 1:1 off-chain):
+  plan defaults → override label/metadata → owning segment's owner.
+- A third contract, `SIIRMarketplace`, joined the suite: listings are
+  also range-based (sell a range, buy a range).
+
+### 8.3 The verification ladder (how we proved it)
+
+Three independent suites, all fixture-backed (no chain, no tvm-cli):
+
+1. **Parity suites** — the same hand-built fixtures fed to the JS
+   mirror and the Python mirror; both must agree with each other and
+   with what the contract computes: 24/24 + 24/24.
+2. **Gateway harness** — real `gateway.py` functions over fixture
+   mirror state (pattern: `MirrorState.__new__`, stubbed
+   `gateway.mirror_state`/`tvm_cli`, `gateway.CACHE` reset between
+   fixtures): 31/31 — register lazy rows + pagination + total, holder
+   counts/weights, holder ranges/claimable, `getSIIRsOf` hex pairs,
+   legacy v1 fallback, gzip/plain data URIs, claim math.
+3. **DOM smoke** — the real static explorer pages executed in a VM
+   with injected lazy fixtures: 33/33 — factory directory, company
+   overview, register (range rows + override rows), holders, holder
+   page, derived per-SIIR pages, marketplace.
+
+The suites earned their keep immediately: §6.30 (as_int zeroing
+holder data) and §6.31 (legacy fallback) were both caught by them.
+
+### 8.4 Live deployment (FORCE redeploy to v2.0.0, shellnet)
+
+```
+dapp-id:    46a62cc3b48b5b2a48d935872bb8953579917f50082c60775402dccce439153a
+factory:    <dapp-id>::46a62cc3b48b5b2a48d935872bb8953579917f50082c60775402dccce439153a
+marketplace:<dapp-id>::8f00e03c690001a028568551ccb93e4420f0dce1f69de72b86466efb05839d5b
+company:    <dapp-id>::a9f00423e961fae96bf660aa9679fc06162a3214a3e97e77ae277f9861faaca3
+rounds:     <dapp-id>::87f1208700bd669e1a4d8c89183ddd8d0ce4cd418aacb9c266728b36d1c18177
+founder:    c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb::<same>
+holder:     0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa::<same>
+factory ownerPubkey: 0xb7df23e9a73343f1fc3a11e15ae3f6bf227b9df955f2da558c96904021e92b8b
+founder pubkey:      0x4af1476b083267020a5b70e179269d24223e33869f32450fb91537fecbc60235
+```
+
+| step | assertion | result |
+|---|---|---|
+| factory | ver 2.0.0, company code cell = fresh compile | ✓ |
+| deployCompany | company Active, ver fields set | ✓ |
+| UI bundle | >46k message budget → gzip path | ✓ 15,329 B base64 `;base64,gz,` stored on-chain, byte-exact round-trip (deterministic gzip: `mtime=0`) |
+| issue genesis | 100 × weight 1000 | ✓ `issuedCount:100, totalWeight:100000` |
+| segments | one range `[1..0x64 → founder]` | ✓ |
+| deposits | ecc 2/3/1 via founder multisig | ✓ |
+| claimable(1) | weight·index/1e9 | ✓ |
+| transfer #1 | founder → holder | ✓ (deed escrow → holder, step 7) |
+| claim | 3 currencies, one consolidated `transfer{value:1g,flag:1,cc2}` | ✓ holder ecc = `{"1":60000000,"2":114600000000,"3":300000000000}` |
+| rounds company | Model-B `issue` to 100 via holder | ✓ Active, extra issue → supply-exceeded exit code |
+| charter | immutable text, founder-key ratification, stable fingerprint | ✓ |
+| marketplace | escrow → list 5 SHELL → founder bid → `acceptBid` | ✓ deed `#1 → 0:c4d173…` (bidder), listing closed |
+
+### 8.5 The VMSHELL reserve trap (why acceptBid aborted)
+
+The marketplace settle failed twice with `action failed: error_code=37`
+(insufficient balance) even though the account's GraphQL `balance_delta`
+showed ~41e9 credits per inbound message. Root cause — this chain's
+gram accounting is **reserve-based**:
+
+- An account can only *send* grams it holds as VMSHELL reserve, granted
+  by the giver's `sendCurrencyWithFlag … flag:16` (`fund()` in
+  `deploy.sh`) or by a deploy message's `value`.
+- Wallet `flags:1` messages carrying grams **do not** replenish the
+  receiving contract's reserve — the ~41e9 `balance_delta` is the
+  carried SHELL-ecc, not spendable grams.
+- The factory's constructor deploys the marketplace with only ~1e9
+  grams of reserve; list/bid fees ate it down to 974,620,000, so
+  `acceptBid` (which must send 2×1e9: deed to the buyer + price to the
+  seller) died at the action phase and the executor zeroed the account.
+- The step-2 `fund "$MARKET" …` was guarded by `if ! Active`, but the
+  marketplace is always Active (deployed by the factory constructor) —
+  so the top-up never ran. Fixed: unconditional reserve top-up
+  (`fund "$MARKET" 40000000000`, flag16) right after step 2.
+
+Lesson: on this network, **senders** must be reserve-funded before any
+cross-dapp gram transfer; the deploy script now does so for factory,
+wallets, and the marketplace, and step 13e verifies the settlement
+(deed → bidder, listing `active:false`) with a hard `[fail]` + exit 1.
+
+Note: the old §8.5 "transfer aborts with exit code 50" is resolved —
+that abort was the 0-gram claim payout bouncing at the receiver for
+lack of forward fee; the claim now pays `value:1e9, flag:1` in one
+consolidated message (verified delivering all three currencies).
+
+---
+
+## 9. Current status and next steps
 
 **Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
 (`SIIRFactory`, `CompanySIIR`), `Makefile`, `scripts/deploy.sh`, docs
@@ -459,7 +615,19 @@ lookup (address, balance, claimable), plans, payout tracks, per-SIIR
 fingerprint + history, and free-text/address search — everything read
 live from the contracts (see `docs/gateway.md`).
 
-**Next:** gateway hardening (real mirror-node client instead of a
-tvm-cli spawn per getter, then bind/override options); wallet
-integration (claim button, deed view); governance & dissolution
-safeguards; marketplace hooks.
+**v2.0.0 (lazy cap table, §8):** the register became fully range-derived
+(O(1) issuance at any size, compact ownership segments, sparse overrides)
+and is re-verified end-to-end: 24/24 JS + 24/24 Python parity, 31/31
+gateway, 33/33 DOM smoke. Redeployed live on shellnet (§8.4): factory
+ver 2.0.0, company Active, genesis issued, three-currency deposits
+landed, gzip UI bundle stored on-chain, and the full demo lifecycle now
+passes **steps 1–13**, including the marketplace escrow → list → bid →
+`acceptBid` settle (deed → bidder, listing closed, verified in step
+13e). The last blocker was the VMSHELL reserve trap (§8.5): contract
+senders need flag-16 reserve top-ups before cross-dapp gram sends —
+`fund "$MARKET" 40000000000` now runs unconditionally after step 2.
+
+**Next:** the 10-billion-SIIR proof run (`PLAN_COUNT=10000000000` issue
+→ single segment row → O(1) claim math); then governance & dissolution
+safeguards, and wiring the explorer's live marketplace views against
+the §8.4 addresses.

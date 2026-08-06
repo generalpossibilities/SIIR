@@ -617,6 +617,26 @@ class MirrorState:
                                    inner_ref)
 
             return not (12 + key_bits + 1 < 1023), nested
+        if vt.endswith("[]"):
+            # dynamic array as a map value: 32-bit length + 1 present bit,
+            # then a ref to the dict root (same layout as top-level arrays)
+            et = vt[:-2]
+            if et == "tuple":
+                mb = sum(self._maxbits(c["type"]) for c in comps)
+                dec2 = lambda v: self._decode_tuple(comps, v)
+            else:
+                mb = self._maxbits(et)
+                dec2 = lambda v: self._decode_scalar(et, v)
+
+            def arr(v):
+                n_len = v.read_uint(32)
+                if not v.read_bool() or n_len == 0 or not v.cell.refs:
+                    return {}
+                d = decode_dict(v.cell.refs[0], 32, dec2,
+                                not (12 + 32 + mb < 1023))
+                return {i: d.get(i) for i in range(n_len)}
+
+            return not (12 + key_bits + 33 < 1023), arr
         return not (12 + key_bits + self._maxbits(vt) < 1023), \
             lambda v: self._decode_scalar(vt, v)
 
@@ -642,8 +662,163 @@ class MirrorState:
 
     # ---------- derived getters (mirror the contract) ----------
 
-    def _siirs(self):
-        return self.state.get("_siirs") or {}
+    # Lazy derived register: an id is real the moment its plan is issued.
+    # weight/createdAt/round come from the plan; label/metadata from the plan
+    # unless overridden per id; owner from the owning segment.
+
+    def _plans_raw(self):
+        return self.state.get("_plans") or []
+
+    def _segments(self):
+        """Ownership ranges: [{start, end, owner}] (BigInts for start/end)."""
+        out = []
+        for s in self.state.get("_segments") or []:
+            if not s:
+                continue
+            out.append({"start": s[0], "end": s[1], "owner": s[2]})
+        return out
+
+    def _overrides(self):
+        return self.state.get("_siirs") or {}  # id -> [label, metadataUri]
+
+    def _plan_start(self):
+        return self.state.get("_planStartId") or {}
+
+    def _plan_end(self):
+        return self.state.get("_planEndId") or {}
+
+    def _plan_issued_at(self):
+        return self.state.get("_planIssuedAt") or {}
+
+    def _plan_checkpoint(self):
+        return self.state.get("_planCheckpoint") or {}
+
+    def _plan_of(self, id):
+        for k, s in self._plan_start().items():
+            e = self._plan_end().get(k)
+            if e is not None and s <= id <= e:
+                return k
+        return None
+
+    def _resolve(self, id):
+        ov = self._overrides().get(id)
+        if ov and len(ov) >= 6:
+            # v1 materialized record [weight, owner, createdAt, round,
+            # label, metadataUri] — keeps gateway legacy fallbacks honest
+            # until v2 contracts replace them on-chain
+            return {
+                "weight": ov[0],
+                "owner": ov[1],
+                "createdAt": ov[2],
+                "round": ov[3],
+                "label": ov[4] or "",
+                "metadataUri": ov[5] or "",
+            }
+        pid = self._plan_of(id)
+        if pid is None:
+            return None
+        p = self._plans_raw()[pid] if pid < len(self._plans_raw()) else None
+        if not p:
+            return None
+        ov = self._overrides().get(id)
+        owner = None
+        for seg in self._segments():
+            if seg["start"] <= id <= seg["end"]:
+                owner = seg["owner"]
+                break
+        if not owner:
+            return None
+        return {
+            "weight": p[1],
+            "owner": owner,
+            "createdAt": self._plan_issued_at().get(pid, 0),
+            "round": pid,
+            "label": (ov[0] or "") if ov else (p[2] or ""),
+            "metadataUri": (ov[1] or "") if ov else (self.state.get("_metadataUri") or ""),
+        }
+
+    def siir(self, id):
+        s = self._resolve(id)
+        if not s:
+            return None
+        return {
+            "weight": str(s["weight"]),
+            "owner": s["owner"],
+            "createdAt": str(s["createdAt"]),
+            "round": str(s["round"]),
+            "label": s["label"] or "",
+            "metadataUri": s["metadataUri"] or "",
+        }
+
+    def owner_of(self, id):
+        s = self._resolve(id)
+        return s["owner"] if s else None
+
+    def segments_of(self, owner):
+        return [s for s in self._segments() if s["owner"] == owner]
+
+    def ids_of(self, owner):
+        # ownership as compact ranges [(start, end)] - never per-id, so 10B
+        # SIIRs enumerate in one record per range
+        return [(s["start"], s["end"]) for s in self.segments_of(owner)]
+
+    def balance_of(self, owner):
+        return sum(e - s + 1 for s, e in self.ids_of(owner))
+
+    def _checkpoint_for(self, id, pid, cur):
+        own = self._checkpoint_flat(id).get(cur)
+        if own is not None:
+            return own
+        return (self._plan_checkpoint().get(pid) or {}).get(cur, 0)
+
+    def claimable(self, id):
+        s = self._resolve(id)
+        if not s:
+            return [], []
+        pid = self._plan_of(id)
+        cur, amt = [], []
+        for c in self._div_currencies():
+            idx = self._div_index().get(c, 0)
+            cp = self._checkpoint_for(id, pid, c)
+            pending = s["weight"] * (idx - cp) // 1_000_000_000
+            cur.append(str(c))
+            amt.append(str(pending))
+        return cur, amt
+
+    def claimable_of(self, owner):
+        totals = {}
+        div_c = self._div_currencies()
+        owned = self.segments_of(owner)
+        for seg in owned:
+            pid = self._plan_of(seg["start"])
+            if pid is None:
+                continue
+            p = self._plans_raw()[pid]
+            w = p[1]
+            n = seg["end"] - seg["start"] + 1
+            for c in div_c:
+                idx = self._div_index().get(c, 0)
+                cp = (self._plan_checkpoint().get(pid) or {}).get(c, 0)
+                totals[str(c)] = totals.get(str(c), 0) + w * (idx - cp) // 1_000_000_000 * n
+        # per-id checkpoint overrides inside owned ranges: swap the plan share
+        # for the individually-claimed share
+        for oid in self._overrides():
+            s = self._resolve(oid)
+            if not s or s["owner"] != owner:
+                continue
+            pid = self._plan_of(oid)
+            w = s["weight"]
+            for c in div_c:
+                if self._checkpoint_flat(oid).get(c) is None:
+                    continue
+                idx = self._div_index().get(c, 0)
+                cp_own = self._checkpoint_for(oid, pid, c)
+                cp_plan = (self._plan_checkpoint().get(pid) or {}).get(c, 0)
+                totals[str(c)] = totals.get(str(c), 0) + \
+                    w * (idx - cp_own) // 1_000_000_000 - \
+                    w * (idx - cp_plan) // 1_000_000_000
+        return [str(c) for c in div_c], \
+            [str(totals.get(str(c), 0)) for c in div_c]
 
     def company_info(self):
         st = self.state
@@ -680,50 +855,6 @@ class MirrorState:
     def _deposited(self):
         return self.state.get("_deposited") or {}
 
-    def siir(self, id):
-        s = self._siirs().get(id)
-        if not s:
-            return None
-        return {
-            "weight": str(s[0]),
-            "owner": s[1],
-            "createdAt": str(s[2]),
-            "round": str(s[3]),
-            "label": s[4] or "",
-            "metadataUri": s[5] or "",
-        }
-
-    def owner_of(self, id):
-        s = self._siirs().get(id)
-        return s[1] if s else None
-
-    def balance_of(self, owner):
-        return len(self.ids_of(owner))
-
-    def ids_of(self, owner):
-        return [i for i, s in self._siirs().items() if s and s[1] == owner]
-
-    def claimable(self, id):
-        s = self._siirs().get(id)
-        if not s:
-            return [], []
-        cur, amt = [], []
-        for c in self._div_currencies():
-            idx = self._div_index().get(c, 0)
-            cp = self._checkpoint_flat(id).get(c, 0)
-            pending = s[0] * (idx - cp) // 1_000_000_000
-            cur.append(str(c))
-            amt.append(str(pending))
-        return cur, amt
-
-    def claimable_of(self, owner):
-        totals = {}
-        for id in self.ids_of(owner):
-            c_, a_ = self.claimable(id)
-            for c, a in zip(c_, a_):
-                totals[str(c)] = totals.get(str(c), 0) + int(a)
-        return [str(c) for c in self._div_currencies()], [str(totals.get(str(c), 0)) for c in self._div_currencies()]
-
     def dividends(self):
         ids, idx, dep = [], [], []
         for c in self._div_currencies():
@@ -749,9 +880,19 @@ class MirrorState:
     def history(self, id):
         h = self.state.get("_history") or {}
         n = self.state.get("_historyCount") or {}
+        rh = self.state.get("_rangeHistory") or {}
+        entries = []
+        # range moves: every segment whose range contains the id contributed
+        # one entry per transferRange that created it
+        for seg in self._segments():
+            if seg["start"] <= id <= seg["end"]:
+                for e in (rh.get(seg["start"]) or {}).values():
+                    if e:
+                        entries.append({"from": e[0], "to": e[1],
+                                        "timestamp": str(e[2])})
+        # single-id transfers
         cnt = n.get(id, 0)
         hh = h.get(id) or {}
-        entries = []
         for i in range(cnt):
             e = hh.get(i)
             if e:
@@ -780,15 +921,15 @@ class MirrorState:
         return "0x" + cell_hash(Cell("", [self._raw_cells["_charter"]])).hex()
 
     def fingerprint(self, id):
-        s = self._siirs().get(id)
+        s = self._resolve(id)
         if not s:
             return None
         # abi.encode(weight, createdAt, round, label, metadataUri):
         # ints inline (224 bits), strings stored as bare refs (raw bytes,
         # no length prefix) in the same cell.
-        bits = f"{s[0]:0128b}{s[2]:064b}{s[3]:032b}"
+        bits = f"{s['weight']:0128b}{s['createdAt']:064b}{s['round']:032b}"
         cell = Cell(bits, [])
-        for txt in (s[4] or "", s[5] or ""):
+        for txt in (s["label"] or "", s["metadataUri"] or ""):
             b = txt.encode()
             cell.refs.append(Cell("".join(f"{x:08b}" for x in b), []))
         return "0x" + cell_hash(cell).hex()

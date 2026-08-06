@@ -448,6 +448,30 @@ class MirrorState {
             };
             return { valueInRef: !(12 + keyBits + 1 < 1023), dec: nested };
         }
+        if (vt.endsWith("[]")) {
+            // dynamic array as a map value: 32-bit length + 1 present bit,
+            // then a ref to the dict root (same layout as top-level arrays)
+            const et = vt.slice(0, -2);
+            let dec2;
+            if (et === "tuple") {
+                dec2 = (sl) => this.decodeTuple(comps || [], sl);
+            } else {
+                dec2 = (sl) => this.decodeScalar(et, sl);
+            }
+            const arr = (v) => {
+                const nLen = Number(v.readUint(32));
+                if (!v.readBool() || nLen === 0 || !v.cell.refs.length) return {};
+                const r = v.cell.refs[0];
+                const mb = et === "tuple"
+                    ? (comps || []).reduce((s, c) => s + maxBitsFor(c.type), 0)
+                    : maxBitsFor(et);
+                const dict = decodeDict(r, 32, dec2, !(12 + 32 + mb < 1023));
+                const out = {};
+                for (let k = 0; k < nLen; k++) out[String(k)] = dict[String(k)] ?? null;
+                return out;
+            };
+            return { valueInRef: !(12 + keyBits + 33 < 1023), dec: arr };
+        }
         return {
             valueInRef: !(12 + keyBits + maxBitsFor(vt) < 1023),
             dec: (sl) => this.decodeScalar(vt, sl),
@@ -545,8 +569,6 @@ class MirrorState {
 
     // ---------- derived getters (mirror the contract) ----------
 
-    siirs() { return this.state._siirs || {}; }
-
     companyInfo() {
         const st = this.state;
         return {
@@ -572,58 +594,134 @@ class MirrorState {
     _divIndex() { return this.state._dividendIndex || {}; }
     _deposited() { return this.state._deposited || {}; }
 
-    siir(id) {
-        const s = dictGet(this.siirs(), id);
-        if (!s) return null;
+    // ---------- lazy derived register ----------
+    // A SIIR id is real the moment its plan is issued. The full record is
+    // derived: weight/createdAt/round from the plan, label/metadata from the
+    // plan (unless overridden per id), owner from the owning segment.
+
+    _plansRaw() { return this.state._plans || []; }
+
+    segments() {
+        return (this.state._segments || []).map((s) => s && ({
+            start: s[0], end: s[1], owner: s[2],
+        })).filter(Boolean);
+    }
+
+    overrides() { return this.state._siirs || {}; }  // id -> [label, metadataUri]
+
+    _planStart() { return this.state._planStartId || {}; }
+    _planEnd() { return this.state._planEndId || {}; }
+    _planIssuedAt() { return this.state._planIssuedAt || {}; }
+    _planCheckpoint() { return this.state._planCheckpoint || {}; }
+
+    _planOf(id) {
+        const starts = this._planStart();
+        for (const k in starts) {
+            const s = starts[k], e = this._planEnd()[k];
+            if (s !== undefined && e !== undefined && id >= s && id <= e) return BigInt(k);
+        }
+        return null;
+    }
+
+    resolve(id) {
+        const pid = this._planOf(id);
+        if (pid === null) return null;
+        const p = this._plansRaw()[Number(pid)];
+        if (!p) return null;
+        const ov = dictGet(this.overrides(), id, null);
+        let owner = null;
+        for (const seg of this.segments()) {
+            if (id >= seg.start && id <= seg.end) { owner = seg.owner; break; }
+        }
+        if (!owner) return null;
         return {
-            weight: String(s[0]),
-            owner: s[1],
-            createdAt: String(s[2]),
-            round: String(s[3]),
-            label: s[4] || "",
-            metadataUri: s[5] || "",
+            weight: String(p[1]),
+            owner,
+            createdAt: String(dictGet(this._planIssuedAt(), pid, 0n)),
+            round: String(pid),
+            label: ov ? (ov[0] || "") : (p[2] || ""),
+            metadataUri: ov ? (ov[1] || "") : (this.state._metadataUri || ""),
         };
     }
 
-    idsOf(owner) {
-        const out = [];
-        const siirs = this.siirs();
-        for (const k in siirs) {
-            const s = siirs[k];
-            if (s && s[1] === owner) out.push(Number(k));
-        }
-        out.sort((a, b) => a - b);
-        return out;
+    siir(id) { return this.resolve(id); }
+
+    segmentsOf(owner) {
+        return this.segments().filter((s) => s.owner === owner);
     }
 
-    claimable(id) {
-        const s = dictGet(this.siirs(), id);
-        if (!s) return [[], []];
-        const cur = [], amt = [];
-        for (const c of this._divCurrencies()) {
-            const idx = dictGet(this._divIndex(), c, 0n);
-            const cp = dictGet(this._checkpointFlat(id), c, 0n);
-            const pending = (s[0] * (idx - cp)) / 1000000000n;
-            cur.push(String(c));
-            amt.push(pending.toString());
-        }
-        return [cur, amt];
+    // ownership as compact ranges [{start, end}] — never per-id, so 10B
+    // SIIRs enumerate in one record per range
+    idsOf(owner) {
+        return this.segmentsOf(owner).map((s) => ({ start: s.start, end: s.end }));
+    }
+
+    balanceOf(owner) {
+        let n = 0n;
+        for (const s of this.segmentsOf(owner)) n += s.end - s.start + 1n;
+        return n;
     }
 
     _checkpointFlat(id) {
         return dictGet(this._checkpoint(), id) || {};
     }
 
+    _checkpointFor(id, pid, cur) {
+        const own = dictGet(this._checkpointFlat(id), cur, null);
+        if (own !== null) return own;
+        return dictGet(dictGet(this._planCheckpoint(), pid, {}), cur, 0n);
+    }
+
+    claimable(id) {
+        const s = this.resolve(id);
+        if (!s) return [[], []];
+        const pid = this._planOf(id);
+        const cur = [], amt = [];
+        for (const c of this._divCurrencies()) {
+            const idx = dictGet(this._divIndex(), c, 0n);
+            const cp = this._checkpointFor(id, pid, c);
+            const pending = (BigInt(s.weight) * (idx - cp)) / 1000000000n;
+            cur.push(String(c));
+            amt.push(pending.toString());
+        }
+        return [cur, amt];
+    }
+
     claimableOf(owner) {
         const totals = {};
-        for (const id of this.idsOf(owner)) {
-            const [c_, a_] = this.claimable(id);
-            for (let i = 0; i < c_.length; i++) {
-                const k = String(c_[i]);
-                totals[k] = (totals[k] || 0n) + BigInt(a_[i]);
+        const cs = this._divCurrencies();
+        const owned = this.segmentsOf(owner);
+        for (const seg of owned) {
+            const pid = this._planOf(seg.start);
+            if (pid === null) continue;
+            const w = this._plansRaw()[Number(pid)][1];
+            const n = seg.end - seg.start + 1n;
+            for (const c of cs) {
+                const k = String(c);
+                const idx = dictGet(this._divIndex(), c, 0n);
+                const cp = dictGet(dictGet(this._planCheckpoint(), pid, {}), c, 0n);
+                totals[k] = (totals[k] || 0n) + (w * (idx - cp)) / 1000000000n * n;
             }
         }
-        const cs = this._divCurrencies();
+        // per-id checkpoint overrides inside owned ranges: swap their plan
+        // share for the individually-claimed share
+        for (const oid in this.overrides()) {
+            const ob = BigInt(oid);
+            if (!owned.some((r) => ob >= r.start && ob <= r.end)) continue;
+            const s = this.resolve(ob);
+            if (!s) continue;
+            const pid = this._planOf(ob);
+            const w = BigInt(s.weight);
+            for (const c of cs) {
+                const k = String(c);
+                if (dictGet(this._checkpointFlat(ob), c, null) === null) continue;
+                const idx = dictGet(this._divIndex(), c, 0n);
+                const cpOwn = this._checkpointFor(ob, pid, c);
+                const cpPlan = dictGet(dictGet(this._planCheckpoint(), pid, {}), c, 0n);
+                totals[k] = (totals[k] || 0n) + (w * (idx - cpOwn)) / 1000000000n
+                    - (w * (idx - cpPlan)) / 1000000000n;
+            }
+        }
         return [
             cs.map((c) => String(c)),
             cs.map((c) => String(totals[String(c)] || 0n)),
@@ -652,9 +750,21 @@ class MirrorState {
 
     history(id) {
         const h = this.state._history || {};
+        const rh = this.state._rangeHistory || {};
+        const entries = [];
+        // range moves: every segment whose range contains the id contributed
+        // one entry per transferRange that created it
+        for (const seg of this.segments()) {
+            if (id < seg.start || id > seg.end) continue;
+            const rhh = rh[String(seg.start)] || {};
+            for (const k in rhh) {
+                const e = rhh[k];
+                if (e) entries.push({ from: e[0] || "", to: e[1] || "", timestamp: String(dictGet(e, 2, 0n)) });
+            }
+        }
+        // single-id transfers
         const cnt = dictGet(this.state._historyCount || {}, id, 0n);
         const hh = h[String(id)] || {};
-        const entries = [];
         for (let i = 0n; i < cnt; i++) {
             const e = hh[String(i)];
             if (e) entries.push({ from: e[0] || "", to: e[1] || "", timestamp: String(dictGet(e, 2, 0n)) });
@@ -685,11 +795,11 @@ class MirrorState {
     }
 
     async fingerprint(id) {
-        const s = dictGet(this.siirs(), id);
+        const s = this.resolve(id);
         if (!s) return null;
-        const bits = bin(s[0], 128) + bin(s[2], 64) + bin(s[3], 32);
+        const bits = bin(BigInt(s.weight), 128) + bin(BigInt(s.createdAt), 64) + bin(BigInt(s.round), 32);
         const cell = new Cell(bits, []);
-        for (const txt of [s[4] || "", s[5] || ""]) {
+        for (const txt of [s.label || "", s.metadataUri || ""]) {
             const bytes = new TextEncoder().encode(txt);
             cell.refs.push(new Cell(bitsFromBytes(bytes, bytes.length * 8), []));
         }

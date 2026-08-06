@@ -8,6 +8,11 @@
 # fresh companies, fresh marketplace — and bakes the new addresses into the
 # UI bundle before deploying the companies.
 #
+# PLAN_COUNT=<n> (default 100) sets the genesis plan size of the demo company.
+# PLAN_COUNT=10000000000 additionally runs the 10B-scale proof: one O(1)
+# issue() for all 10B ids, derived getSIIR spot checks (1 / mid / last),
+# getBalanceOf, and a single transferRange covering the whole register.
+#
 # Addressing model on Acki Nacki:
 #   * self-rooted (deployed via external message) contracts live at <own>::<own>
 #   * children deployed by a contract inherit the parent's dapp_id
@@ -47,9 +52,9 @@ fund() { # fund <self-or-full> <shell_nano>  — VMSHELL gas (flag16) + SHELL ec
   echo "  funding $1 with $2 nano SHELL (VMSHELL gas + SHELL ecc)..."
   local gas=$(( $2 / 5 ))
   cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrencyWithFlag \
-    "{\"dest\":\"$(legacy "$1")\",\"value\":1000000000,\"ecc\":{\"2\":$gas},\"flag\":16}" >/dev/null
+    "{\"dest\":\"$(legacy "$1")\",\"value\":3000000000,\"ecc\":{\"2\":$gas},\"flag\":16}" >/dev/null
   cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
-    "{\"dest\":\"$(legacy "$1")\",\"value\":1000000000,\"ecc\":{\"2\":$2}}" >/dev/null
+    "{\"dest\":\"$(legacy "$1")\",\"value\":3000000000,\"ecc\":{\"2\":$2}}" >/dev/null
 }
 
 wait_active() { # wait_active <fulladdr> <name> [timeout_s]
@@ -154,7 +159,7 @@ if ! cli account "$FACTORY" 2>/dev/null | grep -q '"Active"' || factory_stale "$
   sleep 5
   echo "  deploying factory (with marketplace code)..."
   deploy_self SIIRFactory "$WORK/factory.keys.json" "$CT/SIIRFactory.abi.json" \
-    "{\"value\":10000000000,\"companyCode\":\"$(company_code)\",\"marketplaceCode\":\"$(marketplace_code)\"}"
+    "{\"value\":30000000000,\"companyCode\":\"$(company_code)\",\"marketplaceCode\":\"$(marketplace_code)\"}"
   wait_active "$FACTORY" "factory"
 fi
 cli run "$FACTORY" getFactoryInfo {} --abi "$CT/SIIRFactory.abi.json"
@@ -162,11 +167,16 @@ MARKET_RAW=$(cli run "$FACTORY" getMarketplaceAddress '{}' --abi "$CT/SIIRFactor
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"].split(":")[1])' 2>/dev/null || echo "")
 MARKET="$FACTORY_RAW::$MARKET_RAW"   # marketplace is factory's child: same dapp-id
 echo "  marketplace: $MARKET"
+# Always top up the marketplace VMSHELL reserve (flag16). The factory's
+# constructor deploys it with only ~1g of reserve, which is consumed by
+# list/bid fees; acceptBid then needs 2e9 grams to pay out deed + price
+# and would abort with error_code=37 (insufficient balance).
 if ! cli account "$MARKET" 2>/dev/null | grep -q '"Active"'; then
-  fund "$MARKET" 50000000000
   sleep 3
-  cli account "$MARKET" 2>/dev/null | grep -q '"Active"' || echo "  [warn] marketplace not active yet"
 fi
+fund "$MARKET" 40000000000
+sleep 3
+cli account "$MARKET" 2>/dev/null | grep -q '"Active"' || echo "  [warn] marketplace not active yet"
 
 # ---------- 3. founder wallet (self-rooted multisig) ----------
 echo "== 3. founder wallet =="
@@ -182,7 +192,7 @@ if ! cli account "$FOUNDER" 2>/dev/null | grep -q '"Active"'; then
   fund "$FOUNDER" 50000000000
   sleep 3
   deploy_self founder "$WORK/company.keys.json" "$MULTISIG_ABI" \
-    "{\"owners_pubkey\":[\"0x$FOUNDER_PUB\"],\"owners_address\":[],\"reqConfirms\":1,\"reqConfirmsData\":1,\"value\":1000000000}"
+    "{\"owners_pubkey\":[\"0x$FOUNDER_PUB\"],\"owners_address\":[],\"reqConfirms\":1,\"reqConfirmsData\":1,\"value\":3000000000}"
   wait_active "$FOUNDER" "founder wallet"
 fi
 
@@ -197,14 +207,20 @@ echo "  company (in factory dapp): $COMPANY"
 # its own factory directory and demo company (bundle is rebuilt only here:
 # the addresses are only known once the factory is deployed above)
 UI_BUNDLE=$(python3 "$ROOT/static/bundle.py" --set "FACTORY_ADDR=$FACTORY" --set "DEMO_ADDR=$COMPANY" --emit)
-echo "  ui bundle: $(echo -n "$UI_BUNDLE" | wc -c) bytes base64 (cap ~46k)"
+UI_MODE=plain
+if [ "$(echo -n "$UI_BUNDLE" | wc -c)" -gt 46000 ]; then
+  echo "  bundle over the 46k message budget; storing gzip-compressed..."
+  UI_BUNDLE=$(python3 "$ROOT/static/bundle.py" --set "FACTORY_ADDR=$FACTORY" --set "DEMO_ADDR=$COMPANY" --emit --gzip)
+  UI_MODE=gzip
+fi
+echo "  ui bundle: $(echo -n "$UI_BUNDLE" | wc -c) bytes base64 ($UI_MODE)"
 if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
   echo "  deploying company via factory..."
   cli callx --abi "$CT/SIIRFactory.abi.json" --addr "$FACTORY" --keys "$WORK/factory.keys.json" \
     -m deployCompany \
     "{\"name\":\"NJD Ventures\",\"description\":\"SIIR demo company\",\"website\":\"https://njd.example\",\
       \"metadataUri\":\"ipfs://QmSIIRdemo\",\"founder\":\"$(legacy "$FOUNDER")\",\"founderPubkey\":\"0x$FOUNDER_PUB\",\
-      \"issuanceModel\":0,\"plans\":[{\"count\":100,\"weight\":1000,\"label\":\"Genesis\",\"issued\":false}],\
+      \"issuanceModel\":0,\"plans\":[{\"count\":${PLAN_COUNT:-100},\"weight\":1000,\"label\":\"Genesis\",\"issued\":false}],\
       \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"$UI_BUNDLE\",\
       \"charter\":$CHARTER,\"initialValue\":20000000000}" >/dev/null || true
   wait_active "$COMPANY" "company"
@@ -246,8 +262,38 @@ if ! cli account "$HOLDER" 2>/dev/null | grep -q '"Active"'; then
   fund "$HOLDER" 50000000000
   sleep 3
   deploy_self holder "$WORK/holder.keys.json" "$MULTISIG_ABI" \
-    "{\"owners_pubkey\":[\"0x$HOLDER_PUB\"],\"owners_address\":[],\"reqConfirms\":1,\"reqConfirmsData\":1,\"value\":1000000000}"
+    "{\"owners_pubkey\":[\"0x$HOLDER_PUB\"],\"owners_address\":[],\"reqConfirms\":1,\"reqConfirmsData\":1,\"value\":3000000000}"
   wait_active "$HOLDER" "holder wallet"
+fi
+
+# ---------- 5b. 10B-scale proof (PLAN_COUNT=10^10) ----------
+if [ "${PLAN_COUNT:-100}" = "10000000000" ]; then
+  echo "== 5b. 10B-scale proof (lazy derived registry) =="
+  cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
+  echo "  spot-check derived getSIIR at 1 / mid / last:"
+  cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
+  cli run "$COMPANY" getSIIR '{"id":"5000000000"}' --abi "$CT/CompanySIIR.abi.json" || true
+  cli run "$COMPANY" getSIIR '{"id":"10000000000"}' --abi "$CT/CompanySIIR.abi.json" || true
+  echo "  register shape (compact ranges, not per-id rows):"
+  cli run "$COMPANY" getSegments '{}' --abi "$CT/CompanySIIR.abi.json" || true
+  FB10=$(cli run "$COMPANY" getBalanceOf "{\"owner\":\"$(legacy "$FOUNDER")\"}" --abi "$CT/CompanySIIR.abi.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0", json.load(sys.stdin).get("count","?")))' 2>/dev/null || echo "?")
+  echo "  founder balance: $FB10 (expect 10000000000)"
+  [ "$FB10" = "10000000000" ] && echo "  [ok] balance counts derived ids from one segment" || echo "  [fail] balance mismatch"
+  echo "  one transferRange moves all 10B ids to the holder:"
+  cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transferRange '{"start":"1","end":"10000000000","newOwner":"'$(legacy "$HOLDER")'"}')\"}" >/dev/null || true
+  for attempt in $(seq 1 15); do
+    H10=$(cli run "$COMPANY" getOwnerOf '{"id":"5000000000"}' --abi "$CT/CompanySIIR.abi.json" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+    [ "$H10" = "0:$HOLDER_RAW" ] && break
+    sleep 2
+  done
+  echo "  SIIR #5000000000 owner: ${H10:-?} (expect 0:$HOLDER_RAW)"
+  [ "$H10" = "0:$HOLDER_RAW" ] && echo "  [ok] transferRange landed in one record" || echo "  [fail] transferRange never landed"
+  cli run "$COMPANY" getSegments '{}' --abi "$CT/CompanySIIR.abi.json" || true
+  cli run "$COMPANY" getHistory '{"id":"10000000000"}' --abi "$CT/CompanySIIR.abi.json" || true
 fi
 
 # ---------- 7. transfer SIIR #1 -> holder ----------
@@ -258,7 +304,7 @@ if [ "$OWNER" != "0:$FOUNDER_RAW" ]; then
   echo "  owner is not founder wallet; skipping transfer"
 else
   cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
       \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer "{\"ids\":[\"1\"],\"newOwner\":\"$(legacy "$HOLDER")\"}")\"}" >/dev/null || true
   sleep 3
   cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
@@ -271,17 +317,17 @@ FBAL=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.
 FBAL2=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("2",0))' 2>/dev/null || echo 0)
 FBAL1=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("1",0))' 2>/dev/null || echo 0)
 [ "${FBAL:-0}" -lt 5000000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
-  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"3\":5000000000000}}" >/dev/null || true
+  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":3000000000,\"ecc\":{\"3\":5000000000000}}" >/dev/null || true
 [ "${FBAL2:-0}" -lt 20000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
-  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"2\":20000000000}}" >/dev/null || true
+  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":3000000000,\"ecc\":{\"2\":20000000000}}" >/dev/null || true
 [ "${FBAL1:-0}" -lt 1000000000 ] && cli callx --abi "$GIVER_ABI" --addr "$GIVER_FULL" -m sendCurrency \
-  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":1000000000,\"ecc\":{\"1\":1000000000}}" >/dev/null || true
+  "{\"dest\":\"$(legacy "$FOUNDER")\",\"value\":3000000000,\"ecc\":{\"1\":1000000000}}" >/dev/null || true
 sleep 3
 div_dep() { cli run "$COMPANY" getDividendCurrencies {} --abi "$CT/CompanySIIR.abi.json" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); ids=d.get('ids') or d.get('value0') or []; deps=d.get('deposits') or d.get('value2') or []; print(deps[ids.index('$1')] if '$1' in ids else 0)" 2>/dev/null || echo 0; }
 PRE_USDC=$(div_dep 3)
 cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{\"2\":10000000000,\"3\":5000000000000,\"1\":1000000000},\"bounce\":true,\"flags\":1,\
+  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":10000000000,\"3\":5000000000000,\"1\":1000000000},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["2","3","1"]}')\"}" >/dev/null || true
 for attempt in $(seq 1 15); do
   NOW_USDC=$(div_dep 3)
@@ -299,7 +345,7 @@ echo "== 9. holder claims (SHELL + eccUSDC + NACKL in one transfer) =="
 HB=$(cli account "$HOLDER" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
 [ "${HB:-0}" -lt 3000000000 ] && { echo "  holder vmshell low (${HB}); funding..."; fund "$HOLDER" 50000000000; sleep 3; }
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/CompanySIIR.abi.json" claim '{"ids":["1"]}')\"}" >/dev/null || true
 for attempt in $(seq 1 15); do
   OUT=$(cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null || true)
@@ -326,8 +372,39 @@ echo "  rounds company: $COMPANY_B"
 if ! cli account "$COMPANY_B" 2>/dev/null | grep -q '"Active"'; then
   echo "  deploying rounds company via factory..."
   # factory spends initialValue in VMSHELL per company; refill if running low
-  FB=$(cli account "$FACTORY" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
-  [ "${FB:-0}" -lt 40000000000 ] && { echo "  factory vmshell low (${FB}); refilling..."; fund "$FACTORY" 125000000000; sleep 5; }
+  FB=$(cli account "$FACTORY" 2>/dev/null | python3 -c '
+import json, sys
+for line in reversed(sys.stdin.read().splitlines()):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        print(int(json.loads(line).get("balance") or 0)); break
+    except Exception:
+        continue
+else:
+    print(0)' 2>/dev/null || echo 0)
+  if [ "${FB:-0}" -lt 50000000000 ]; then
+    echo "  factory vmshell low (${FB}); refilling..."
+    fund "$FACTORY" 250000000000
+    for i in $(seq 1 12); do
+      FB=$(cli account "$FACTORY" 2>/dev/null | python3 -c '
+import json, sys
+for line in reversed(sys.stdin.read().splitlines()):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        print(int(json.loads(line).get("balance") or 0)); break
+    except Exception:
+        continue
+else:
+    print(0)' 2>/dev/null || echo 0)
+      [ "${FB:-0}" -ge 50000000000 ] && break
+      sleep 5
+    done
+    echo "  factory balance now: ${FB}"
+  fi
   cli callx --abi "$CT/SIIRFactory.abi.json" --addr "$FACTORY" --keys "$WORK/factory.keys.json" \
     -m deployCompany \
     "{\"name\":\"Rounds Inc\",\"description\":\"model-B company\",\"website\":\"\",\"metadataUri\":\"\",\
@@ -378,7 +455,19 @@ echo "  content sizes: logo=$SZ_LOGO siirImage=$SZ_SIIR ui=$SZ_UI (bytes)"
 R_LOGO=$(ct_get "$COMPANY" getCompanyImage img); R_SIIR=$(ct_get "$COMPANY" getSIIRImage img); R_UI=$(ct_get "$COMPANY" getUI ui)
 [ "$R_LOGO" = "$LOGO_SVG" ] && echo "  [ok] company logo round-trips on-chain" || echo "  [fail] logo mismatch"
 [ "$R_SIIR" = "$SIIRIMG_SVG" ] && echo "  [ok] SIIR deed image round-trips on-chain" || echo "  [fail] siir image mismatch"
-[ "$R_UI" = "$UI_BUNDLE" ] && echo "  [ok] static UI bundle round-trips on-chain" || echo "  [fail] ui mismatch"
+ui_norm() { python3 -c '
+import sys, base64, gzip
+s = sys.stdin.read().strip()
+m = "data:text/html;base64,"
+gz = s.startswith(m + "gz,")
+b = s[len(m) + (3 if gz else 0):]
+d = base64.b64decode(b)
+print(gzip.decompress(d).decode(errors="replace") if gz else d.decode(errors="replace"))'; }
+if [ "$(printf '%s' "$R_UI" | ui_norm)" = "$(printf '%s' "$UI_BUNDLE" | ui_norm)" ]; then
+  echo "  [ok] static UI bundle round-trips on-chain"
+else
+  echo "  [fail] ui mismatch"
+fi
 echo "  oversized uploads: capped at deploy by require() in the factory"
 echo "    (factory ERR_LOGO/SIIR/UI/CHARTER_TOO_LARGE 202-205, company 108-111)."
 echo "    Note: tvm-cli's own message builder refuses >~128KB/single-message,"
@@ -420,7 +509,7 @@ OWNER1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.j
 echo "  SIIR #1 owner: $OWNER1 (seller escrows it)"
 if [ "$OWNER1" = "0:$HOLDER_RAW" ]; then
   cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
-    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
       \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer "{\"ids\":[\"1\"],\"newOwner\":\"$(legacy "$MARKET")\"}")\"}" >/dev/null || true
   sleep 4
 fi
@@ -428,27 +517,36 @@ echo "  SIIR #1 owner after escrow:"
 cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
 # 13b. seller lists it for 5 SHELL
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" list "{\"company\":\"$(legacy "$COMPANY")\",\"ids\":[\"1\"],\"askPrice\":5000000000,\"currencyId\":2}")\"}" >/dev/null || true
 sleep 4
 echo "  listings:"
 cli run "$MARKET" getListings '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
 # 13c. buyer (founder) bids 5 SHELL, valid 1 hour
 cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":1000000000,\"cc\":{\"2\":5000000000},\"bounce\":true,\"flags\":1,\
+  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{\"2\":5000000000},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" bid "{\"company\":\"$(legacy "$COMPANY")\",\"ids\":[\"1\"],\"price\":5000000000,\"currencyId\":2,\"validUntil\":$(( $(date +%s) + 3600 ))}")\"}" >/dev/null || true
 sleep 4
 echo "  bids:"
 cli run "$MARKET" getBids '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
 # 13d. seller accepts the top bid
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":1000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+  "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" acceptBid '{"listingId":1,"bidId":1}')\"}" >/dev/null || true
 sleep 4
 echo "  after settlement — SIIR #1 owner:"
 cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
 echo "  listing state:"
 cli run "$MARKET" getListing '{"listingId":1}' --abi "$CT/SIIRMarketplace.abi.json" || true
+# 13e. verify the settlement landed: deed with the bidder, listing closed
+O1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+ACT=$(cli run "$MARKET" getListing '{"listingId":1}' --abi "$CT/SIIRMarketplace.abi.json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("active","?")).lower())' 2>/dev/null || echo "?")
+if [ "$O1" = "0:$FOUNDER_RAW" ] && [ "$ACT" = "false" ]; then
+  echo "  [ok] acceptBid settled: deed -> bidder, listing closed"
+else
+  echo "  [fail] acceptBid did not settle (owner=$O1 active=$ACT)"
+  exit 1
+fi
 
 echo ""
 echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B  marketplace: $MARKET =="
