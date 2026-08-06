@@ -700,6 +700,57 @@ only surfaced two steps later at the claim. Step 7 now runs
 
 ---
 
+### 8.7 Founder rights (v2.2.0) and the fresh live deployment
+
+**v2.2.0 contract surface** (P0.2): the founder can manage founder
+rights. `grantFounderRights(wallet, pubkey)` — original founder only,
+adds a co-founder entry (a (wallet, pubkey) pair exactly like the
+original founder, so both internal-wallet and external-key auth work).
+`revokeFounderRights(wallet, pubkey)` — original founder only, removes
+the entry by wallet (or by pubkey when wallet is zero). Co-founders
+hold the full founder powers (`issue`, `ratifyCharter`,
+`dissolveCompany`, `finalizeDissolution`) but **cannot manage the
+founder set** (single-admin): a co-founder's grant attempt is rejected.
+The original founder is baked into the company's address and can never
+be revoked. Grants double as key rotation: grant a replacement pubkey
+first, then revoke the lost one. Register frozen (`_dissolved`)
+blocks grant/revoke. Readbacks: `getFounders()` (wallets, pubkeys,
+grantedAt — mirror-decoded by `gov_state.py founders`) and
+`getFounderRights(wallet, pubkey)`; `_isFounder` consults
+`_coFounders` after the original wallet/pubkey check. State field
+`_coFounders` (FounderEntry[]) is appended to the C4 layout, so all
+older companies decode unchanged.
+
+**Live redeploy (current, v2.2.0 stack):** `FORCE=1
+PLAN_COUNT=10000000000 DEMO_FOUNDER_RIGHTS=1` — the 10B-scale run on
+the new stack, 18/18 `[ok]`, 0 `[fail]`, including the new 13c
+founder-rights demo on the rounds company: grant → co-founder
+ratified the charter (founder power proven) → co-founder grant attempt
+rejected (single-admin) → revoke → revoked key's grant attempt
+rejected. The demo company stays operating (no step-14 dissolution);
+the founder-rights demo runs before dissolution so grants are legal.
+
+```
+dapp-id:    ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f
+factory:    <dapp-id>::ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f
+marketplace:<dapp-id>::dbcfe4606f1c3b707b0eb3eefe23c2faf9c3793d8e344ad3ba01adf38d159899
+company:    <dapp-id>::fba5b22395a75f9c8dae21068d09e3fdbbf98ee6d6325acf25136b3a085f7fef  (10B SIIRs, operating)
+rounds:     <dapp-id>::dc3b5746385e0cde5847caf5ed80b5c173a77ea85f0668f354f88b023058592d
+founder:    c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb::<same>
+holder:     0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa::<same>
+founder pubkey: 0x4af1476b083267020a5b70e179269d24223e33869f32450fb91537fecbc60235
+```
+
+**Parity coverage:** `tests/gen_ground.py` + `static/parity.js` now
+compare 21 fields incl. `co_founders` (empty list on the live company
+after the demo's revoke) and `founder_rights_*` checks. The non-empty
+decode was proven separately against the rounds company (grant →
+JS/Python ALL MATCH on the 3 founder fields → revoke), and the on-chain
+grant readback (`gov_state.py founders`) showed the exact wallet
+`0:c4d173…` + pubkey `0x4af1476b…` entry.
+
+---
+
 ## 9. Current status and next steps
 
 **Done (verified on shellnet):** spec (`SIIR.md`), README, contracts

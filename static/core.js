@@ -785,6 +785,26 @@ class MirrorState {
         return { charter: this.state._charter || "", ratified: !!this.state._charterRatified };
     }
 
+    // every granted co-founder; the original founder is baked into the
+    // address and never listed here
+    coFounders() {
+        return (this.state._coFounders || []).map((e) => ({
+            wallet: e[0] || "",
+            pubkey: hex0x64(e[1] || 0n),
+            grantedAt: String(e[2] || 0n),
+        }));
+    }
+
+    founderRights(wallet, pubkey) {
+        const w = wallet || "";
+        const p = pubkey ? hex0x64(pubkey) : "";
+        for (const e of this.state._coFounders || []) {
+            if (w && e[0] === w) return true;
+            if (p && e[1] && hex0x64(e[1]) === p) return true;
+        }
+        return false;
+    }
+
     async charterFingerprint() {
         const ch = this.state._charter || "";
         if (!ch) return "0";

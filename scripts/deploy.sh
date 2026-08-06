@@ -12,6 +12,8 @@
 # PLAN_COUNT=10000000000 additionally runs the 10B-scale proof: one O(1)
 # issue() for all 10B ids, derived getSIIR spot checks (1 / mid / last),
 # getBalanceOf, and a single transferRange covering the whole register.
+# DEMO_FOUNDER_RIGHTS=1 runs the v2.2.0 founder-rights demo on the rounds
+# company: grant -> co-founder ratify -> single-admin check -> revoke -> dead key.
 #
 # Addressing model on Acki Nacki:
 #   * self-rooted (deployed via external message) contracts live at <own>::<own>
@@ -471,6 +473,52 @@ for attempt in $(seq 1 8); do
   sleep 4
 done
 cli run "$COMPANY_B" getPlans {} --abi "$CT/CompanySIIR.abi.json"
+
+# ---------- 13c. founder rights (v2.2.0): grant -> power -> single-admin -> revoke ----------
+# On the rounds company (founder = holder wallet, charter never ratified):
+# the original founder grants the main-founder key co-founder rights, the
+# co-founder proves founder power (ratifyCharter), proves single-admin
+# (co-founder grant attempt is rejected), then revocation kills the rights.
+if [ "${DEMO_FOUNDER_RIGHTS:-0}" = "1" ]; then
+  echo "== 13c. founder rights v2.2.0 =="
+  CF_KEYS="$WORK/company.keys.json"
+  CF_PUBKEY=$(python3 -c 'import json; print("0x"+json.load(open("'"$CF_KEYS"'"))["public"])')
+  CF_WALLET="0:$FOUNDER_RAW"
+  FR() { python3 scripts/gov_state.py "$COMPANY_B" founders 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); c=d.get("coFounders") or []; print(len(c), c[0]["wallet"] if c else "-", c[0]["pubkey"][:18] if c else "-")' 2>/dev/null || echo "? ?"; }
+  echo "  before grant: $(FR) (expect 0 -)"
+  # 13c-1. original founder (holder) grants the main founder wallet + its key
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$WORK/holder.keys.json" -m grantFounderRights \
+    "{\"wallet\":\"$CF_WALLET\",\"pubkey\":\"$CF_PUBKEY\"}" >/dev/null 2>&1 || true
+  sleep 4
+  G=$(FR)
+  [ "${G%% *}" = "1" ] && echo "  [ok] grant landed: $G" || echo "  [fail] grant never landed ($G)"
+  # 13c-2. the co-founder exercises founder power: ratify the charter
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$CF_KEYS" -m ratifyCharter '{}' >/dev/null 2>&1 || true
+  sleep 4
+  RAT=$(cli run "$COMPANY_B" getCharter {} --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+    | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("ratified","?")).lower())' 2>/dev/null || echo "?")
+  [ "$RAT" = "true" ] && echo "  [ok] co-founder ratified the charter (founder power proven)" || echo "  [fail] co-founder ratify rejected (ratified=$RAT)"
+  # 13c-3. single-admin: the co-founder cannot grant further rights
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$CF_KEYS" -m grantFounderRights \
+    "{\"wallet\":\"0:$HOLDER_RAW\",\"pubkey\":\"0x0000000000000000000000000000000000000000000000000000000000000000\"}" >/dev/null 2>&1 || true
+  sleep 4
+  G2=$(FR)
+  [ "${G2%% *}" = "1" ] && echo "  [ok] co-founder grant rejected (single-admin, still ${G2%% *} founder)" || echo "  [fail] co-founder granted more rights ($G2)"
+  # 13c-4. original founder revokes by wallet
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$WORK/holder.keys.json" -m revokeFounderRights \
+    "{\"wallet\":\"$CF_WALLET\",\"pubkey\":\"0x0000000000000000000000000000000000000000000000000000000000000000\"}" >/dev/null 2>&1 || true
+  sleep 4
+  G3=$(FR)
+  [ "${G3%% *}" = "0" ] && echo "  [ok] revoke landed: 0 co-founders" || echo "  [fail] revoke never landed ($G3)"
+  # 13c-5. the revoked key holds no power: its grant attempt must not land
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY_B" --keys "$CF_KEYS" -m grantFounderRights \
+    "{\"wallet\":\"0:$HOLDER_RAW\",\"pubkey\":\"$CF_PUBKEY\"}" >/dev/null 2>&1 || true
+  sleep 4
+  G4=$(FR)
+  [ "${G4%% *}" = "0" ] && echo "  [ok] revoked key rejected (rights are dead)" || echo "  [fail] revoked key still grants ($G4)"
+  FR
+fi
 
 # ---------- 11. on-chain content: round-trip + size-cap enforcement ----------
 echo "== 11. on-chain content =="

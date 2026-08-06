@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from mirror import MirrorState  # noqa: E402
 
 ADDR = (sys.argv[1] if len(sys.argv) > 1 else
-        "82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6"
-        "::6890748cdb02ed4c1ac5f43b52c4e9048f60567fe0cbfbe8124babb37f1096bd")
+        "ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f"
+        "::fba5b22395a75f9c8dae21068d09e3fdbbf98ee6d6325acf25136b3a085f7fef")
 F = sys.argv[2] if len(sys.argv) > 2 else "0:c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb"
 H = sys.argv[3] if len(sys.argv) > 3 else "0:0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa"
 
@@ -55,6 +55,9 @@ def main():
                      for s, e in ms.ids_of(F)][:5],
         "history100": ms.history(100),
         "holder_claimable": ms.claimable_of(H),
+        "co_founders": ms.co_founders(),
+        "founder_rights_holder": ms.founder_rights(H, "0x0000000000000000000000000000000000000000000000000000000000000000"),
+        "founder_rights_original": ms.founder_rights(F, "0x0000000000000000000000000000000000000000000000000000000000000000"),
     }
     print(json.dumps(out, sort_keys=True))
     return 0

@@ -275,6 +275,21 @@ appended to the SIIR's history; nothing is ever deleted.
 Optional. Voting power = SIIR weight. Founder controls governance
 until enabled by the founder at creation.
 
+## Founder rights
+
+The original founder (the wallet + pubkey baked into the company's
+address) can grant and revoke co-founder rights at any time while the
+register operates. A grant is a (wallet, pubkey) pair exactly like the
+original founder — a co-founder acts through their wallet contract or
+their own key (external messages). Co-founders hold the full founder
+powers (issue, charter ratification, dissolve, finalize) but cannot
+manage the founder set: only the original founder grants or revokes,
+and the original founder can never be revoked. Grants double as key
+rotation — grant a replacement pubkey before revoking a lost one.
+Revocation is immediate and total for the wallet/key in question.
+Grant and revoke are blocked once the company is dissolved (the
+register is frozen).
+
 ## Dissolution
 
 A defined lifecycle for ending a company:

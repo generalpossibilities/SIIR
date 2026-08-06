@@ -32,3 +32,4 @@ scripts/__pycache__/
 # Generated single-file bundle (build with static/bundle.py)
 static/bundle.html
 
+tests/__pycache__/

@@ -33,6 +33,12 @@
  * triggered finalize sweeps the unclaimed treasury to the immutable rule
  * chosen at creation: back to the founder (treasury), a fixed charity/DAO
  * address, or burn. The SIIRs survive as historical records.
+ *
+ * v2.2: founder rights. The original founder (baked into the address) may
+ * grant/revoke co-founder rights — (wallet, pubkey) pairs holding the same
+ * founder powers. Single-admin: only the original founder manages the set,
+ * and can never be revoked. Grants double as key rotation (grant a
+ * replacement pubkey before revoking a lost one).
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
@@ -40,7 +46,7 @@ pragma AbiHeader pubkey;
 
 contract CompanySIIR {
     // ---------- constants ----------
-    string constant version = "2.1.0";
+    string constant version = "2.2.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
@@ -82,6 +88,8 @@ contract CompanySIIR {
     uint16 constant ERR_ALREADY_VOTED     = 128;
     uint16 constant ERR_QUORUM_NOT_MET    = 129;
     uint16 constant ERR_BAD_DISSOLUTION   = 130;
+    uint16 constant ERR_ALREADY_GRANTED   = 131;
+    uint16 constant ERR_NOT_GRANTED       = 132;
 
     // Dissolution grace period: claims stay open this long after the company
     // dissolves, then the founder may sweep the unclaimed treasury.
@@ -229,6 +237,21 @@ contract CompanySIIR {
     bool _finalDeposited;        // the one post-dissolution (final) deposit happened
     bool _finalized;             // grace over; treasury swept; claims closed
 
+    // ---------- founder rights (v2.2.0) ----------
+    // Co-founders granted by the original founder: each entry is a (wallet,
+    // pubkey) pair exactly like the original founder, so both internal-wallet
+    // and external-key auth work. The original founder is baked into the
+    // address and can never be revoked. Grants also serve key rotation: a
+    // founder who loses a key gets a replacement pubkey granted before the
+    // old one is revoked.
+    struct FounderEntry {
+        address wallet;
+        uint256 pubkey;
+        uint64 grantedAt;
+    }
+
+    FounderEntry[] _coFounders;
+
     // ---------- events ----------
     event CompanyCreated(address factory, address founder, string name, uint8 issuanceModel);
     event PlanMinted(uint256 planIndex, uint256 startId, uint256 endId, uint128 weight, uint64 timestamp);
@@ -240,6 +263,8 @@ contract CompanySIIR {
     event DissolveVote(address voter, uint128 weight, uint128 totalVotes, uint64 timestamp);
     event CompanyDissolved(uint64 timestamp);
     event DissolutionFinalized(uint8 rule, address destination, uint64 timestamp);
+    event FounderRightsGranted(address wallet, uint256 pubkey, uint64 timestamp);
+    event FounderRightsRevoked(address wallet, uint256 pubkey, uint64 timestamp);
 
     // ---------- constructor ----------
     constructor(
@@ -295,13 +320,66 @@ contract CompanySIIR {
     function _isFounder() private view {
         require(
             (msg.sender == _founder) ||
-            (msg.pubkey() == _founderPubkey),
+            (msg.pubkey() == _founderPubkey) ||
+            _isGrantedFounder(msg.sender, msg.pubkey()),
             ERR_NOT_FOUNDER
         );
         tvm.accept();
     }
 
+    /// Co-founder auth: a granted wallet (internal messages) or a granted
+    /// pubkey (external messages, where msg.sender is an addr_extern).
+    function _isGrantedFounder(address wallet, uint256 pubkey) private view returns (bool ok) {
+        for (uint256 i = 0; i < _coFounders.length; i++) {
+            if (_coFounders[i].wallet.value != 0 && _coFounders[i].wallet == wallet) return true;
+            if (_coFounders[i].pubkey != 0 && _coFounders[i].pubkey == pubkey) return true;
+        }
+    }
+
     /// Owners act through their wallet contracts (internal messages).
+
+    // ---------- founder rights ----------
+    /// Only the original founder (the wallet+pubkey baked into this company's
+    /// address) may grant co-founder rights. A granted co-founder has the full
+    /// founder powers: issue, ratify, dissolve, finalize. The original founder
+    /// can never be revoked — the company's own address guarantees it. Grants
+    /// also serve key rotation: grant a replacement pubkey first, then revoke
+    /// the lost one.
+    function grantFounderRights(address wallet, uint256 pubkey) public {
+        _isFounder();
+        require(!_dissolved, ERR_REGISTER_FROZEN);
+        require(wallet.value != 0 || pubkey != 0, ERR_BAD_GOVERNANCE);
+        require(wallet != _founder && pubkey != _founderPubkey, ERR_ALREADY_GRANTED);
+        for (uint256 i = 0; i < _coFounders.length; i++) {
+            require(wallet.value == 0 || _coFounders[i].wallet != wallet, ERR_ALREADY_GRANTED);
+            require(pubkey == 0 || _coFounders[i].pubkey != pubkey, ERR_ALREADY_GRANTED);
+        }
+        tvm.accept();
+        _coFounders.push(FounderEntry(wallet, pubkey, uint64(block.timestamp)));
+        emit FounderRightsGranted(wallet, pubkey, uint64(block.timestamp));
+    }
+
+    /// The original founder removes a co-founder's rights. The entry is
+    /// identified by its wallet when given, else by its pubkey. Once revoked
+    /// the wallet/key loses every founder power immediately.
+    function revokeFounderRights(address wallet, uint256 pubkey) public {
+        _isFounder();
+        require(!_dissolved, ERR_REGISTER_FROZEN);
+        require(wallet.value != 0 || pubkey != 0, ERR_BAD_GOVERNANCE);
+        for (uint256 i = 0; i < _coFounders.length; i++) {
+            bool hit = (wallet.value != 0 && _coFounders[i].wallet == wallet) ||
+                       (pubkey != 0 && _coFounders[i].pubkey == pubkey);
+            if (!hit) continue;
+            tvm.accept();
+            for (uint256 j = i; j + 1 < _coFounders.length; j++) {
+                _coFounders[j] = _coFounders[j + 1];
+            }
+            _coFounders.pop();
+            emit FounderRightsRevoked(wallet, pubkey, uint64(block.timestamp));
+            return;
+        }
+        require(false, ERR_NOT_GRANTED);
+    }
 
     // ---------- charter ----------
     /// The founder personally acknowledges the immutable charter with their
@@ -693,6 +771,25 @@ contract CompanySIIR {
     function getVoteInfo(address owner) external view returns (bool voted, uint128 weight) {
         voted = _votedDissolve[owner];
         weight = _weightOf(owner);
+    }
+
+    /// Every co-founder granted founder rights. The original founder is baked
+    /// into the company's address and is never listed here.
+    function getFounders() external view returns (
+        address[] wallets,
+        uint256[] pubkeys,
+        uint64[] grantedAt
+    ) {
+        for (uint256 i = 0; i < _coFounders.length; i++) {
+            wallets.push(_coFounders[i].wallet);
+            pubkeys.push(_coFounders[i].pubkey);
+            grantedAt.push(_coFounders[i].grantedAt);
+        }
+    }
+
+    /// Whether a wallet/pubkey currently holds co-founder rights.
+    function getFounderRights(address wallet, uint256 pubkey) external view returns (bool granted) {
+        granted = _isGrantedFounder(wallet, pubkey);
     }
 
     function getSIIR(uint256 id) external view returns(

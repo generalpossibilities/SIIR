@@ -9,7 +9,7 @@ global.atob = (s) => Buffer.from(s, "base64").toString("binary");
 const XP = require("./core.js");
 const ABI = { fields: require("./fields.js").ABI_FIELDS };
 
-const ADDR = process.env.PARITY_ADDR || "82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6::6890748cdb02ed4c1ac5f43b52c4e9048f60567fe0cbfbe8124babb37f1096bd";
+const ADDR = process.env.PARITY_ADDR || "ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f::fba5b22395a75f9c8dae21068d09e3fdbbf98ee6d6325acf25136b3a085f7fef";
 const F = process.env.PARITY_FOUNDER || "0:c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb";
 const H = process.env.PARITY_HOLDER || "0:0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa";
 
@@ -36,6 +36,9 @@ async function main() {
         ids_of_f: ms.idsOf(F).slice(0, 5),
         history100: ms.history(100),
         holder_claimable: ms.claimableOf(H),
+        co_founders: ms.coFounders(),
+        founder_rights_holder: ms.founderRights(H, "0x0000000000000000000000000000000000000000000000000000000000000000"),
+        founder_rights_original: ms.founderRights(F, "0x0000000000000000000000000000000000000000000000000000000000000000"),
     };
     const py = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
     // normalize: BigInt -> string, and sort object keys recursively, so the

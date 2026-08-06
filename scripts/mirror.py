@@ -929,6 +929,34 @@ class MirrorState:
             "ratified": bool(self.state.get("_charterRatified")),
         }
 
+    def co_founders(self):
+        """Every granted co-founder: [{wallet, pubkey, grantedAt}]. The
+        original founder is baked into the address and never listed."""
+        out = []
+        for e in self.state.get("_coFounders") or []:
+            wallet = e[0] if isinstance(e, (list, tuple)) and len(e) > 0 else None
+            pubkey = int(e[1]) if isinstance(e, (list, tuple)) and len(e) > 1 else 0
+            granted = int(e[2]) if isinstance(e, (list, tuple)) and len(e) > 2 else 0
+            out.append({
+                "wallet": wallet or "",
+                "pubkey": f"0x{pubkey:064x}",
+                "grantedAt": str(granted),
+            })
+        return out
+
+    def founder_rights(self, wallet, pubkey):
+        """Mirror of getFounderRights(wallet, pubkey): a wallet or pubkey is
+        granted when either half matches a live co-founder entry."""
+        w = wallet or ""
+        p = f"0x{int(pubkey, 16) if isinstance(pubkey, str) else pubkey:064x}"
+        for e in self.state.get("_coFounders") or []:
+            if isinstance(e, (list, tuple)) and len(e) >= 2:
+                if w and e[0] == w:
+                    return True
+                if pubkey and f"0x{int(e[1]):064x}" == p:
+                    return True
+        return False
+
     def charter_fingerprint(self):
         ch = self.state.get("_charter") or ""
         if not ch:

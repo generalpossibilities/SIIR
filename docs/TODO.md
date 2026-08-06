@@ -11,10 +11,10 @@ Project-end goals (per the founder):
 - **UI deployability**: everything currently done from the CLI
   (`scripts/deploy.sh`) must be reachable from a browser.
 
-Current live deployment (shellnet, v2.1.0 stack): factory
-`82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6` (self-rooted),
-10B company `…::6890748c…`, rounds company `…::3d74a393…`, marketplace/escrow
-`…::1c67df9c…` (see `docs/project.md` §8.4).
+Current live deployment (shellnet, v2.2.0 stack): factory
+`ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f` (self-rooted),
+10B company `…::fba5b223…`, rounds company `…::dc3b5746…`, marketplace/escrow
+`…::dbcfe460…` (see `docs/project.md` §8.7).
 
 ## P0 — Security, keys & correctness
 
@@ -29,9 +29,14 @@ Current live deployment (shellnet, v2.1.0 stack): factory
    accepts external messages (verified live: signed `callx` lands with a
    tx_hash through `https://shellnet.ackinacki.org/graphql`), the relay query
    is the ton-node's hidden operation, format to be pinned in P1.8.
-2. **Grant/revoke founder rights** (`CompanySIIR` governance v2.1.0) is still
-   a no-op placeholder — implement it and cover it with the governance parity
-   suite.
+2. **Grant/revoke founder rights — DONE (v2.2.0)**: `grantFounderRights`
+   + `revokeFounderRights` (original founder only, single-admin),
+   co-founders hold full founder powers, key-rotation-friendly,
+   register-frozen guard, `getFounders`/`getFounderRights` readbacks,
+   `_coFounders` appended to C4 (older companies decode unchanged).
+   Governed by the 13c demo (grant → co-founder ratify → single-admin
+   rejection → revoke → dead key) and the 21-field parity suite
+   (non-empty decode proven live against the rounds company).
 3. **Commit the regression harness — DONE**: `tests/` now holds the parity
    harness — `gen_ground.py` (ground-truth generator against the live
    deployment), the committed fixture `fixtures/py_ground.json` (18 fields),
