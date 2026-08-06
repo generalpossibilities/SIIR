@@ -18,12 +18,17 @@ Current live deployment (shellnet, v2.1.0 stack): factory
 
 ## P0 — Security, keys & correctness
 
-1. **Gateway write-endpoint auth**: `POST /company/<addr>/claim` signs with
-   `scripts/.work/holder.keys.json` and has NO authentication — anyone who can
-   reach the gateway can spend the wallet's VMSHELL reserve. Decide the
-   signing model (browser wallet vs. server key custody behind an auth token)
-   and implement; keep local keys for dev only. Everything from the browser
-   (`scripts/deploy.sh` equivalents) hangs off this decision.
+1. **Gas & signing model — DECIDED: user-paid gas (model A).** Every wallet
+   self-funds a small VMSHELL balance; transfers, claims, lists, bids and
+   deploys are signed by the user's own keys (browser wallet) and submitted
+   directly to the chain. The gateway is **read-only by default** (done this
+   round: `POST /claim` → 403, `--writes` opt-in for dev networks only,
+   per-IP rate limit 10/min on write endpoints). Remaining: the browser
+   wallet itself — sign external messages in-browser (ed25519 via WebCrypto)
+   and relay them to the chain endpoint; the public shellnet mirror GraphQL
+   accepts external messages (verified live: signed `callx` lands with a
+   tx_hash through `https://shellnet.ackinacki.org/graphql`), the relay query
+   is the ton-node's hidden operation, format to be pinned in P1.8.
 2. **Grant/revoke founder rights** (`CompanySIIR` governance v2.1.0) is still
    a no-op placeholder — implement it and cover it with the governance parity
    suite.
@@ -33,8 +38,9 @@ Current live deployment (shellnet, v2.1.0 stack): factory
 4. **CI beyond Pages**: `.github/workflows/pages.yml` only deploys `static/**`
    to GitHub Pages; add a test job (parity suites + `scripts/deploy.sh` lint)
    on every push.
-5. **Abuse controls**: rate-limit gateway write endpoints; document and
-   enforce VMSHELL-reserve guardrails for the signing wallet (§8.5/§8.6).
+5. **Abuse controls — partially done**: rate limit (10 req/min/IP) on write
+   endpoints; still open: VMSHELL-reserve guardrails for the dev signing
+   wallet (§8.5/§8.6).
 
 ## P1 — Marketplace, explorer & UI write flows
 
@@ -47,9 +53,13 @@ Current live deployment (shellnet, v2.1.0 stack): factory
    marketplace — token pair view (prices per currency, pair switcher), and
    extend the marketplace contract with direct token-pair trades if needed
    (today listings price a SIIR deed in a single currency).
-8. **Browser write flows** (replaces the CLI lifecycle): company creation,
-   funding (giver faucet), issue, transfer, deposit dividends, claim (exists,
-   P0.1), charter upload + ratification, marketplace list/bid/acceptBid.
+8. **Browser write flows** (replaces the CLI lifecycle; gas is user-paid per
+   P0.1): company creation, funding (self-funded wallets — the freemium
+   shellnet giver is a dev-only faucet; on mainnet users fund their own
+   wallets), issue, transfer, deposit dividends, claim, charter upload +
+   ratification, marketplace list/bid/acceptBid. Signing: in-browser ed25519
+   (WebCrypto) + external-message relay to the chain endpoint; first pin the
+   relay request format (see P0.1).
 9. **Live verification of every UI action**: after each browser write, the
    explorer must reflect it instantly via mirror read-back (extend the
    gateway parity scripts to cover the write paths).

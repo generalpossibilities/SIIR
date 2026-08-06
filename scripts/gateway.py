@@ -657,6 +657,38 @@ def pending_for(addr, ids):
     return total
 
 
+ALLOW_WRITES = False
+WRITE_RATE = (10, 60)  # max requests per window (per IP) on write endpoints
+_write_hits = {}
+_write_lock = threading.Lock()
+
+
+def _rate_limited(ip):
+    """True when ip has exceeded the write-endpoint budget."""
+    with _write_lock:
+        now = time.time()
+        limit, window = WRITE_RATE
+        bucket = _write_hits.get(ip, [])
+        bucket = [t for t in bucket if now - t < window]
+        bucket.append(now)
+        _write_hits[ip] = bucket
+        return len(bucket) > limit
+
+
+def _writes_blocked(addr):
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>read-only gateway</title>
+<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;color:#111}}
+a{{color:#1d4ed8}}</style></head><body>
+<h1>This gateway is read-only</h1>
+<p>Per the SIIR gas model, transactions are <strong>signed by the user's own wallet</strong>
+and submitted directly to the chain (gas is paid by the sender's wallet — no server-side keys).
+The gateway never holds keys in production.</p>
+<p>To claim dividends from your own wallet, sign the <code>claim</code> call with your keys and
+submit it to the chain endpoint, or run a local gateway with <code>--writes</code>
+for development (uses <code>scripts/.work/holder.keys.json</code> — dev networks only).</p>
+<p><a href="/company/{addr}/">company</a></p></body></html>"""
+
+
 def do_claim(addr, ids):
     """Sign and send claim(ids) from the gateway's wallet; poll until settled."""
     w = gateway_wallet()
@@ -1430,6 +1462,12 @@ SIIRs are reachable only through the search bar.</p></div>
                 return self._send(b"bad address (want dapp_id::account_id)",
                                   "text/plain", 400)
             if parts[2:] == ["claim"]:
+                if not ALLOW_WRITES:
+                    return self._send(_writes_blocked(addr).encode(),
+                                      "text/html; charset=utf-8", 403)
+                if _rate_limited(self.client_address[0]):
+                    return self._send(b"rate limit exceeded (write endpoints)",
+                                      "text/plain", 429)
                 return self.company_claim(addr, qs)
         return self._send(b"not found", "text/plain", 404)
 
@@ -1533,8 +1571,11 @@ SIIRs are reachable only through the search bar.</p></div>
             return self._send(siir_page(addr, rest[1]).encode(),
                               "text/html; charset=utf-8")
         if what == "claim":
-            return self._send(claim_form_page(addr).encode(),
-                              "text/html; charset=utf-8")
+            if ALLOW_WRITES:
+                return self._send(claim_form_page(addr).encode(),
+                                  "text/html; charset=utf-8")
+            return self._send(_writes_blocked(addr).encode(),
+                              "text/html; charset=utf-8", 403)
         if what == "siir.json" and len(rest) > 1:
             return self._send(json.dumps(siir_data(addr, rest[1])).encode(),
                               "application/json")
@@ -1583,10 +1624,15 @@ SIIRs are reachable only through the search bar.</p></div>
 
 
 def main():
-    global NET, DEBUG, WALLET_ABI
+    global NET, DEBUG, WALLET_ABI, ALLOW_WRITES
     ap = argparse.ArgumentParser(description="SIIR on-chain content gateway")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--net", default="shellnet.ackinacki.org")
+    ap.add_argument("--writes", action="store_true",
+                    help="enable write endpoints (POST /claim) using the local "
+                         "scripts/.work/*.keys.json — DEV NETWORKS ONLY. Per the "
+                         "gas model, production signers own their wallets; the "
+                         "gateway is read-only by default.")
     ap.add_argument("--multisig-abi",
                     help="path to UpdateCustodianMultisigWallet.abi.json "
                          "(defaults: repo/contracts/0.79.3_compiled/..., "
@@ -1595,6 +1641,7 @@ def main():
     args = ap.parse_args()
     NET = args.net
     DEBUG = args.debug
+    ALLOW_WRITES = args.writes
     if args.multisig_abi:
         MULTISIG_ABI_PATHS.insert(0, args.multisig_abi)
     WALLET_ABI = next((p for p in MULTISIG_ABI_PATHS if os.path.exists(p)), None)
