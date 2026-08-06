@@ -23,6 +23,16 @@
  * any wallet anywhere can deposit and withdraw. The accounting is
  * asset-agnostic; swapping to a TIP-3 ecc token (e.g. eccUSDC) is a drop-in
  * payout module change, not an accounting change.
+ *
+ * v2.1: governance & dissolution safeguards (SIIR.md §Governance §Dissolution).
+ * Governance is optional and chosen at creation: when disabled the founder
+ * alone dissolves the company; when enabled, dissolution needs a weighted
+ * SIIR vote (quorum share chosen at creation). Dissolution freezes the
+ * register (no issues, no transfers, one final deposit allowed), lets
+ * holders claim their final value during the grace period, then a founder-
+ * triggered finalize sweeps the unclaimed treasury to the immutable rule
+ * chosen at creation: back to the founder (treasury), a fixed charity/DAO
+ * address, or burn. The SIIRs survive as historical records.
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
@@ -30,7 +40,7 @@ pragma AbiHeader pubkey;
 
 contract CompanySIIR {
     // ---------- constants ----------
-    string constant version = "2.0.0";
+    string constant version = "2.1.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
@@ -63,6 +73,28 @@ contract CompanySIIR {
     uint16 constant ERR_UI_TOO_LARGE      = 110;
     uint16 constant ERR_CHARTER_TOO_LARGE = 111;
     uint16 constant ERR_ALREADY_RATIFIED  = 112;
+    uint16 constant ERR_NOT_DISSOLVED     = 122;
+    uint16 constant ERR_ALREADY_DISSOLVED = 123;
+    uint16 constant ERR_REGISTER_FROZEN   = 124;
+    uint16 constant ERR_GRACE_NOT_OVER    = 125;
+    uint16 constant ERR_ALREADY_FINALIZED = 126;
+    uint16 constant ERR_BAD_GOVERNANCE    = 127;
+    uint16 constant ERR_ALREADY_VOTED     = 128;
+    uint16 constant ERR_QUORUM_NOT_MET    = 129;
+    uint16 constant ERR_BAD_DISSOLUTION   = 130;
+
+    // Dissolution grace period: claims stay open this long after the company
+    // dissolves, then the founder may sweep the unclaimed treasury.
+    uint64 constant DISSOLUTION_GRACE = 30 days;
+
+    // Dissolution rules (immutable, chosen at company creation):
+    // 0 = TREASURY: unclaimed funds return to the founder's wallet
+    // 1 = CHARITY / 2 = DAO: swept to the fixed address chosen at creation
+    // 3 = BURN: unclaimed funds are destroyed
+    uint8 constant DISSOLUTION_TREASURY = 0;
+    uint8 constant DISSOLUTION_CHARITY  = 1;
+    uint8 constant DISSOLUTION_DAO      = 2;
+    uint8 constant DISSOLUTION_BURN     = 3;
 
     // On-chain content caps (Acki Nacki storage is free, but bounded so a
     // single account never becomes pathological). Base64 data-URI strings.
@@ -185,6 +217,18 @@ contract CompanySIIR {
     mapping(uint256 => mapping(uint256 => HistoryEntry)) _history;
     mapping(uint256 => uint256) _historyCount;
 
+    // ---------- governance & dissolution ----------
+    bool _governanceEnabled;     // chosen at creation; dissolution needs a vote when true
+    uint16 _quorumPermille;      // weight share required to dissolve (1000 = 100%)
+    uint128 _dissolveVotes;      // accumulated SIIR weight voting to dissolve
+    mapping(address => bool) _votedDissolve;  // one weighted vote per wallet
+    bool _dissolved;             // register frozen; claims still settle
+    uint64 _dissolvedAt;
+    uint8 _dissolutionRule;      // immutable sweep rule (TREASURY/CHARITY/DAO/BURN)
+    address _dissolutionDest;    // fixed destination for CHARITY/DAO rules
+    bool _finalDeposited;        // the one post-dissolution (final) deposit happened
+    bool _finalized;             // grace over; treasury swept; claims closed
+
     // ---------- events ----------
     event CompanyCreated(address factory, address founder, string name, uint8 issuanceModel);
     event PlanMinted(uint256 planIndex, uint256 startId, uint256 endId, uint128 weight, uint64 timestamp);
@@ -193,6 +237,9 @@ contract CompanySIIR {
     event DividendDeposited(address depositor, uint32 currency, uint128 amount, uint128 dividendIndex);
     event DividendClaimed(uint256 id, address holder, uint32 currency, uint128 amount, uint128 dividendIndex);
     event CharterRatified(uint256 founderPubkey, uint64 timestamp);
+    event DissolveVote(address voter, uint128 weight, uint128 totalVotes, uint64 timestamp);
+    event CompanyDissolved(uint64 timestamp);
+    event DissolutionFinalized(uint8 rule, address destination, uint64 timestamp);
 
     // ---------- constructor ----------
     constructor(
@@ -205,7 +252,11 @@ contract CompanySIIR {
         string logoImage,
         string siirImage,
         string ui,
-        string charter
+        string charter,
+        bool governanceEnabled,
+        uint16 quorumPermille,
+        uint8 dissolutionRule,
+        address dissolutionDest
     ) accept {
         gosh.cnvrtshellq(0);
         tvm.accept();
@@ -215,6 +266,10 @@ contract CompanySIIR {
         require(bytes(siirImage).length <= MAX_SIIR_IMAGE_SIZE, ERR_SIIR_IMG_TOO_LARGE);
         require(bytes(ui).length <= MAX_UI_SIZE, ERR_UI_TOO_LARGE);
         require(bytes(charter).length <= MAX_CHARTER_SIZE, ERR_CHARTER_TOO_LARGE);
+        require(!governanceEnabled || (quorumPermille > 0 && quorumPermille <= 1000), ERR_BAD_GOVERNANCE);
+        require(dissolutionRule <= DISSOLUTION_BURN, ERR_BAD_DISSOLUTION);
+        require(dissolutionRule == DISSOLUTION_TREASURY || dissolutionRule == DISSOLUTION_BURN
+                || dissolutionDest.value != 0, ERR_BAD_DISSOLUTION);
         _name = name;
         _description = description;
         _website = website;
@@ -225,6 +280,10 @@ contract CompanySIIR {
         _siirImage = siirImage;
         _ui = ui;
         _charter = charter;
+        _governanceEnabled = governanceEnabled;
+        _quorumPermille = quorumPermille;
+        _dissolutionRule = dissolutionRule;
+        _dissolutionDest = dissolutionDest;
         _nextId = 1;
         emit CompanyCreated(_factory, _founder, _name, _issuanceModel);
     }
@@ -256,12 +315,94 @@ contract CompanySIIR {
         emit CharterRatified(_founderPubkey, uint64(block.timestamp));
     }
 
+    // ---------- governance & dissolution ----------
+    /// Total SIIR weight currently held by an owner (summed over segments;
+    /// O(segments x plans) — the register stays compact by design).
+    function _weightOf(address owner) private view returns (uint128 total) {
+        for (uint256 i = 0; i < _segments.length; i++) {
+            if (_segments[i].owner != owner) continue;
+            uint256 start = _segments[i].start;
+            uint256 end = _segments[i].end;
+            for (uint256 p = 0; p < _planIndex; p++) {
+                uint256 a = start > _planStartId[p] ? start : _planStartId[p];
+                uint256 b = end < _planEndId[p] ? end : _planEndId[p];
+                if (a <= b) {
+                    total += uint128(b - a + 1) * _plans[p].weight;
+                }
+            }
+        }
+    }
+
+    /// A holder wallet votes to dissolve; its vote weighs all the SIIRs it
+    /// currently owns. One vote per wallet. Reaching the quorum share of the
+    /// total weight dissolves the company immediately.
+    function voteDissolve() public internalMsg {
+        require(_governanceEnabled, ERR_BAD_GOVERNANCE);
+        require(!_dissolved && !_finalized, ERR_ALREADY_DISSOLVED);
+        require(!_votedDissolve[msg.sender], ERR_ALREADY_VOTED);
+        tvm.accept();
+        uint128 weight = _weightOf(msg.sender);
+        require(weight > 0, ERR_NOT_OWNER);
+        _votedDissolve[msg.sender] = true;
+        _dissolveVotes += weight;
+        emit DissolveVote(msg.sender, weight, _dissolveVotes, uint64(block.timestamp));
+        if (_dissolveVotes * 1000 >= _totalWeight * uint128(_quorumPermille)) {
+            _startDissolution();
+        }
+    }
+
+    /// Founder-key dissolution. With governance disabled the founder decides
+    /// alone; with governance enabled the quorum must already be reached.
+    function dissolveCompany() public {
+        _isFounder();
+        require(!_dissolved && !_finalized, ERR_ALREADY_DISSOLVED);
+        require(!_governanceEnabled ||
+                _dissolveVotes * 1000 >= _totalWeight * uint128(_quorumPermille),
+                ERR_QUORUM_NOT_MET);
+        tvm.accept();
+        _startDissolution();
+    }
+
+    function _startDissolution() private {
+        _dissolved = true;
+        _dissolvedAt = uint64(block.timestamp);
+        emit CompanyDissolved(_dissolvedAt);
+    }
+
+    /// After the grace period, the founder sweeps the unclaimed treasury to
+    /// the immutable rule chosen at creation. Claims close forever after.
+    function finalizeDissolution() public {
+        _isFounder();
+        require(_dissolved && !_finalized, ERR_NOT_DISSOLVED);
+        require(uint64(block.timestamp) >= _dissolvedAt + DISSOLUTION_GRACE, ERR_GRACE_NOT_OVER);
+        tvm.accept();
+        address dest = _dissolutionDest;
+        if (_dissolutionRule == DISSOLUTION_TREASURY) dest = _founder;
+        if (_dissolutionRule == DISSOLUTION_BURN) dest = address(0);
+        mapping(uint32 => varuint32) cc2;
+        bool any = false;
+        for (uint256 c = 0; c < _divCurrencies.length; c++) {
+            uint32 cur = _divCurrencies[c];
+            uint128 bal = uint128(address(this).currencies[cur]);
+            if (bal > 0) {
+                cc2[cur] = bal;
+                any = true;
+            }
+        }
+        _finalized = true;
+        emit DissolutionFinalized(_dissolutionRule, dest, uint64(block.timestamp));
+        if (any && dest.value != 0) {
+            dest.transfer({value: varuint16(1000000000), flag: 1, currencies: cc2});
+        }
+    }
+
     // ---------- issuance ----------
     /// Mint the next declared plan/round in batches.
     /// Full capitalization: the single genesis plan. Rounds: the next round plan.
     /// Every SIIR is minted to the founder.
     function issue() public {
         _isFounder();
+        require(!_dissolved, ERR_REGISTER_FROZEN);
         require(_planIndex < _plans.length, ERR_SUPPLY_EXCEEDED);
         TierPlan plan = _plans[_planIndex];
         require(!plan.issued, ERR_ALREADY_ISSUED);
@@ -334,6 +475,7 @@ contract CompanySIIR {
     /// Ownership is a state change in the register; the SIIR carries its
     /// history, and pending dividends stay attached (cum-dividend).
     function transfer(uint256[] ids, address newOwner) public {
+        require(!_dissolved, ERR_REGISTER_FROZEN);
         require(newOwner.value != 0, ERR_NOT_OWNER);
         require(msg.sender != newOwner, ERR_NOT_OWNER);
         tvm.accept();
@@ -352,6 +494,7 @@ contract CompanySIIR {
     /// Transfer a whole contiguous range [start, end] in one record. The
     /// range must lie inside a single segment owned by the caller.
     function transferRange(uint256 start, uint256 end, address newOwner) public {
+        require(!_dissolved, ERR_REGISTER_FROZEN);
         require(newOwner.value != 0, ERR_NOT_OWNER);
         require(msg.sender != newOwner, ERR_NOT_OWNER);
         require(start >= 1 && start <= end && end < _nextId, ERR_NO_SIIR);
@@ -407,6 +550,9 @@ contract CompanySIIR {
     function depositDividends(uint32[] currencyIds) public internalMsg {
         uint128 total = 0;
         require(_totalWeight > 0, ERR_BAD_ISSUANCE);
+        // Treasury is frozen once dissolved — except for the single final
+        // distribution the founder may still deposit during the grace period.
+        require(!_finalized && (!_dissolved || !_finalDeposited), ERR_REGISTER_FROZEN);
         tvm.accept();
         for (uint256 i = 0; i < currencyIds.length; i++) {
             uint32 cur = currencyIds[i];
@@ -424,6 +570,7 @@ contract CompanySIIR {
             emit DividendDeposited(msg.sender, cur, amount, _dividendIndex[cur]);
         }
         require(total > 0, ERR_NOTHING_DEPOSITED);
+        if (_dissolved) _finalDeposited = true;
     }
 
     /// Claim pending dividends for owned SIIRs. Every active payout track is
@@ -432,6 +579,7 @@ contract CompanySIIR {
     /// — in the same message, so funds arrive at the wallet on any Dapp ID,
     /// including currency ids created after this company was deployed.
     function claim(uint256[] ids) public internalMsg {
+        require(!_finalized, ERR_REGISTER_FROZEN);
         mapping(uint32 => uint128) totals;
         uint128 combined = 0;
         for (uint256 i = 0; i < ids.length; i++) {
@@ -516,6 +664,35 @@ contract CompanySIIR {
 
     function getPlans() external view returns (TierPlan[] plans) {
         return _plans;
+    }
+
+    /// Governance & dissolution state: config (immutable) + live status.
+    /// graceEnd = when the founder may finalize the dissolution (0 until then).
+    function getGovernance() external view returns (
+        bool governanceEnabled,
+        uint16 quorumPermille,
+        uint128 totalWeight,
+        uint128 dissolveVotes,
+        bool dissolved,
+        uint64 dissolvedAt,
+        uint8 dissolutionRule,
+        address dissolutionDest,
+        bool finalDeposited,
+        bool finalized,
+        uint64 graceEnd
+    ) {
+        return (
+            _governanceEnabled, _quorumPermille, _totalWeight, _dissolveVotes,
+            _dissolved, _dissolvedAt, _dissolutionRule, _dissolutionDest,
+            _finalDeposited, _finalized,
+            _dissolved ? _dissolvedAt + DISSOLUTION_GRACE : 0
+        );
+    }
+
+    /// Whether an owner already voted and with what weight.
+    function getVoteInfo(address owner) external view returns (bool voted, uint128 weight) {
+        voted = _votedDissolve[owner];
+        weight = _weightOf(owner);
     }
 
     function getSIIR(uint256 id) external view returns(

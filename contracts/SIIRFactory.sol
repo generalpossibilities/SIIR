@@ -10,6 +10,10 @@
  * client (static explorer included) can list companies and listings by
  * decoding this single contract's state.
  *
+ * v2.1: deployCompany passes the governance & dissolution configuration
+ * (governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest)
+ * through to the company contract (see SIIR.md §Governance §Dissolution).
+ *
  * The factory never modifies deployed companies. It only creates them.
  */
 pragma gosh-solidity >=0.76.1;
@@ -20,7 +24,7 @@ import "./CompanySIIR.sol";
 import "./SIIRMarketplace.sol";
 
 contract SIIRFactory {
-    string constant version = "2.0.0";
+    string constant version = "2.1.0";
 
     uint16 constant ERR_NOT_OWNER = 200;
     uint16 constant ERR_BAD_ARGS   = 201;
@@ -96,6 +100,11 @@ contract SIIRFactory {
     /// @param ui          optional static app bundle (HTML/JS, base64 data URI)
     /// @param charter     immutable founder commitments / rules of the company
     /// @param initialValue VMSHELL to fund the company contract at deploy
+    /// @param governanceEnabled dissolution needs a weighted SIIR vote when true
+    /// @param quorumPermille  weight share (0-1000) required to dissolve
+    /// @param dissolutionRule  unclaimed-treasury rule (0 treasury, 1 charity,
+    ///                         2 DAO, 3 burn) — immutable, chosen at creation
+    /// @param dissolutionDest fixed destination address (rules 1-2)
     function deployCompany(
         string name,
         string description,
@@ -109,7 +118,11 @@ contract SIIRFactory {
         string siirImage,
         string ui,
         string charter,
-        uint128 initialValue
+        uint128 initialValue,
+        bool governanceEnabled,
+        uint16 quorumPermille,
+        uint8 dissolutionRule,
+        address dissolutionDest
     ) public onlyOwner returns (address company) {
         require(plans.length > 0, ERR_BAD_ARGS);
         require(founder.value != 0, ERR_BAD_ARGS);
@@ -121,7 +134,9 @@ contract SIIRFactory {
             stateInit: _companyStateInit(founder, founderPubkey),
             value: varuint16(initialValue),
             flag: 1
-        }(name, description, website, metadataUri, issuanceModel, plans, logoImage, siirImage, ui, charter);
+        }(name, description, website, metadataUri, issuanceModel, plans,
+          logoImage, siirImage, ui, charter,
+          governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest);
         emit CompanyDeployed(company, founder, name, issuanceModel);
         _registerCompany(company, name, issuanceModel, founder);
     }

@@ -678,6 +678,23 @@ class MirrorState:
             out.append({"start": s[0], "end": s[1], "owner": s[2]})
         return out
 
+    def weight_of(self, owner):
+        """Total SIIR weight held by an owner (mirror of contract _weightOf)."""
+        total = 0
+        starts = self._plan_start()
+        ends = self._plan_end()
+        plans = self._plans_raw()
+        for seg in self._segments():
+            if seg["owner"] != owner:
+                continue
+            a, b = seg["start"], seg["end"]
+            for k, s in starts.items():
+                pe = ends.get(k)
+                pa, pb = max(a, s), min(b, pe)
+                if pa <= pb:
+                    total += (pb - pa + 1) * plans[int(k)][1]
+        return total
+
     def _overrides(self):
         return self.state.get("_siirs") or {}  # id -> [label, metadataUri]
 

@@ -232,10 +232,14 @@ if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
       \"metadataUri\":\"ipfs://QmSIIRdemo\",\"founder\":\"$(legacy "$FOUNDER")\",\"founderPubkey\":\"0x$FOUNDER_PUB\",\
       \"issuanceModel\":0,\"plans\":[{\"count\":${PLAN_COUNT:-100},\"weight\":1000,\"label\":\"Genesis\",\"issued\":false}],\
       \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"$UI_BUNDLE\",\
-      \"charter\":$CHARTER,\"initialValue\":20000000000}" >/dev/null || true
+      \"charter\":$CHARTER,\"initialValue\":20000000000,\
+      \"governanceEnabled\":${GOV_ENABLED:-false},\"quorumPermille\":${GOV_QUORUM:-500},\
+      \"dissolutionRule\":${DISSOLUTION_RULE:-0},\"dissolutionDest\":\"$(legacy "$FOUNDER")\"}" >/dev/null || true
   wait_active "$COMPANY" "company"
 fi
 cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
+echo "  governance/dissolution config:"
+python3 scripts/gov_state.py "$COMPANY" || true
 
 # ---------- 5. issue genesis ----------
 echo "== 5. issue genesis =="
@@ -314,10 +318,18 @@ echo "  SIIR #1 owner: $OWNER"
 if [ "$OWNER" != "0:$FOUNDER_RAW" ]; then
   echo "  owner is not founder wallet; skipping transfer"
 else
+  topup "$FOUNDER" 9000000000 "founder"
   cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
     "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
       \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer "{\"ids\":[\"1\"],\"newOwner\":\"$(legacy "$HOLDER")\"}")\"}" >/dev/null || true
-  sleep 3
+  for attempt in $(seq 1 15); do
+    O1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+    [ "$O1" = "0:$HOLDER_RAW" ] && break
+    sleep 2
+  done
+  echo "  SIIR #1 owner after transfer: ${O1:-?} (expect 0:$HOLDER_RAW)"
+  [ "$O1" = "0:$HOLDER_RAW" ] && echo "  [ok] transfer landed: SIIR #1 -> holder" || { echo "  [fail] transfer never landed"; exit 1; }
   cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 fi
 
@@ -425,7 +437,9 @@ else:
                 {\"count\":25,\"weight\":2000,\"label\":\"Round 1\",\"issued\":false},\
                 {\"count\":25,\"weight\":4000,\"label\":\"Round 2\",\"issued\":false}],\
       \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"\",\
-      \"charter\":$CHARTER,\"initialValue\":20000000000}" >/dev/null || true
+      \"charter\":$CHARTER,\"initialValue\":20000000000,\
+      \"governanceEnabled\":${GOV_ENABLED:-false},\"quorumPermille\":${GOV_QUORUM:-500},\
+      \"dissolutionRule\":${DISSOLUTION_RULE:-0},\"dissolutionDest\":\"$(legacy "$HOLDER")\"}" >/dev/null || true
   wait_active "$COMPANY_B" "rounds company" 120
 fi
 run_info_b() { cli run "$COMPANY_B" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json" \
@@ -565,6 +579,77 @@ else
 fi
 
 echo ""
+if [ "${DEMO_DISSOLUTION:-0}" = "1" ]; then
+  # ---------- 14. dissolution lifecycle demo (freezes the demo company) ----------
+  echo "== 14. dissolution lifecycle =="
+  GOV() { python3 scripts/gov_state.py "$COMPANY" 2>/dev/null || echo "{}"; }
+  GOV_FMT() { GOV | python3 -c 'import json,sys; d=json.load(sys.stdin); print("governanceEnabled=%s quorum=%s votes=%s dissolved=%s rule=%s finalDeposited=%s finalized=%s" % (d.get("_governanceEnabled"), d.get("_quorumPermille"), d.get("_dissolveVotes"), d.get("_dissolved"), d.get("_dissolutionRule"), d.get("_finalDeposited"), d.get("_finalized")))' 2>/dev/null || echo "?"; }
+  echo "  before: $(GOV_FMT)"
+  # 14a. register is frozen: a transfer from the current owner must not land
+  O2=$(cli run "$COMPANY" getOwnerOf '{"id":"2"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "?")
+  if [ "$O2" = "0:$FOUNDER_RAW" ]; then S2_KEYS="$WORK/company.keys.json"; S2_WHO="founder";
+  elif [ "$O2" = "0:$HOLDER_RAW" ]; then S2_KEYS="$WORK/holder.keys.json"; S2_WHO="holder";
+  else S2_KEYS=""; S2_WHO="?"; fi
+  [ -n "$S2_KEYS" ] && cli callx --abi "$MULTISIG_ABI" --addr "$O2" --keys "$S2_KEYS" -m sendTransaction \
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer '{"ids":["2"],"newOwner":"'$(legacy "$MARKET")'"}')\"}" >/dev/null || true
+  sleep 3
+  O2B=$(cli run "$COMPANY" getOwnerOf '{"id":"2"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "?")
+  [ "$O2B" = "$O2" ] && echo "  [ok] register frozen before dissolution: transfer rejected (owner of #2 unchanged)" \
+    || echo "  [fail] transfer landed before dissolution (owner was $O2 now $O2B)"
+  # 14b. governance-disabled vote is rejected
+  cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" voteDissolve '{}')\"}" >/dev/null || true
+  sleep 3
+  VI=$(cli run "$COMPANY" getVoteInfo "{\"owner\":\"$(legacy "$HOLDER")\"}" --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(d.get("voted","?")).lower())' 2>/dev/null || echo "?")
+  if [ "${DEMO_GOVERNANCE:-0}" = "1" ]; then
+    # 14b'. weighted vote path (governance enabled): zero-weight holder vote
+    # is rejected; founder's vote reaches the quorum => auto-dissolve
+    cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m dissolveCompany '{}' >/dev/null 2>&1 || true
+    sleep 3
+    [ "$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_dissolved",False)).lower())' 2>/dev/null)" = "false" ] \
+      && echo "  [ok] founder dissolveCompany rejected before quorum (ERR_QUORUM_NOT_MET)" || echo "  [fail] dissolved without quorum"
+    [ "$VI" = "false" ] && echo "  [ok] zero-weight holder vote rejected (ERR_NOT_OWNER)" || echo "  [fail] holder vote recorded (voted=$VI)"
+    echo "  after holder vote: $(GOV_FMT)"
+    VS1=$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_dissolveVotes",0)))' 2>/dev/null || echo "?")
+    [ "$VS1" = "0" ] && echo "  [ok] no votes counted (holder holds no SIIR after the marketplace round)" || echo "  [fail] dissolve votes=$VS1 (expect 0)"
+    [ "$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_dissolved",False)).lower())' 2>/dev/null)" = "false" ] \
+      && echo "  [ok] quorum not met yet: company still operating" || echo "  [fail] dissolved before quorum"
+    cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+      "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+        \"payload\":\"$(body "$CT/CompanySIIR.abi.json" voteDissolve '{}')\"}" >/dev/null || true
+    sleep 3
+    VS2=$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_dissolveVotes",0)))' 2>/dev/null || echo "?")
+    [ "$VS2" = "100000" ] && echo "  [ok] dissolve votes = 100000 (founder holds all SIIRs)" || echo "  [fail] dissolve votes=$VS2 (expect 100000)"
+    [ "$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_dissolved",False)).lower())' 2>/dev/null)" = "true" ] \
+      && echo "  [ok] quorum met: company dissolved by vote" || echo "  [fail] not dissolved after quorum"
+    echo "  after founder vote: $(GOV_FMT)"
+  else
+    [ "$VI" = "false" ] && echo "  [ok] voteDissolve rejected while governance disabled" || echo "  [fail] vote accepted (voted=$VI)"
+    # 14c. founder dissolves (governance disabled => founder alone)
+    cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m dissolveCompany '{}' >/dev/null 2>&1 || true
+    sleep 3
+    echo "  after dissolve: $(GOV_FMT)"
+  fi
+  # 14d. one final distribution may still be deposited during the grace period
+  cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":1000000000},\"bounce\":true,\"flags\":1,\
+      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["2"]}')\"}" >/dev/null || true
+  sleep 3
+  FD=$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_finalDeposited","?")).lower())' 2>/dev/null || echo "?")
+  [ "$FD" = "true" ] && echo "  [ok] one final distribution accepted after dissolution" || echo "  [fail] final deposit rejected (finalDeposited=$FD)"
+  # 14e. finalize is blocked until the grace period ends (30 days)
+  cli callx --abi "$CT/CompanySIIR.abi.json" --addr "$COMPANY" --keys "$WORK/company.keys.json" -m finalizeDissolution '{}' >/dev/null 2>&1 || true
+  sleep 3
+  FZ=$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_finalized","?")).lower())' 2>/dev/null || echo "?")
+  [ "$FZ" = "false" ] && echo "  [ok] finalize blocked before grace ends (ERR_GRACE_NOT_OVER)" || echo "  [fail] finalized early (finalized=$FZ)"
+  GOV
+fi
+
 echo "== done. factory: $FACTORY  company: $COMPANY  rounds: $COMPANY_B  marketplace: $MARKET =="
 # register companies for the content gateway (scripts/gateway.py)
 echo "{\"companies\":[{\"address\":\"$COMPANY\",\"tag\":\"model-a\"},{\"address\":\"$COMPANY_B\",\"tag\":\"rounds\"}]}" > "$WORK/companies.json"

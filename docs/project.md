@@ -544,6 +544,34 @@ factory ownerPubkey: 0xb7df23e9a73343f1fc3a11e15ae3f6bf227b9df955f2da558c9690402
 founder pubkey:      0x4af1476b083267020a5b70e179269d24223e33869f32450fb91537fecbc60235
 ```
 
+**v2.1.0 (governance & dissolution, §8.6) live redeploy** — the last full
+`FORCE` run (`DEMO_DISSOLUTION=1 DEMO_GOVERNANCE=1 GOV_ENABLED=true
+GOV_QUORUM=5`) ended with the demo company dissolved by vote, so the
+current live demo company is the *rounds* one:
+
+```
+dapp-id:    4e8739f0f0d270e0dbc2710cff4d6b829c31fafedbad243bff3afbd766ed8a84
+factory:    <dapp-id>::4e8739f0f0d270e0dbc2710cff4d6b829c31fafedbad243bff3afbd766ed8a84
+marketplace:<dapp-id>::5c49a1d711134b774f0e40062859415ed691bfc9736ff0cfb69ce172a888c849
+company:    <dapp-id>::4a87745e212b8dcfd0830a2dc185d47dff044b1861b632874a0436d0a03e047e (dissolved by vote)
+rounds:     <dapp-id>::b71a87a48257fe21c45411f442483e1749341f2ec65b582452bdc650d342b4d4 (operating)
+founder:    c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb::<same>
+holder:     0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa::<same>
+factory ownerPubkey: 0xb7df23e9a73343f1fc3a11e15ae3f6bf227b9df955f2da558c96904021e92b8b
+founder pubkey:      0x4af1476b083267020a5b70e179269d24223e33869f32450fb91537fecbc60235
+```
+
+The v2.1.0 run verified all 14 steps green (24/24 checks): the
+governance-enabled company rejected a founder `dissolveCompany` before
+quorum (`ERR_QUORUM_NOT_MET`), rejected the zero-weight holder's vote
+(`ERR_NOT_OWNER`), dissolved instantly once the founder's weighted vote
+(100000 of 100000 total, quorum 5‰) landed, accepted exactly one final
+distribution during the 30-day grace, and blocked `finalizeDissolution`
+before the grace ended. The governance-disabled variant (run before it)
+proved the founder-only path: frozen register, `voteDissolve` rejected,
+founder `dissolveCompany`, one final deposit, `finalize` still blocked.
+`getGovernance` is mirrored from state (see §8.6 note).
+
 | step | assertion | result |
 |---|---|---|
 | factory | ver 2.0.0, company code cell = fresh compile | ✓ |
@@ -603,6 +631,47 @@ that abort was the 0-gram claim payout bouncing at the receiver for
 lack of forward fee; the claim now pays `value:1e9, flag:1` in one
 consolidated message (verified delivering all three currencies).
 
+### 8.6 Governance & dissolution (v2.1.0) and two tooling lessons
+
+**v2.1.0 contract surface** (spec: `SIIR.md` §Governance, §Dissolution):
+constructor gains `governanceEnabled, quorumPermille (0–1000),
+dissolutionRule (0 treasury→founder, 1 charity, 2 DAO, 3 burn),
+dissolutionDest` (must be nonzero for rules 1–2). `voteDissolve()` —
+one weighted vote per wallet (`_weightOf` sums plan weight over owned
+segments), zero-weight votes rejected (`ERR_NOT_OWNER`), quorum
+`votes*1000 >= totalWeight*quorumPermille` auto-dissolves.
+`dissolveCompany()` — founder-key, requires the quorum when governance
+is enabled. `finalizeDissolution()` — founder-key, only after the
+30-day grace; sweeps every dividend currency to the dissolution dest
+(TREASURY → founder; BURN → address(0), no send). Guards: the register
+is frozen once dissolved (`issue/transfer/transferRange` →
+`ERR_REGISTER_FROZEN`), one final `depositDividends` is allowed during
+grace (`_finalDeposited`), claims are blocked once finalized, and
+deposits are blocked after finalization. Readbacks:
+`getGovernance()` (11 fields incl. computed `graceEnd`) and
+`getVoteInfo(owner)`.
+
+**tvm-cli 3.0.0 cannot decode `getGovernance`.** The run succeeds but
+tvm-cli's decoder rejects the response (its getter-id computation
+includes the output types, and the response body is
+`[0xb7072865 marker][11-tuple]` with the tuple tail in a ref — the
+decoder chokes where it tolerates every other getter). The response
+itself decodes cleanly with the mirror's C4-style tuple loader (all 11
+values verified at offset 32). Workaround: `scripts/gov_state.py`
+reads the governance state straight from the mirror node (it drives
+`deploy.sh` step 4 + step 14 and the gateway's company page + 
+`/company/<addr>/governance`; the gateway refuses the tvm-cli fallback
+for `getGovernance` since it can never succeed).
+
+**Deterministic funding of the step-7 transfer.** A `FORCE` run
+failed step 9 ("claim never settled") because step 7's transfer of
+SIIR #1 to the holder had silently bounced: the founder's VMSHELL
+reserve had drifted under the ~3.9e9 needed (tx fees vary per round),
+and step 7 had neither a `topup` nor a landing check — the failure
+only surfaced two steps later at the claim. Step 7 now runs
+`topup "$FOUNDER" 9000000000 "founder"` first and hard-fails with a
+`[fail]` + exit if the ownership didn't change.
+
 ---
 
 ## 9. Current status and next steps
@@ -653,3 +722,12 @@ currencies are skipped by design), and the marketplace settle.
 
 **Next:** governance & dissolution safeguards, and wiring the
 explorer's live marketplace views against the §8.4 addresses.
+
+**Done since:** governance & dissolution (v2.1.0) shipped and verified
+live: founder- and vote-driven dissolution, frozen register, one final
+distribution in grace, founder-key finalize after 30 days, and
+immutable unclaimed-treasury rules — the full 14-step demo is green in
+both governance modes (§8.4, §8.6). The explorer and gateway now show
+the governance card and a `/company/<addr>/governance` endpoint read
+from mirror state, and `deploy.sh` step 14 exercises the whole
+lifecycle with hard assertions.

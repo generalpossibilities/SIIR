@@ -165,8 +165,30 @@ def mirror_getter(address, method, params):
         return {"fp": ms.charter_fingerprint()}
     if method == "getContentInfo":
         return {k: str(v) for k, v in ms.content_info().items()}
+    if method == "getGovernance":
+        s = ms.state
+        grace = 0
+        if s.get("_dissolved"):
+            grace = int(s.get("_dissolvedAt") or 0) + 30 * 86400
+        return {
+            "governanceEnabled": bool(s.get("_governanceEnabled")),
+            "quorumPermille": str(s.get("_quorumPermille", 0)),
+            "totalWeight": str(s.get("_totalWeight", 0)),
+            "dissolveVotes": str(s.get("_dissolveVotes", 0)),
+            "dissolved": bool(s.get("_dissolved")),
+            "dissolvedAt": str(s.get("_dissolvedAt", 0)),
+            "dissolutionRule": str(s.get("_dissolutionRule", 0)),
+            "dissolutionDest": s.get("_dissolutionDest") or "",
+            "finalDeposited": bool(s.get("_finalDeposited")),
+            "finalized": bool(s.get("_finalized")),
+            "graceEnd": str(grace),
+        }
+    if method == "getVoteInfo":
+        owner = p["owner"]
+        voted = (ms.state.get("_votedDissolve") or {}).get(owner, False)
+        return {"voted": bool(voted), "weight": str(ms.weight_of(owner))}
     if method == "getVersion":
-        return {"value0": "2.0.0", "value1": "CompanySIIR"}
+        return {"value0": "2.1.0", "value1": "CompanySIIR"}
     if method == "getCompanyCount":
         ms = mirror_state(address, FACTORY_ABI)
         return {"count": str(ms.state.get("_companyCount", 0))}
@@ -234,6 +256,11 @@ def run_getter(address, method, params="{}", abi=COMPANY_ABI):
             log(f"mirror {method}@{address} failed ({e}); falling back to tvm-cli")
             data = None
     if data is None:
+        if method == "getGovernance":
+            # tvm-cli 3.0.0 cannot decode this getter's result tuple; the
+            # mirror is the only reliable source for governance state.
+            log(f"getGovernance@{address}: mirror failed, no tvm-cli fallback")
+            return None
         out = tvm_cli("run", address, method, params, "--abi", abi)
         try:
             data = json.loads(out.stdout)
@@ -1038,6 +1065,31 @@ def company_page(addr):
                 f"index {escape(str(idx))}</p>"
             )
         money_rows = "".join(bodies)
+    gov_rows = ""
+    try:
+        gov = run_getter(addr, "getGovernance") or {}
+        if gov:
+            rule = {0: "treasury→founder", 1: "charity", 2: "DAO",
+                    3: "burn"}.get(int(gov.get("dissolutionRule") or 0), "?")
+            gov_rows = (
+                f"<p>governance: <b class=\"{{'ok' if gov.get('governanceEnabled') else 'no'}}\">"
+                f"{'enabled' if gov.get('governanceEnabled') else 'founder-only'}</b> · "
+                f"quorum {gov.get('quorumPermille', 0)}‰ · "
+                f"votes {gov.get('dissolveVotes', 0)} / {gov.get('totalWeight', 0)} weight</p>"
+                f"<p>status: <b class=\"{{'no' if gov.get('dissolved') else 'ok'}}\">"
+                f"{'DISSOLVED' if gov.get('dissolved') else 'operating'}</b> · "
+                f"unclaimed rule: {rule} · "
+                f"finalDeposit {'yes' if gov.get('finalDeposited') else 'no'} · "
+                f"finalized {'yes' if gov.get('finalized') else 'no'}"
+                f"</p>"
+            )
+            if gov.get("dissolved"):
+                gov_rows += (f"<p><small>dissolved {gov.get('dissolvedAt')} · "
+                             f"grace ends {gov.get('graceEnd')}</small></p>")
+    except Exception:
+        pass
+    if not gov_rows:
+        gov_rows = "<p><small>unavailable</small></p>"
     body = f"""<!doctype html><html><head><meta charset="utf-8"><title>{escape(name)}</title>
 <style>
  body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
@@ -1068,6 +1120,7 @@ def company_page(addr):
    <b class="{ 'ok' if ratified else 'no' }">{'YES' if ratified else 'no'}</b></p>
  <pre>{escape(charter_txt) or '(no charter supplied)'}</pre>
 </div>
+<div class="card"><h3>Governance &amp; dissolution</h3>{gov_rows}</div>
 <p><a href="/company/{addr}/info">info.json</a> ·
    <a href="/company/{addr}/charter">charter.json</a> ·
    <a href="/company/{addr}/explore">explore register</a> ·
@@ -1275,6 +1328,10 @@ class Handler(BaseHTTPRequestHandler):
                 ).encode(),
                 "application/json",
             )
+            return
+        if what == "governance":
+            self._send(json.dumps(run_getter(addr, "getGovernance") or {}).encode(),
+                        "application/json")
             return
         if what == "explore":
             return self._send(explore_page(addr, qs).encode(),

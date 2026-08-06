@@ -100,9 +100,20 @@ function overviewSection(ms, c, plans, div, content, fp) {
         plans.map((p) => `<tr><td>${esc(p.label)}</td><td>${esc(p.count)}</td><td>${esc(p.weight)}</td><td>${p.issued ? "yes" : "no"}</td></tr>`).join("")
     }</table>`;
     const ch = ms.charter();
+    const g = ms.state || {};
+    const rules = {0: "treasury → founder", 1: "charity", 2: "DAO", 3: "burn"};
+    const govCard = `<div class="card"><h2>governance &amp; dissolution</h2>
+        <div class="kv"><div class="k">mode</div><div class="v">${g._governanceEnabled ? "holder vote" : "founder-only"}</div></div>
+        <div class="kv"><div class="k">dissolution quorum</div><div class="v">${g._quorumPermille != null ? g._quorumPermille + "‰" : "—"}</div></div>
+        <div class="kv"><div class="k">dissolve votes</div><div class="v">${fmtBig(g._dissolveVotes || 0)} weight</div></div>
+        <div class="kv"><div class="k">status</div><div class="v">${g._dissolved ? "DISSOLVED" : "operating"}</div></div>
+        <div class="kv"><div class="k">unclaimed rule</div><div class="v">${rules[g._dissolutionRule] || "—"}</div></div>
+        <div class="kv"><div class="k">final deposit / finalized</div><div class="v">${g._finalDeposited ? "yes" : "no"} / ${g._finalized ? "yes" : "no"}</div></div>
+    </div>`;
     return `<div class="card"><h2>company</h2>${grid}</div>
             <div class="card"><h2>dividends</h2>${divsTable}</div>
             <div class="card"><h2>plans</h2>${plansTable}</div>
+            ${govCard}
             <div class="card"><h2>content</h2>
                <div class="kv"><div class="k">logo / deed / ui</div>
                <div class="v">${esc(content.logoSize)} / ${esc(content.siirImageSize)} / ${esc(content.uiSize)} bytes</div></div>

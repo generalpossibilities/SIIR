@@ -77,8 +77,12 @@ Replace the CLI lifecycle (`scripts/deploy.sh`) with browser flows:
   instantly (mirror read-back).
 
 ### 4. Governance & dissolution safeguards
-- [ ] Grant/revoke flows, quorum enforcement, `dissolveCompany` path,
-  owner-side guarantees (see `contracts/CompanySIIR.sol`).
+- [x] Grant/revoke flows, quorum enforcement, `dissolveCompany` path,
+  owner-side guarantees (see `contracts/CompanySIIR.sol`). v2.1.0:
+  founder/vote dissolution, frozen register, 30-day grace, one final
+  distribution, immutable unclaimed-treasury rules — verified live in
+  both governance modes (`deploy.sh` step 14). Remaining idea:
+  grant/revoke of founder rights is still a no-op placeholder.
 
 ### 5. Marketplace hooks
 - [ ] Listing, offers, and settlement primitives on top of `transfer` +
