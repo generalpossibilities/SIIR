@@ -572,6 +572,32 @@ proved the founder-only path: frozen register, `voteDissolve` rejected,
 founder `dissolveCompany`, one final deposit, `finalize` still blocked.
 `getGovernance` is mirrored from state (see §8.6 note).
 
+**10B-scale under v2.1.0 (live, current)** — the current shellnet
+deployment: `FORCE=1 PLAN_COUNT=10000000000` on the v2.1.0 stack,
+13/13 steps green with the 10B plan (the full 13-step lifecycle —
+genesis, deposits, consolidated claim, marketplace settle — at the
+10^10 scale, no step-14 demo so the company stays operating). The
+explorer index (gateway) reads this factory's registry directly:
+
+```
+dapp-id:    82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6
+factory:    <dapp-id>::82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6
+marketplace:<dapp-id>::1c67df9ce1e21711b6cb10118170cfce5d6942b8a28365e3a691f057a1bb4144
+company:    <dapp-id>::6890748cdb02ed4c1ac5f43b52c4e9048f60567fe0cbfbe8124babb37f1096bd  (10B SIIRs, operating)
+rounds:     <dapp-id>::3d74a393d63c1d75a464e6298e64e7a261937e5e8847fefd80fe95353638c538
+founder:    c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb::<same>
+holder:     0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa::<same>
+factory ownerPubkey: 0xb7df23e9a73343f1fc3a11e15ae3f6bf227b9df955f2da558c96904021e92b8b
+founder pubkey:      0x4af1476b083267020a5b70e179269d24223e33869f32450fb91537fecbc60235
+```
+
+Verification on the live 10B company: genesis `issuedCount:10000000000,
+totalWeight:10000000000000, nextId:0x2540be401` as one segment row;
+`getSIIR` resolves ids 1 / 5,000,000,000 / 10,000,000,000 off one plan
+row; `getBalanceOf` counts 10B from one segment; one `transferRange`
+moved all 10B ids to the holder in one record; `getGovernance` mirror
+reads `totalWeight=10000000000000`, operating, founder-only mode.
+
 | step | assertion | result |
 |---|---|---|
 | factory | ver 2.0.0, company code cell = fresh compile | ✓ |
@@ -718,7 +744,10 @@ moves all 10B ids to the holder in one record (segments: one row, owner
 swapped) with per-id history event. The full 13-step lifecycle then
 passed with the 10B plan, including deposits (indices 1e6/5e8/1e5),
 the consolidated claim (payouts round to 1/500/0 nano — zero-amount
-currencies are skipped by design), and the marketplace settle.
+currencies are skipped by design), and the marketplace settle. **The
+current shellnet deployment is a fresh 10B run on the v2.1.0 stack**
+(§8.4): factory `82a2ff68…`, 10B company `…::6890748c…` operating, in
+the registry and browsable from the gateway index.
 
 **Next:** governance & dissolution safeguards, and wiring the
 explorer's live marketplace views against the §8.4 addresses.
