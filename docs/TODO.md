@@ -32,12 +32,15 @@ Current live deployment (shellnet, v2.1.0 stack): factory
 2. **Grant/revoke founder rights** (`CompanySIIR` governance v2.1.0) is still
    a no-op placeholder — implement it and cover it with the governance parity
    suite.
-3. **Commit the regression harness**: the parity suites referenced in the docs
-   (JS/Python decoder parity 24/24, DOM smoke 33/33) are not in the repo —
-   commit the tests, the fixtures, and a runner (`make test`-style).
-4. **CI beyond Pages**: `.github/workflows/pages.yml` only deploys `static/**`
-   to GitHub Pages; add a test job (parity suites + `scripts/deploy.sh` lint)
-   on every push.
+3. **Commit the regression harness — DONE**: `tests/` now holds the parity
+   harness — `gen_ground.py` (ground-truth generator against the live
+   deployment), the committed fixture `fixtures/py_ground.json` (18 fields),
+   `static/parity.js` (env-overridable addresses, BigInt/key-order-safe
+   comparison, verified ALL MATCH 18/18), and `tests/run_parity.sh` +
+   `tests/run_dom_smoke.sh` (6/6 headless-Chrome assertions) as the runners.
+4. **CI beyond Pages — DONE**: `pages.yml` gained a `test` job (py_compile of
+   all Python, JS/Python parity vs the committed fixture, bundle build) that
+   triggers on `static/**`, `scripts/**`, `tests/**`, `contracts/**`.
 5. **Abuse controls — partially done**: rate limit (10 req/min/IP) on write
    endpoints; still open: VMSHELL-reserve guardrails for the dev signing
    wallet (§8.5/§8.6).
