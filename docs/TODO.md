@@ -1,7 +1,9 @@
-# TODO
+# TODO — production readiness
 
-Backlog for the SIIR project. Checked items are done and committed
-(see `git log`). Open items are ordered by priority.
+Backlog for the SIIR project. Everything completed so far is in `git log`
+(and `docs/project.md`). Open items below are ordered by priority; P0 items
+are correctness/security-critical, P1 are the remaining product surface,
+P2 are independence proofs, P3 are mainnet/ops hardening.
 
 Project-end goals (per the founder):
 - **Independence**: the protocol must run without a paid server — reads from
@@ -9,97 +11,78 @@ Project-end goals (per the founder):
 - **UI deployability**: everything currently done from the CLI
   (`scripts/deploy.sh`) must be reachable from a browser.
 
-## Open
+Current live deployment (shellnet, v2.1.0 stack): factory
+`82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6` (self-rooted),
+10B company `…::6890748c…`, rounds company `…::3d74a393…`, marketplace/escrow
+`…::1c67df9c…` (see `docs/project.md` §8.4).
 
-### 1. Finish the mirror-node gateway (in progress)
-State of the work in `scripts/mirror.py`:
-- [x] One HTTP call to the public mirror node GraphQL
-  (`blockchain.account(info.data)`) replaces per-getter `tvm-cli run`.
-- [x] Full one-pass state decode: BOC (magic/descriptor/find_tag/big cells),
-  C4 break chain per `DecodePositionAbiV2`, HmLabel walk, compiler
-  dict-value rule (inline vs value-in-ref, `12 + keyLen + maxBits < 1023`),
-  nested maps (`_checkpoint`, `_history`), tuple breaks, `uint32[]`-before-
-  `uint` decode order. Verified offline and live against `tvm-cli` on
-  shellnet.
-- [x] `cell_hash` matches the SDK descriptor math (`calc_d1`/`calc_d2`,
-  marker-bit padding).
-- [x] **`getFingerprint` / `getCharterFingerprint` parity** — SOLVED:
-  `cell_hash` needed child depths before hashes (all depths, then all hashes,
-  per tvm-sdk data_cell.rs); strings in `abi.encode` tuples are bare raw-byte
-  refs (no length prefix); the charter is a 127-byte cell chain whose root is
-  hashed. Verified live: fingerprint(1/2/100) = `0x1163cfaf…`, charter fp =
-  `0x73075fe3…` all match tvm-cli exactly.
-- [x] `MirrorState` wired into `scripts/gateway.py`: `run_getter` serves all
-  17 getters from the mirror with tvm-cli fallback; fixed `claimable_of`
-  (str-vs-int currency keys) and `content_info` (string byte length, not
-  decoded base64). 17/17 live parity, HTTP regression green (register,
-  holders, plans, treasury, history, search, claim page, deed, logo, app).
-- [ ] Update `docs/shellnet-decoding.md` with the verified layout rules and
-  `docs/gateway.md` with the mirror mode; commit.
+## P0 — Security, keys & correctness
 
-### 2. Independence: zero paid server, zero tvm-cli
-- [x] **Static client-side explorer** (`static/`): plain JS port of the whole
-  mirror decode (`core.js` — BOC, dicts, cell breaks, cell_hash with
-  `crypto.subtle`, BigInt math) + single-page app (`index.html`, `app.js`).
-  Verified byte-identical to the Python client (17/17 parity checks) and
-  live against shellnet; renders company/register/holders/SIIR/holder pages
-  and fingerprints from **`file://` with no server process** (CORS is open
-  on the mirror). Served by the gateway at `/static/`.
-- [x] **On-chain UI embedding path**: `static/bundle.py` inlines the explorer
-  into a single self-contained HTML (~40 KB) and `--emit`s it as a
-  `data:text/html;base64,…`; `deploy.sh` now ships that as the `CompanySIIR`
-  UI unit (`_ui`, 4 MiB cap; the gateway already serves a stored `_ui`
-  verbatim at `/company/<addr>/` and `/app`). The bundle decodes through
-  `decode_data_uri` in the gateway.
-- [ ] Remove the tvm-cli dependency from `gateway.py` entirely (reads via
-  mirror; the only tvm-cli uses left are wallet writes — see item 3).
-- [ ] Ship the explorer to a free static host (GitHub Pages) and/or embed it
-  as the on-chain UI bundle via the content gateway.
-- [ ] Prove it from a clean machine with only a browser: register, holders,
-  plans, treasury, history, claims (amounts; signing is item 3), deed all
-  work with no server process.
+1. **Gateway write-endpoint auth**: `POST /company/<addr>/claim` signs with
+   `scripts/.work/holder.keys.json` and has NO authentication — anyone who can
+   reach the gateway can spend the wallet's VMSHELL reserve. Decide the
+   signing model (browser wallet vs. server key custody behind an auth token)
+   and implement; keep local keys for dev only. Everything from the browser
+   (`scripts/deploy.sh` equivalents) hangs off this decision.
+2. **Grant/revoke founder rights** (`CompanySIIR` governance v2.1.0) is still
+   a no-op placeholder — implement it and cover it with the governance parity
+   suite.
+3. **Commit the regression harness**: the parity suites referenced in the docs
+   (JS/Python decoder parity 24/24, DOM smoke 33/33) are not in the repo —
+   commit the tests, the fixtures, and a runner (`make test`-style).
+4. **CI beyond Pages**: `.github/workflows/pages.yml` only deploys `static/**`
+   to GitHub Pages; add a test job (parity suites + `scripts/deploy.sh` lint)
+   on every push.
+5. **Abuse controls**: rate-limit gateway write endpoints; document and
+   enforce VMSHELL-reserve guardrails for the signing wallet (§8.5/§8.6).
 
-### 3. Everything deployable from the UI
-Replace the CLI lifecycle (`scripts/deploy.sh`) with browser flows:
-- [ ] **Company creation**: founder form (name, description, website, plans,
-  issuance model, founder pubkey/address) → factory `deployCompany` →
-  status page.
-- [ ] **Funding**: giver faucet calls (VMSHELL gas leg + SHELL ecc leg) from
-  the UI for factory/company/wallet accounts.
-- [ ] **Issue**: founder button per plan; **Transfer**: owner-initiated
-  SIIR transfer; **Deposit dividends**: currency+amount form;
-  **Claim**: existing claim flow, extended to any owned SIIR.
-- [ ] **Charter**: upload, founder-key ratification, fingerprint display.
-- [ ] Signing model decision: browser wallet (AFT/extended-wallet connect,
-  pubkey auth) vs. server-side key custody behind the UI. Decide and
-  implement; keep `scripts/.work/*.keys.json` for local dev.
-- [ ] Verify each step live on shellnet; explorer must reflect UI actions
-  instantly (mirror read-back).
+## P1 — Marketplace, explorer & UI write flows
 
-### 4. Governance & dissolution safeguards
-- [x] Grant/revoke flows, quorum enforcement, `dissolveCompany` path,
-  owner-side guarantees (see `contracts/CompanySIIR.sol`). v2.1.0:
-  founder/vote dissolution, frozen register, 30-day grace, one final
-  distribution, immutable unclaimed-treasury rules — verified live in
-  both governance modes (`deploy.sh` step 14). Remaining idea:
-  grant/revoke of founder rights is still a no-op placeholder.
+6. **Explorer redesign (done this round)**: marketplace is the landing page
+   (`#/`), escrow address card with one-click "copy escrow address" and
+   long-press full-address reveal, token filter chips, companies/SIIRs
+   reachable only through search (no directory on the landing). Verify the
+   same on the gateway's `/` landing and the GitHub Pages deployment.
+7. **Multi-token trading**: NACKL/SHELL/eccUSDC must all be tradable on the
+   marketplace — token pair view (prices per currency, pair switcher), and
+   extend the marketplace contract with direct token-pair trades if needed
+   (today listings price a SIIR deed in a single currency).
+8. **Browser write flows** (replaces the CLI lifecycle): company creation,
+   funding (giver faucet), issue, transfer, deposit dividends, claim (exists,
+   P0.1), charter upload + ratification, marketplace list/bid/acceptBid.
+9. **Live verification of every UI action**: after each browser write, the
+   explorer must reflect it instantly via mirror read-back (extend the
+   gateway parity scripts to cover the write paths).
 
-### 5. Marketplace hooks
-- [ ] Listing, offers, and settlement primitives on top of `transfer` +
-  `claimDividends`.
+## P2 — Independence (zero server, zero tvm-cli)
 
-## Done
-- Mirror decode work (item 1 top block): BOC parsing, C4 breaks, HmLabel,
-  dict value-in-ref, nested maps, tuple decode, `[]`-vs-`uint` ordering,
-  cell hash descriptor math — all verified offline and against live
-  tvm-cli getters on shellnet (see `git log`, mirror.py docstring).
-- `941f119` Wallet integration in gateway: `GET/POST /claim` (signs with
-  `scripts/.work/holder.keys.json`, polls until settled) + printable deed card
-  at `/siir/<id>/deed`; live-tested on shellnet incl. error paths. This task
-  created this TODO file.
-- `ffdb9fd` Explorer on the gateway: register, holders, plans, treasury,
-  history, search.
-- `0fd1654` Currency-agnostic dividends (NACKL+SHELL+USDC in one claim).
-- `f966079` Dual-track treasury (SHELL + eccUSDC).
-- `4cb2362` On-chain content gateway (UI, images, charter, info).
-- `df31b64` On-chain company content (logo, deed image, UI) + charter.
+10. **Remove tvm-cli from gateway reads**: `run_getter` should be mirror-only
+    (tvm-cli fallback kept for writes until P0.1). `getGovernance` must be
+    decoded from the mirror like the other getters (tvm-cli 3.0.0 cannot
+    decode it; `scripts/gov_state.py` is the mirror-based workaround).
+11. **Clean-machine proof**: from a machine with only a browser — register,
+    holders, plans, treasury, history, claims (amounts; signing is P0.1),
+    deed, marketplace, search all work with no server process
+    (verify on `file://` and the GitHub Pages deployment).
+12. **On-chain UI bundle**: regenerate after every explorer change
+    (`static/bundle.py`), confirm it still decodes via the content gateway
+    (`/company/<addr>/` and `/app`).
+
+## P3 — Mainnet readiness, docs & ops
+
+13. **Mainnet config**: giver funding, fee/bounce parameters, network
+    constants — remove shellnet specifics from `scripts/deploy.sh` and the
+    explorer defaults; document the mainnet equivalents.
+14. **Docs**: `docs/usage.md` governance + marketplace + explorer sections;
+    README production checklist (keys, gateway auth, reserve funding);
+    `docs/TODO.md` cleanup (this file stays current).
+15. **Post-deploy verification script**: one command that replays the parity
+    suites + the deploy.sh step 1–14 smoke against a fresh deployment.
+16. **Explorer design polish** (ongoing, global-standard bar): responsive
+    layout, dark mode, token icons, order-book view of the marketplace,
+    i18n-ready strings.
+
+## Closed this round
+
+- Explorer redesign items 6 (static + gateway landings) — commit + Pages deploy.
+- TODO rewritten to the P0–P3 production-readiness structure.

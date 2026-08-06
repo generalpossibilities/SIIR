@@ -339,6 +339,7 @@ def decode_data_uri(uri):
 
 
 def escape(s):
+    s = "" if s is None else str(s)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -988,17 +989,107 @@ on-chain registry (mirror decode).</p>
     return body
 
 
-def marketplace_page(addr):
+_PAGE_CSS = """
+:root{--fg:#0f172a;--mut:#64748b;--acc:#2563eb;--bg:#f1f5f9;--card:#fff;--line:#e2e8f0}
+*{box-sizing:border-box}
+body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:var(--bg);color:var(--fg);line-height:1.55}
+header{background:#0f172a;color:#e2e8f0;padding:12px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+header .brand{font-weight:800;color:#fff;text-decoration:none}
+header form{flex:1 1 320px;display:flex;gap:8px}
+header input{flex:1;font:13px ui-monospace,Menlo,Consolas,monospace;padding:9px 12px;border:1px solid #334155;border-radius:9px;background:#1e293b;color:#f1f5f9;outline:none}
+header input:focus{border-color:var(--acc)}
+button{cursor:pointer;font:inherit;font-weight:600}
+button.primary{background:var(--acc);color:#fff;border:0;border-radius:9px;padding:9px 16px}
+button.primary:hover{background:#1d4ed8}
+main{max-width:1020px;margin:0 auto;padding:22px 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:0 0 18px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+h1{font-size:24px;margin:0 0 4px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut);margin:0 0 12px;font-weight:700}
+p{margin:4px 0}
+.mut{color:var(--mut)}
+.addr{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+tbody tr:hover{background:#f8fafc}
+.chip{display:inline-block;border:1px solid #cbd5e1;background:var(--card);border-radius:20px;padding:5px 14px;font-size:13px;font-weight:600;cursor:pointer;margin:0 8px 8px 0}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.tok{display:inline-block;border-radius:6px;padding:1px 8px;font-size:12px;font-weight:700}
+.tok.nk{color:#b45309;background:#fef3c7}.tok.sh{color:#0f766e;background:#ccfbf1}.tok.us{color:#1d4ed8;background:#dbeafe}.tok.ot{color:#64748b;background:#f1f5f9}
+.state{font-size:12px;font-weight:700;border-radius:6px;padding:1px 8px}
+.state.open{color:#059669;background:#d1fae5}.state.closed{color:#64748b;background:#f1f5f9}
+.escrow{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}
+.escrow .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+.escrow .full{display:none;font:12.5px ui-monospace,Menlo,Consolas,monospace;word-break:break-all;background:#fff;border:1px solid var(--line);border-radius:8px;padding:7px 10px;flex:1 1 100%}
+.escrow .full.show{display:block}
+.escrow .hint{font-size:11.5px;color:var(--mut)}
+.empty{color:var(--mut);font-size:13px;padding:8px 0}
+footer{color:#64748b;font-size:12px;text-align:center;padding:26px}
+a{color:#1d4ed8}
+"""
+
+_ESCROW_JS = """
+<script>
+(function(){var b=document.getElementById('esc-copy');if(!b)return;
+var f=document.getElementById('esc-full'),t=null,held=false;
+b.addEventListener('pointerdown',function(){held=false;t=setTimeout(function(){held=true;f.classList.add('show');},600);});
+b.addEventListener('pointerup',function(){clearTimeout(t);});
+b.addEventListener('pointerleave',function(){clearTimeout(t);});
+b.addEventListener('pointercancel',function(){clearTimeout(t);});
+b.addEventListener('click',function(){if(held){held=false;return;}
+var a=b.getAttribute('data-addr');
+var ok=function(){b.textContent='copied';setTimeout(function(){b.textContent=b.getAttribute('data-label');},1400);};
+try{if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(a).then(ok,ok);}else{ok();}}catch(e){ok();}});
+document.querySelectorAll('.chip').forEach(function(c){c.addEventListener('click',function(){
+document.querySelectorAll('.chip').forEach(function(x){x.classList.remove('on')});c.classList.add('on');
+var cur=c.getAttribute('data-cur');
+document.querySelectorAll('table[data-filter] tr[data-cur]').forEach(function(r){r.style.display=(cur==='all'||r.getAttribute('data-cur')===cur)?'':'none';});
+});});
+})();
+</script>
+"""
+
+
+def _escrow_card(addr, label="copy escrow address"):
+    """Escrow address card: one click copies, hold ~0.6s reveals the full value."""
+    return f"""<div class="escrow">
+<div><div class="lab">escrow account (marketplace contract)</div>
+<div class="addr mut" style="margin-top:2px">{escape(addr)}</div></div>
+<button class="primary" id="esc-copy" data-addr="{escape(addr)}" data-label="{escape(label)}">{escape(label)}</button>
+<span class="hint">hold 0.6s to reveal &middot; click to copy</span>
+<div class="full addr" id="esc-full">{escape(addr)}</div></div>"""
+
+
+def _market_tok(cid):
+    return {"1": ("NACKL", "nk"), "2": ("SHELL", "sh"), "3": ("eccUSDC", "us")}.get(
+        str(cid), (str(cid), "ot"))
+
+
+def _page(html, title="SIIR market", q=""):
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{escape(title)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{_PAGE_CSS}</style></head><body>
+<header><a class="brand" href="/">SIIR market</a>
+<form action="/search" method="get"><input type="search" name="q" placeholder="search companies or paste dapp_id::account_id" spellcheck="false" value="{escape(q)}"><button class="primary">search</button></form></header>
+<main>{html}</main>
+<footer>read-only &middot; every value here is decoded from the contracts on-chain via the shellnet mirror node</footer>
+{_ESCROW_JS}</body></html>"""
+
+
+def marketplace_page(addr, q=""):
     listings = run_getter(addr, "getListings") or {}
     bids = run_getter(addr, "getBids") or {}
     n_list = run_getter(addr, "getListingCount") or {}
     n_bids = run_getter(addr, "getBidCount") or {}
-    cur = {"1": "NACKL", "2": "SHELL", "3": "eccUSDC"}
+    def tok(cid):
+        n, c = _market_tok(cid)
+        return f'<span class="tok {c}">{escape(n)}</span>'
     lrows = "".join(
-        f"<tr><td>{i}</td><td><a href=\"/company/{escape(c)}/\">{escape(c.split('::')[1][:10])}…</a></td>"
-        f"<td><a href=\"/company/{escape(c)}/siir/{escape(s)}\">#{escape(s)}</a></td>"
-        f"<td><code>{escape(seller)}</code></td><td>{price} {escape(cur.get(cid, cid))}</td>"
-        f"<td>{'open' if act else 'closed'}</td></tr>"
+        f'<tr data-cur="{escape(cid)}"><td>#{escape(i)}</td><td><a href="/company/{escape(c)}/">'
+        f'{escape(c.split("::")[1][:10])}…</a></td>'
+        f'<td><a href="/company/{escape(c)}/siir/{escape(s)}">#{escape(s)}</a></td>'
+        f'<td><code>{escape(seller)}</code></td><td>{price} {tok(cid)}</td>'
+        f'<td><span class="state {"open" if act else "closed"}">{"open" if act else "closed"}</span></td></tr>'
         for i, c, s, seller, price, cid, _t, act in zip(
             listings.get("ids", []), listings.get("company", []), listings.get("siirIds", []),
             listings.get("seller", []), listings.get("askPrice", []),
@@ -1006,31 +1097,41 @@ def marketplace_page(addr):
             listings.get("active", []))
     )
     brows = "".join(
-        f"<tr><td>{i}</td><td><code>{escape(bidder)}</code></td>"
-        f"<td><a href=\"/company/{escape(c)}/siir/{escape(s)}\">#{escape(s)}</a></td>"
-        f"<td>{price} {escape(cur.get(cid, cid))}</td>"
-        f"<td>{'spent' if acc else 'open'}</td></tr>"
+        f'<tr data-cur="{escape(cid)}"><td>#{escape(i)}</td><td><code>{escape(bidder)}</code></td>'
+        f'<td><a href="/company/{escape(c)}/">…</a></td>'
+        f'<td><a href="/company/{escape(c)}/siir/{escape(s)}">#{escape(s)}</a></td>'
+        f'<td>{price} {tok(cid)}</td>'
+        f'<td><span class="state {"closed" if acc else "open"}">{"spent" if acc else "open"}</span></td></tr>'
         for i, bidder, c, s, price, cid, _v, acc in zip(
             bids.get("ids", []), bids.get("bidder", []), bids.get("company", []),
             bids.get("siirIds", []), bids.get("price", []), bids.get("currencyId", []),
             bids.get("validUntil", []), bids.get("accepted", []))
     )
-    body = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR marketplace</title>
-<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111}}
-a{{color:#1d4ed8}} table{{border-collapse:collapse;width:100%;margin:10px 0}}
-th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #ddd;font-size:14px}}
-code{{font-size:12px}}</style></head><body>
-<h1>SIIR marketplace</h1>
-<p>custodial escrow exchange for SIIR deeds at <code>{escape(addr)}</code> —
-state decoded from the marketplace contract.</p>
-<p><strong>{n_list.get('count', '?')}</strong> listings · <strong>{n_bids.get('count', '?')}</strong> bids</p>
-<h2>ask listings</h2>
-<table><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>state</th></tr>{lrows or '<tr><td colspan=6>none</td></tr>'}</table>
-<h2>buy offers</h2>
-<table><tr><th>id</th><th>bidder</th><th>deed</th><th>price</th><th>state</th></tr>{brows or '<tr><td colspan=5>none</td></tr>'}</table>
-<p><small>all values are read on-chain; nothing is cached by the gateway for longer than a few seconds.</small></p>
-</body></html>"""
-    return body
+    n_open = sum(1 for a in listings.get("active", []) if a)
+    html = f"""<div class="card">
+<h1>marketplace</h1>
+<p class="mut">custodial escrow exchange for SIIR deeds at <code>{escape(addr)}</code> —
+NACKL, SHELL and eccUSDC pairs trade here. State decoded from the marketplace contract.</p>
+<p><strong>{escape(n_list.get("count", "?"))}</strong> listings &middot;
+<strong>{escape(n_bids.get("count", "?"))}</strong> bids &middot;
+<strong>{n_open}</strong> open</p></div>
+<div class="card"><h2>escrow</h2>
+<p class="mut">all trades settle through the custodial escrow (the marketplace contract). one click
+copies the address; hold the button to reveal the full value.</p>
+{_escrow_card(addr)}</div>
+<div class="card"><h2>tokens</h2>
+<button class="chip on" data-cur="all">all tokens</button>
+<button class="chip" data-cur="1">NACKL</button>
+<button class="chip" data-cur="2">SHELL</button>
+<button class="chip" data-cur="3">eccUSDC</button>
+<p class="mut" style="font-size:12.5px">filter listings and offers by trading token.</p></div>
+<div class="card"><h2>ask listings</h2>
+<table data-filter="1"><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>state</th></tr>{lrows or '<tr><td colspan=6 class="empty">none</td></tr>'}</table></div>
+<div class="card"><h2>buy offers</h2>
+<table data-filter="1"><tr><th>id</th><th>bidder</th><th>company</th><th>deed</th><th>price</th><th>state</th></tr>{brows or '<tr><td colspan=6 class="empty">none</td></tr>'}</table></div>
+<p><small><a href="/marketplace/{escape(addr)}/listings.json">listings.json</a> &middot;
+<a href="/marketplace/{escape(addr)}/bids.json">bids.json</a></small></p>"""
+    return _page(html, "SIIR marketplace")
 
 
 def company_page(addr):
@@ -1156,6 +1257,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if not parts or parts[0] == "":
             return self.index()
+        if parts[0] == "search":
+            return self.search((qs.get("q") or [""])[0])
         if parts[0] == "company":
             if len(parts) < 2:
                 return self._send(b"missing address", "text/plain", 400)
@@ -1216,26 +1319,98 @@ class Handler(BaseHTTPRequestHandler):
 
     def index(self):
         factory = default_factory()
-        rows = []
-        for c in load_companies():
-            addr = c.get("address", "")
-            rows.append(
-                f'<li><a href="/company/{addr}/">{escape(c.get("name") or addr)}</a> '
-                f'<a href="/company/{addr}/explore">explore</a> '
-                f'<small><code>{escape(addr)}</code></small></li>'
-            )
         mkt = ""
+        n_list = n_bids = "?"
+        n_open = 0
+        lrows = brows = ""
         if factory:
             mkt = (run_getter(factory, "getMarketplaceAddress", abi=FACTORY_ABI) or {}).get("value0", "")
-        mkt_link = f' · <a href="/marketplace/{escape(mkt)}/">marketplace</a>' if mkt else ""
-        html = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR gateway</title></head>
-<body><h1>SIIR gateway — companies on shellnet</h1>
-<p>directory reads the factory registry on-chain:
-<code>{escape(factory) if factory else 'no factory in scripts/.work/factory.addr'}</code>
-<a href="/factory/{escape(factory)}/">{'open directory' if factory else ''}</a>{mkt_link}</p>
-<ul>{''.join(rows) if rows else '<li>none registered (factory unreachable or empty)</li>'}</ul>
-<p><small>everything rendered here is read from the contracts on-chain.</small></p></body></html>"""
-        return self._send(html.encode(), "text/html; charset=utf-8")
+        if mkt:
+            listings = run_getter(mkt, "getListings", abi=MARKETPLACE_ABI) or {}
+            bids = run_getter(mkt, "getBids", abi=MARKETPLACE_ABI) or {}
+            n_list = (run_getter(mkt, "getListingCount", abi=MARKETPLACE_ABI) or {}).get("count", "?")
+            n_bids = (run_getter(mkt, "getBidCount", abi=MARKETPLACE_ABI) or {}).get("count", "?")
+            n_open = sum(1 for a in listings.get("active", []) if a)
+            def tok(cid):
+                n, c = _market_tok(cid)
+                return f'<span class="tok {c}">{escape(n)}</span>'
+            lrows = "".join(
+                f'<tr data-cur="{escape(cid)}"><td>#{escape(i)}</td>'
+                f'<td><a href="/company/{escape(c)}/">{escape(c.split("::")[1][:10])}…</a></td>'
+                f'<td><a href="/company/{escape(c)}/siir/{escape(s)}">#{escape(s)}</a></td>'
+                f'<td><code>{escape(seller)}</code></td><td>{price} {tok(cid)}</td>'
+                f'<td><span class="state {"open" if act else "closed"}">{"open" if act else "closed"}</span></td></tr>'
+                for i, c, s, seller, price, cid, _t, act in zip(
+                    listings.get("ids", []), listings.get("company", []), listings.get("siirIds", []),
+                    listings.get("seller", []), listings.get("askPrice", []),
+                    listings.get("currencyId", []), listings.get("listedAt", []),
+                    listings.get("active", []))
+            )
+            brows = "".join(
+                f'<tr data-cur="{escape(cid)}"><td>#{escape(i)}</td><td><code>{escape(bidder)}</code></td>'
+                f'<td><a href="/company/{escape(c)}/siir/{escape(s)}">#{escape(s)}</a></td>'
+                f'<td>{price} {tok(cid)}</td>'
+                f'<td><span class="state {"closed" if acc else "open"}">{"spent" if acc else "open"}</span></td></tr>'
+                for i, bidder, c, s, price, cid, _v, acc in zip(
+                    bids.get("ids", []), bids.get("bidder", []), bids.get("company", []),
+                    bids.get("siirIds", []), bids.get("price", []), bids.get("currencyId", []),
+                    bids.get("validUntil", []), bids.get("accepted", []))
+            )
+        escrow_html = _escrow_card(mkt) if mkt else '<p class="empty">no marketplace configured on the factory.</p>'
+        html = f"""<div class="card" style="background:linear-gradient(135deg,#0f172a,#1e293b);color:#f1f5f9;border:0">
+<h1 style="color:#fff">SIIR on-chain market</h1>
+<p class="mut" style="color:#94a3b8;max-width:560px">A custodial escrow exchange for SIIR deeds on the
+Acki Nacki chain. NACKL, SHELL and eccUSDC pairs trade here. Every number on this page is decoded
+from the contracts on-chain via the public mirror node.</p>
+<p><strong style="color:#fff">{escape(n_list)}</strong> listings &middot;
+<strong style="color:#fff">{escape(n_bids)}</strong> bids &middot;
+<strong style="color:#fff">{n_open}</strong> open &middot;
+<a href="/factory/{escape(factory)}/">directory</a> &middot;
+<a href="/marketplace/{escape(mkt)}/">marketplace page</a></p>
+</div>
+<div class="card"><h2>escrow</h2>
+<p class="mut">all trades settle through the custodial escrow (the marketplace contract). one click
+copies the address; hold the button to reveal the full value.</p>
+{escrow_html}</div>
+<div class="card"><h2>tokens</h2>
+<button class="chip on" data-cur="all">all tokens</button>
+<button class="chip" data-cur="1">NACKL</button>
+<button class="chip" data-cur="2">SHELL</button>
+<button class="chip" data-cur="3">eccUSDC</button>
+<p class="mut" style="font-size:12.5px">filter listings and offers by trading token. companies and their
+SIIRs are reachable only through the search bar.</p></div>
+<div class="card"><h2>ask listings</h2>
+<table data-filter="1"><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>state</th></tr>{lrows or '<tr><td colspan=6 class="empty">none yet — trades show up here the moment they are listed on-chain</td></tr>'}</table></div>
+<div class="card"><h2>buy offers</h2>
+<table data-filter="1"><tr><th>id</th><th>bidder</th><th>deed</th><th>price</th><th>state</th></tr>{brows or '<tr><td colspan=5 class="empty">none yet</td></tr>'}</table></div>"""
+        return self._send(_page(html, "SIIR market").encode(), "text/html; charset=utf-8")
+
+    def search(self, q):
+        q = (q or "").strip()
+        if re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", q):
+            return self._send(_page(
+                f'<div class="card"><h1>opening address</h1><p class="mut">looks like a contract '
+                f'address — <a href="/company/{escape(q)}/">open the company page</a>.</p></div>',
+                "search: " + q, q).encode(), "text/html; charset=utf-8")
+        if not q:
+            return self.index()
+        ql = q.lower()
+        companies = load_companies()
+        hits = [c for c in companies
+                if ql in (c.get("name") or "").lower() or ql in (c.get("address") or "").lower()]
+        rows = "".join(
+            f'<tr><td>{c.get("index", "?")}</td>'
+            f'<td><a href="/company/{escape(c.get("address", ""))}/">{escape(c.get("name") or "(unnamed)")}</a></td>'
+            f'<td>{escape("rounds" if int(c.get("issuanceModel") or 0) == 1 else "full-cap")}</td>'
+            f'<td><code class="addr">{escape(c.get("address", ""))}</code></td></tr>'
+            for c in hits)
+        html = f"""<div class="card"><h1>search</h1>
+<p class="mut">matches "{escape(q)}" against the factory registry
+({escape(str(len(companies)))} companies). SIIRs are only reachable through their company.</p></div>
+<div class="card"><h2>results ({len(hits)})</h2>
+<table><tr><th>#</th><th>name</th><th>model</th><th>company (dapp::acct)</th></tr>
+{rows or f'<tr><td colspan=4 class="empty">no company named or addressed "{escape(q)}". try a partial name.</td></tr>'}</table></div>"""
+        return self._send(_page(html, "search: " + q, q).encode(), "text/html; charset=utf-8")
 
     def factory_index(self):
         factory = default_factory()

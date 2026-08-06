@@ -1,19 +1,27 @@
 "use strict";
 /* app.js - single-page explorer on top of core.js.
    Hash routes:
-     #/                                  -> factory directory (default)
-     #/factory/<dapp>::<acct>           company directory, searchable by name
-     #/marketplace/<dapp>::<acct>       ask listings + buy offers
+     #/                                   -> marketplace landing (default)
+     #/marketplace/<dapp>::<acct>        ask listings + buy offers
+     #/search/<q>                        company search results
+     #/factory/<dapp>::<acct>           company directory (search-reachable only)
      #/company/<dapp>::<acct>
      #/company/<addr>/register  #/company/<addr>/holders
      #/company/<addr>/siir/<id> #/company/<addr>/holder/<owner>
      #/company/<addr>/search?q=...
+   Companies and their SIIRs are reachable only through search — the landing
+   is the marketplace, and nothing is browsable without a query.
 */
 
 const NET = "shellnet.ackinacki.org";
 const main = document.getElementById("main");
-const inp = document.getElementById("addr");
-const state = { ms: null, addr: null, fact: null, mkt: null };
+const inp = document.getElementById("q");
+const sug = document.getElementById("suggest");
+const state = { ms: null, addr: null, fact: null, mkt: null, cur: "all" };
+
+// token id -> [name, css class]
+const TOKENS = { "1": ["NACKL", "nk"], "2": ["SHELL", "sh"], "3": ["eccUSDC", "us"] };
+const tokenOf = (id) => TOKENS[String(id)] || null;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -30,6 +38,67 @@ function fmtBig(v) {
     return v.toLocaleString ? v.toLocaleString("en-US") : String(v);
 }
 
+function tok(id) {
+    const t = tokenOf(id);
+    return t ? `<span class="tok ${t[1]}">${t[0]}</span>` : `<span class="tok ot">${esc(id)}</span>`;
+}
+
+function toast(msg) {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(t._h);
+    t._h = setTimeout(() => t.classList.remove("show"), 1600);
+}
+
+// one click -> copy; hold ~0.6s -> reveal the full address
+function escrowButton(addr, label) {
+    const wrap = el("div", "escrow");
+    wrap.innerHTML = `
+      <div>
+        <div class="lab">escrow account (marketplace contract)</div>
+        <div class="addr mut" style="margin-top:2px">${esc(addr)}</div>
+      </div>
+      <button class="copy">${esc(label)}</button>
+      <span class="hint">hold 0.6s to reveal · click to copy</span>
+      <div class="full addr">${esc(addr)}</div>`;
+    const b = wrap.querySelector(".copy");
+    const full = wrap.querySelector(".full");
+    let timer = null, held = false;
+    b.addEventListener("pointerdown", () => {
+        held = false;
+        timer = setTimeout(() => { held = true; full.classList.add("show"); }, 600);
+    });
+    const clear = () => { clearTimeout(timer); };
+    b.addEventListener("pointerup", clear);
+    b.addEventListener("pointerleave", clear);
+    b.addEventListener("pointercancel", clear);
+    b.addEventListener("click", async () => {
+        if (held) { held = false; return; }
+        toast((await copyText(addr)) ? "escrow address copied" : "copy failed — select the address manually");
+    });
+    return wrap;
+}
+
+async function copyText(t) {
+    try {
+        await navigator.clipboard.writeText(t);
+        return true;
+    } catch {
+        try {
+            const ta = document.createElement("textarea");
+            ta.value = t;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand("copy");
+            ta.remove();
+            return ok;
+        } catch { return false; }
+    }
+}
+
 function logoCard(ms) {
     const b64 = (ms.state._logoImage || "").replace(/^data:[^,]+,/, "");
     if (!b64) return "";
@@ -41,9 +110,111 @@ async function loadCompany(addr) {
     state.ms = new MirrorState(addr, ABI_FIELDS, NET);
     await state.ms.load();
     state.addr = addr;
-    inp.value = addr;
     return state.ms;
 }
+
+// ---------------- marketplace (landing) ----------------
+
+async function loadMarketplace(addr) {
+    if (state.mkt && state.mkt.address === addr && state.mkt._decoded) return state.mkt;
+    state.mkt = new MarketplaceState(addr, NET);
+    await state.mkt.load();
+    return state.mkt;
+}
+
+function marketChips(on) {
+    const opts = [["all", "all tokens"], ["1", "NACKL"], ["2", "SHELL"], ["3", "eccUSDC"]];
+    return `<div class="chips">${opts.map(([id, lab]) =>
+        `<button class="chip ${on === id ? "on" : ""}" data-cur="${id}">${lab}</button>`).join("")}</div>`;
+}
+
+function fmtTime(n) {
+    const d = new Date(Number(n) * 1000);
+    return d.toISOString ? d.toISOString().replace("T", " ").slice(0, 19) : String(n);
+}
+
+function listingRows(listings) {
+    const rows = listings.map((l) => `
+        <tr><td>#${esc(l.id)}</td>
+            <td><a href="#/company/${l.company}">${esc(l.company.split("::")[1].slice(0, 10))}…</a></td>
+            <td><a href="#/company/${l.company}/siir/${l.siirId}">#${esc(l.siirId)}</a></td>
+            <td class="addr">${esc(l.seller)}</td>
+            <td>${fmtBig(l.askPrice)} ${tok(l.currencyId)}</td>
+            <td>${esc(fmtTime(l.listedAt))}</td>
+            <td><span class="state ${l.active ? "open" : "closed"}">${l.active ? "open" : "closed"}</span></td></tr>`);
+    return rows.join("");
+}
+
+function bidRows(bids) {
+    const rows = bids.map((b) => `
+        <tr><td>#${esc(b.id)}</td>
+            <td class="addr">${esc(b.bidder)}</td>
+            <td><a href="#/company/${b.company}">${esc(b.company.split("::")[1].slice(0, 10))}…</a></td>
+            <td><a href="#/company/${b.company}/siir/${b.siirId}">#${esc(b.siirId)}</a></td>
+            <td>${fmtBig(b.price)} ${tok(b.currencyId)}</td>
+            <td>${b.validUntil === "0" ? "never" : esc(fmtTime(b.validUntil))}</td>
+            <td><span class="state ${b.accepted ? "closed" : "open"}">${b.accepted ? "spent" : "open"}</span></td></tr>`);
+    return rows.join("");
+}
+
+function escrowCard(addr) {
+    return `
+    <div class="card">
+      <h2>escrow</h2>
+      <p class="mut">all trades settle through the custodial escrow (the marketplace contract). one click copies
+      the address; hold the button to reveal the full value.</p>
+      ${escrowButton(addr, "copy escrow address").outerHTML}
+    </div>`;
+}
+
+async function marketplacePage(addr, landing) {
+    const m = await loadMarketplace(addr);
+    if (!m._decoded) return error(m.error);
+    const listings = m.listings();
+    const bids = m.bids();
+    const cur = state.cur;
+    const fl = (cur === "all") ? listings : listings.filter((l) => String(l.currencyId) === cur);
+    const fb = (cur === "all") ? bids : bids.filter((b) => String(b.currencyId) === cur);
+    const openL = listings.filter((l) => l.active).length;
+    const openB = bids.filter((b) => !b.accepted).length;
+    const hero = landing ? `
+    <div class="card hero">
+      <div>
+        <h1>SIIR on-chain market</h1>
+        <p>A custodial escrow exchange for SIIR deeds on the Acki Nacki chain. NACKL, SHELL and eccUSDC
+        pairs trade here. Every number on this page is decoded in your browser from the public mirror
+        node — no server, no tvm-cli.</p>
+        <div class="stats">
+          <div class="stat"><div class="n">${openL}</div><div class="k">open listings</div></div>
+          <div class="stat"><div class="n">${openB}</div><div class="k">open offers</div></div>
+          <div class="stat"><div class="n">${esc(m.listingCount())}</div><div class="k">all listings</div></div>
+        </div>
+      </div>
+    </div>` : `
+    <div class="card">
+      <h1>marketplace</h1>
+      <p class="mut">custodial escrow exchange for SIIR deeds, decoded from the marketplace contract state.</p>
+      <div class="grid">
+        <div class="kv"><div class="k">listings / bids</div><div class="v">${esc(m.listingCount())} / ${esc(m.bidCount())}</div></div>
+        <div class="kv"><div class="k">factory</div><div class="v addr">${esc(m.factoryAddr())}</div></div>
+      </div>
+    </div>`;
+    const chips = `<div class="card" style="padding:14px 22px"><h2>tokens</h2>${marketChips(cur)}
+      <p class="note">filter listings and offers by trading token. prices are in the token the pair is priced in.</p></div>`;
+    const lt = fl.filter((l) => l.active);
+    const bt = fb.filter((b) => !b.accepted);
+    return hero + escrowCard(addr) + chips + `
+    <div class="card"><h2>ask listings · ${lt.length} open${cur !== "all" ? " · " + TOKENS[cur][0] : ""}</h2>
+      ${lt.length ? `<table><thead><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>listed (utc)</th><th>state</th></tr></thead>
+        <tbody>${listingRows(lt)}</tbody></table>`
+        : `<div class="empty">no open listings${cur !== "all" ? " in " + TOKENS[cur][0] : ""} — the full ledger has ${fl.length}.</div>`}</div>
+    <div class="card"><h2>buy offers · ${bt.length} open${cur !== "all" ? " · " + TOKENS[cur][0] : ""}</h2>
+      ${bt.length ? `<table><thead><tr><th>id</th><th>bidder</th><th>company</th><th>deed</th><th>price</th><th>valid until</th><th>state</th></tr></thead>
+        <tbody>${bidRows(bt)}</tbody></table>`
+        : `<div class="empty">no open offers${cur !== "all" ? " in " + TOKENS[cur][0] : ""}.</div>`}</div>`;
+}
+
+// ---------------- company pages ----------------
 
 async function companyPage(ms, tabData) {
     const c = ms.companyInfo();
@@ -93,12 +264,12 @@ function overviewSection(ms, c, plans, div, content, fp) {
     const grid = `<div class="grid">${
         kvs.map(([k, v]) => `<div class="kv"><div class="k">${esc(k)}</div><div class="v addr">${esc(v)}</div></div>`).join("")
     }</div>`;
-    const divsTable = `<table><tr><th>currency</th><th>index</th><th>deposited</th></tr>${
-        div.ids.map((id, i) => `<tr><td>${esc(id)}</td><td>${fmtBig(div.indices[i])}</td><td>${fmtBig(div.deposits[i])}</td></tr>`).join("")
-    }</table>`;
-    const plansTable = `<table><tr><th>plan</th><th>count</th><th>weight</th><th>issued</th></tr>${
+    const divsTable = `<table><tbody><tr><th>currency</th><th>index</th><th>deposited</th></tr>${
+        div.ids.map((id, i) => `<tr><td>${tok(id)}</td><td>${fmtBig(div.indices[i])}</td><td>${fmtBig(div.deposits[i])}</td></tr>`).join("")
+    }</tbody></table>`;
+    const plansTable = `<table><tbody><tr><th>plan</th><th>count</th><th>weight</th><th>issued</th></tr>${
         plans.map((p) => `<tr><td>${esc(p.label)}</td><td>${esc(p.count)}</td><td>${esc(p.weight)}</td><td>${p.issued ? "yes" : "no"}</td></tr>`).join("")
-    }</table>`;
+    }</tbody></table>`;
     const ch = ms.charter();
     const g = ms.state || {};
     const rules = {0: "treasury → founder", 1: "charity", 2: "DAO", 3: "burn"};
@@ -155,7 +326,7 @@ function registerSection(ms) {
                 <td>1</td></tr>`;
     }).join("");
     return `<div class="card"><h2>registry (${fmtBig(BigInt(info.issuedCount))} SIIRs)</h2>
-            <table><tr><th>range</th><th>weight</th><th>owner</th><th>round</th><th>label</th><th>size</th></tr>${rows}${ovRows}</table>
+            <table><tbody><tr><th>range</th><th>weight</th><th>owner</th><th>round</th><th>label</th><th>size</th></tr>${rows}${ovRows}</tbody></table>
             <p class="mut">ownership lives in compact ranges; rows with custom labels are per-id overrides.</p></div>`;
 }
 
@@ -172,7 +343,7 @@ function holdersSection(ms) {
     const rows = Object.keys(h).map((o) => `<tr><td><a class="addr" href="#/company/${ms.address}/holder/${encodeURIComponent(o)}">${esc(o)}</a></td>
         <td>${fmtBig(h[o].count)}</td><td>${fmtBig(h[o].weight)}</td></tr>`).join("");
     return `<div class="card"><h2>holders (${Object.keys(h).length})</h2>
-            <table><tr><th>owner</th><th>siirs</th><th>weight</th></tr>${rows}</table></div>`;
+            <table><tbody><tr><th>owner</th><th>siirs</th><th>weight</th></tr>${rows}</tbody></table></div>`;
 }
 
 async function siirPage(addr, id) {
@@ -184,7 +355,7 @@ async function siirPage(addr, id) {
     const hist = ms.history(id);
     let fp = "…";
     try { fp = await ms.fingerprint(id); } catch {}
-    const rows = cur.map((c, i) => `<tr><td>${esc(c)}</td><td>${amt[i]}</td></tr>`).join("");
+    const rows = cur.map((c, i) => `<tr><td>${tok(c)}</td><td>${amt[i]}</td></tr>`).join("");
     const histRows = hist.map((h) => `<tr><td>${h.timestamp}</td><td class="addr">${esc(h.from)}</td><td class="addr">${esc(h.to)}</td></tr>`).join("");
     return `<div class="card"><h1>SIIR #${esc(id)}</h1>
             <div class="grid">
@@ -195,8 +366,8 @@ async function siirPage(addr, id) {
             <p><b>label</b> ${esc(s.label)}<br><b>metadata</b> ${esc(s.metadataUri)}</p>
             <p><b>fingerprint</b> <code>${esc(fp)}</code></p>
             </div>
-            <div class="card"><h2>claimable</h2><table><tr><th>currency</th><th>pending</th></tr>${rows}</table></div>
-            <div class="card"><h2>provenance</h2><table><tr><th>time</th><th>from</th><th>to</th></tr>${histRows}</table></div>`;
+            <div class="card"><h2>claimable</h2><table><tbody><tr><th>currency</th><th>pending</th></tr>${rows}</tbody></table></div>
+            <div class="card"><h2>provenance</h2><table><tbody><tr><th>time</th><th>from</th><th>to</th></tr>${histRows}</tbody></table></div>`;
 }
 
 async function holderPage(addr, owner) {
@@ -224,21 +395,55 @@ async function holderPage(addr, owner) {
                 <td>${esc(s.weight)}</td><td>${esc(s.round)}</td><td>${fmtBig(n)}</td></tr>`;
         }).join("");
     }
-    const claimRows = cur.map((c, i) => `<tr><td>${esc(c)}</td><td>${amt[i]}</td></tr>`).join("");
+    const claimRows = cur.map((c, i) => `<tr><td>${tok(c)}</td><td>${amt[i]}</td></tr>`).join("");
     return `<div class="card"><h1>holder</h1><p class="addr">${esc(owner)}</p>
             <p class="mut">${fmtBig(total)} SIIRs in ${ranges.length} range(s)</p></div>
-            <div class="card"><h2>owned</h2><table><tr><th>id / range</th><th>weight</th><th>round</th>${total <= 200n ? "" : "<th>size</th>"}</tr>${rows}</table></div>
-            <div class="card"><h2>total claimable</h2><table><tr><th>currency</th><th>pending</th></tr>${claimRows}</table></div>`;
+            <div class="card"><h2>owned</h2><table><tbody><tr><th>id / range</th><th>weight</th><th>round</th>${total <= 200n ? "" : "<th>size</th>"}</tr>${rows}</tbody></table></div>
+            <div class="card"><h2>total claimable</h2><table><tbody><tr><th>currency</th><th>pending</th></tr>${claimRows}</tbody></table></div>`;
+}
+
+// ---------------- factory / search ----------------
+
+async function loadFactory(addr) {
+    if (state.fact && state.fact.address === addr && state.fact._decoded) return state.fact;
+    state.fact = new FactoryState(addr, NET);
+    await state.fact.load();
+    return state.fact;
+}
+
+const ADDR_RE = /^[0-9a-f]{64}::[0-9a-f]{64}$/;
+
+// search the registry by name or address; results only exist after a query
+async function searchPage(q) {
+    const query = q.trim().toLowerCase();
+    if (ADDR_RE.test(q.trim())) {
+        return `<div class="card"><h1>opening address</h1><p class="mut">looks like a contract address — opening the company page.</p></div>`;
+    }
+    const f = await loadFactory(FACTORY_ADDR);
+    if (!f._decoded) return error(f.error);
+    const companies = f.companies();
+    const hits = companies.filter((c) =>
+        c.name.toLowerCase().includes(query) || c.address.toLowerCase().includes(query));
+    const rows = hits.map((c) => `
+        <tr><td>${c.index}</td>
+            <td><a href="#/company/${c.address}">${esc(c.name) || "(unnamed)"}</a></td>
+            <td>${esc(c.issuanceModel === "1" ? "rounds" : "full-cap")}</td>
+            <td><a class="addr" href="#/company/${c.address}">${esc(c.address)}</a></td></tr>`).join("");
+    return `
+    <div class="card">
+      <h1>search</h1>
+      <p class="mut">matches "${esc(q)}" against the factory registry (${esc(f.factoryInfo().count)} companies). SIIRs
+      are only reachable through their company.</p>
+    </div>
+    <div class="card"><h2>results (${hits.length})</h2>
+      ${hits.length ? `<table><tbody><tr><th>#</th><th>name</th><th>model</th><th>company (dapp::acct)</th></tr>${rows}</tbody></table>`
+        : `<div class="empty">no company named or addressed "${esc(q)}". try a partial name.</div>`}
+      <p class="note">direct address (dapp_id::account_id) also opens a company instantly — search bar or <a href="#/factory/${FACTORY_ADDR}">directory</a>.</p>
+    </div>`;
 }
 
 async function factoryPage(addr) {
-    if (state.fact && state.fact.address === addr && state.fact._decoded) {
-        // reload once per navigation; stale cache is fine for a demo
-    } else {
-        state.fact = new FactoryState(addr, NET);
-        await state.fact.load();
-    }
-    const f = state.fact;
+    const f = await loadFactory(addr);
     if (!f._decoded) return error(f.error);
     const info = f.factoryInfo();
     const companies = f.companies();
@@ -250,14 +455,14 @@ async function factoryPage(addr) {
     const html = `
     <div class="card">
       <h1>company directory</h1>
-      <p class="mut">decoded from the factory's on-chain registry (map index → company). Search is case-insensitive — "njd" finds "NJD Ventures".</p>
+      <p class="mut">the registry, decoded from the factory contract. reachable here only because you asked for it.</p>
       <div class="kv"><div class="k">factory</div><div class="v addr">${esc(addr)}</div></div>
       <div class="kv"><div class="k">marketplace</div><div class="v addr"><a href="#/marketplace/${info.marketplace}">${esc(info.marketplace)}</a></div></div>
       <div class="kv"><div class="k">companies</div><div class="v">${esc(info.count)}</div></div>
       <p><input id="fsearch" placeholder="filter by company name…" spellcheck="false"></p>
     </div>
     <div class="card"><h2 id="fcount">registered (${companies.length})</h2>
-      <table id="frows"><tr><th>#</th><th>name</th><th>model</th><th>company (dapp::acct)</th></tr>${rows}</table></div>
+      <table id="frows"><tbody><tr><th>#</th><th>name</th><th>model</th><th>company (dapp::acct)</th></tr>${rows}</tbody></table></div>
     ${companies.length ? "" : '<div class="err">no companies registered in this factory yet.</div>'}`;
     main.innerHTML = html;
     const box = document.getElementById("fsearch");
@@ -275,47 +480,47 @@ async function factoryPage(addr) {
     });
 }
 
-async function marketplacePage(addr) {
-    if (!(state.mkt && state.mkt.address === addr && state.mkt._decoded)) {
-        state.mkt = new MarketplaceState(addr, NET);
-        await state.mkt.load();
+// ---------------- search suggestions ----------------
+
+let suggestTimer = null;
+inp.addEventListener("input", () => {
+    clearTimeout(suggestTimer);
+    suggestTimer = setTimeout(showSuggestions, 250);
+});
+inp.addEventListener("blur", () => setTimeout(() => { sug.style.display = "none"; }, 200));
+inp.addEventListener("focus", () => { if (inp.value.trim()) showSuggestions(); });
+
+async function showSuggestions() {
+    const q = inp.value.trim();
+    sug.style.display = "none";
+    if (!q) return;
+    const v = q.toLowerCase();
+    if (ADDR_RE.test(q)) {
+        sug.innerHTML = `<a href="#/company/${encodeURIComponent(q)}"><span class="s-n">open address</span><div class="s-a">${esc(q)}</div></a>`;
+        sug.style.display = "block";
+        return;
     }
-    const m = state.mkt;
-    if (!m._decoded) return error(m.error);
-    const listings = m.listings();
-    const bids = m.bids();
-    const cur = (id) => ({ "2": "SHELL", "3": "eccUSDC", "1": "NACKL" })[String(id)] || String(id);
-    const t = (n) => { const d = new Date(Number(n) * 1000); return d.toISOString ? d.toISOString().replace("T", " ").slice(0, 19) : n; };
-    const lrows = listings.map((l) => `
-        <tr><td>${esc(l.id)}</td>
-            <td><a href="#/company/${l.company}">${esc(l.company.split("::")[1].slice(0, 10))}…</a></td>
-            <td><a href="#/company/${l.company}/siir/${l.siirId}">#${esc(l.siirId)}</a></td>
-            <td class="addr">${esc(l.seller)}</td>
-            <td>${fmtBig(l.askPrice)} ${esc(cur(l.currencyId))}</td>
-            <td>${esc(t(l.listedAt))}</td>
-            <td>${l.active ? "open" : "closed"}</td></tr>`).join("");
-    const brows = bids.map((b) => `
-        <tr><td>${esc(b.id)}</td>
-            <td class="addr">${esc(b.bidder)}</td>
-            <td><a href="#/company/${b.company}/siir/${b.siirId}">#${esc(b.siirId)}</a></td>
-            <td>${fmtBig(b.price)} ${esc(cur(b.currencyId))}</td>
-            <td>${esc(b.validUntil === "0" ? "never" : b.validUntil)}</td>
-            <td>${b.accepted ? "spent" : "open"}</td></tr>`).join("");
-    return `
-    <div class="card">
-      <h1>marketplace</h1>
-      <p class="mut">custodial escrow exchange for SIIR deeds, decoded from the marketplace contract state.</p>
-      <div class="kv"><div class="k">marketplace</div><div class="v addr">${esc(addr)}</div></div>
-      <div class="kv"><div class="k">listings / bids</div><div class="v">${esc(m.listingCount())} / ${esc(m.bidCount())}</div></div>
-    </div>
-    <div class="card"><h2>ask listings (${listings.filter((l) => l.active).length} open)</h2>
-      <table><tr><th>id</th><th>company</th><th>deed</th><th>seller</th><th>ask</th><th>listed (utc)</th><th>state</th></tr>${lrows}</table></div>
-    <div class="card"><h2>buy offers (${bids.filter((b) => !b.accepted).length} open)</h2>
-      <table><tr><th>id</th><th>bidder</th><th>deed</th><th>price</th><th>valid until</th><th>state</th></tr>${brows}</table></div>`;
+    let f;
+    try { f = await loadFactory(FACTORY_ADDR); } catch { return; }
+    if (!f._decoded) return;
+    const hits = f.companies().filter((c) =>
+        c.name.toLowerCase().includes(v) || c.address.toLowerCase().includes(v)).slice(0, 8);
+    if (!hits.length) {
+        sug.innerHTML = `<div class="s-empty">no company matches "${esc(q)}"</div>`;
+        sug.style.display = "block";
+        return;
+    }
+    sug.innerHTML = hits.map((c) =>
+        `<a href="#/company/${c.address}"><span class="s-n">${esc(c.name) || "(unnamed)"}</span><div class="s-a">${esc(c.address)}</div></a>`).join("") +
+        `<a href="#/search/${encodeURIComponent(q)}" style="color:var(--acc)"><span class="s-n">all results for "${esc(q)}"</span></a>`;
+    sug.style.display = "block";
 }
+
+// ---------------- routing ----------------
 
 async function route() {
     const h = location.hash;
+    sug.style.display = "none";
     try {
         if (h.startsWith("#/company/")) {
             const rest = h.slice("#/company/".length);
@@ -335,9 +540,24 @@ async function route() {
         } else if (h.startsWith("#/factory/")) {
             await factoryPage(decodeURIComponent(h.slice("#/factory/".length)));
         } else if (h.startsWith("#/marketplace/")) {
-            main.innerHTML = await marketplacePage(decodeURIComponent(h.slice("#/marketplace/".length)));
-        } else if (h === "" || h === "#/" || h.startsWith("#/company/demo")) {
-            location.hash = "#/factory/" + FACTORY_ADDR;
+            state.cur = "all";
+            main.innerHTML = await marketplacePage(decodeURIComponent(h.slice("#/marketplace/".length)), false);
+        } else if (h.startsWith("#/search/")) {
+            main.innerHTML = await searchPage(decodeURIComponent(h.slice("#/search/".length)));
+        } else {
+            // landing: the marketplace of the live factory
+            state.cur = "all";
+            const f = await loadFactory(FACTORY_ADDR);
+            if (!f._decoded) {
+                main.innerHTML = error(f.error);
+                return;
+            }
+            const mkt = f.factoryInfo().marketplace;
+            if (!mkt) {
+                main.innerHTML = error("factory has no marketplace configured");
+                return;
+            }
+            main.innerHTML = await marketplacePage(mkt, true);
         }
     } catch (e) {
         main.innerHTML = error((e && e.message) || String(e));
@@ -348,13 +568,23 @@ function error(msg) {
     return `<div class="err">${esc(msg)}</div>`;
 }
 
-document.getElementById("go").addEventListener("click", () => {
+function goSearch() {
     const v = inp.value.trim();
-    if (v) location.hash = "#/company/" + encodeURIComponent(v);
-});
-inp.addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("go").click(); });
-window.addEventListener("hashchange", route);
+    if (!v) return;
+    if (ADDR_RE.test(v)) location.hash = "#/company/" + encodeURIComponent(v);
+    else location.hash = "#/search/" + encodeURIComponent(v);
+}
 
-const FACTORY_ADDR = "e8589bfa0c19221b3f433e656147395c25c573ecce6582cc07294058a7602ce8::e8589bfa0c19221b3f433e656147395c25c573ecce6582cc07294058a7602ce8";
-const DEMO_ADDR = "e8589bfa0c19221b3f433e656147395c25c573ecce6582cc07294058a7602ce8::e41675736c22180617c668583100209ea6ade8e2ecd45ae621881c019fd0434b";
+document.getElementById("go").addEventListener("click", goSearch);
+inp.addEventListener("keydown", (e) => { if (e.key === "Enter") goSearch(); });
+window.addEventListener("hashchange", route);
+document.addEventListener("click", (e) => {
+    const c = e.target.closest ? e.target.closest(".chip[data-cur]") : null;
+    if (!c || state.cur === c.getAttribute("data-cur")) return;
+    state.cur = c.getAttribute("data-cur");
+    route();
+});
+
+const FACTORY_ADDR = "82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6::82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6";
+const DEMO_ADDR = "82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6::6890748cdb02ed4c1ac5f43b52c4e9048f60567fe0cbfbe8124babb37f1096bd";
 route();

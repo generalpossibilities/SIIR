@@ -13,7 +13,8 @@ HTTP face, so the gateway translates getter calls into web responses:
 
 | route | serves |
 |---|---|
-| `GET /` | index of companies (from `scripts/.work/companies.json`) |
+| `GET /` | marketplace landing — escrow account card (one-click copy, long-press reveals the full address), NACKL/SHELL/eccUSDC token filter, ask listings + buy offers from the marketplace contract; companies are reachable only via search |
+| `GET /search?q=…` | company search against the factory registry (name or address); SIIRs are reachable only through their company |
 | `GET /company/<dapp_id>::<account_id>/` | company page — the stored UI bundle if present, otherwise a generated showcase (logo, deed, info, charter + ratification) |
 | `GET /company/<addr>/app` | the raw stored UI bundle (`text/html`) |
 | `GET /company/<addr>/logo` | on-chain company logo (e.g. `image/svg+xml`) |
@@ -33,6 +34,8 @@ HTTP face, so the gateway translates getter calls into web responses:
 | `GET /company/<addr>/treasury` | `getDividendCurrencies` as JSON |
 | `GET /company/<addr>/history/<id>` | `getHistory` entries as JSON |
 | `GET /company/<addr>/search?q=...` | if `q` is an owner address -> holder page; otherwise substring scan of labels, metadata URIs and owner addresses. The same data is on `.../search.json?q=` |
+| `GET /factory/` · `GET /factory/<addr>/` | factory index + directory (registry decoded from the factory contract); `.../companies.json` for the JSON form |
+| `GET /marketplace/<addr>/` | marketplace page (escrow card, token filters, listings + bids); `.../listings.json` and `.../bids.json` for the JSON forms |
 
 ## Run
 
