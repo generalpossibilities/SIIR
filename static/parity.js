@@ -9,9 +9,9 @@ global.atob = (s) => Buffer.from(s, "base64").toString("binary");
 const XP = require("./core.js");
 const ABI = { fields: require("./fields.js").ABI_FIELDS };
 
-const ADDR = "ce31c59c80895b5075efdacc9b0fe1d419937b81df0804f93fd5455d06a87f22::7b7c826d72140cb3640f1429bd813475e89874355104f3eb1c7f2a4aaf17a255";
-const F = "0:4de04d6ac25902a1ddb4618d9b3b7f4e86dab3799b9469a41a9c5cb2af267818";
-const H = "0:e313c6c09c8c3e06aa81ea56e65c41108e384ea04167684723c44750bac2c98b";
+const ADDR = process.env.PARITY_ADDR || "82a2ff688d97c434697602f8dbe38c4d0e582a4f5e4f5d936b29589c422791e6::6890748cdb02ed4c1ac5f43b52c4e9048f60567fe0cbfbe8124babb37f1096bd";
+const F = process.env.PARITY_FOUNDER || "0:c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb";
+const H = process.env.PARITY_HOLDER || "0:0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa";
 
 async function main() {
     const ms = new XP.MirrorState(ADDR, ABI.fields, process.env.NET || "shellnet.ackinacki.org");
@@ -38,9 +38,21 @@ async function main() {
         holder_claimable: ms.claimableOf(H),
     };
     const py = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+    // normalize: BigInt -> string, and sort object keys recursively, so the
+    // comparison is immune to key order and BigInt serialization differences
+    const norm = (v) => {
+        if (typeof v === "bigint") return String(v);
+        if (Array.isArray(v)) return v.map(norm);
+        if (v && typeof v === "object") {
+            const o = {};
+            for (const k of Object.keys(v).sort()) o[k] = norm(v[k]);
+            return o;
+        }
+        return v;
+    };
     let fail = 0;
     for (const k of Object.keys(py)) {
-        const a = JSON.stringify(out[k]), b = JSON.stringify(py[k]);
+        const a = JSON.stringify(norm(out[k])), b = JSON.stringify(norm(py[k]));
         if (a === b) console.log("ok  " + k);
         else { fail++; console.log("FAIL " + k + "\n  js: " + a + "\n  py: " + b); }
     }
