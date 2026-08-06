@@ -57,6 +57,16 @@ fund() { # fund <self-or-full> <shell_nano>  — VMSHELL gas (flag16) + SHELL ec
     "{\"dest\":\"$(legacy "$1")\",\"value\":3000000000,\"ecc\":{\"2\":$2}}" >/dev/null
 }
 
+topup() { # topup <fulladdr> <min_vmshell> <label> — refill if sender may run dry
+  local b
+  b=$(cli account "$1" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
+  if [ "${b:-0}" -lt "$2" ]; then
+    echo "  $3 vmshell low (${b} < $2); funding..."
+    fund "$1" 50000000000
+    sleep 3
+  fi
+}
+
 wait_active() { # wait_active <fulladdr> <name> [timeout_s]
   local t=${3:-60}
   for i in $(seq 1 $((t / 2))); do
@@ -269,6 +279,7 @@ fi
 # ---------- 5b. 10B-scale proof (PLAN_COUNT=10^10) ----------
 if [ "${PLAN_COUNT:-100}" = "10000000000" ]; then
   echo "== 5b. 10B-scale proof (lazy derived registry) =="
+  topup "$FOUNDER" 9000000000 "founder"
   cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
   echo "  spot-check derived getSIIR at 1 / mid / last:"
   cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
@@ -277,7 +288,7 @@ if [ "${PLAN_COUNT:-100}" = "10000000000" ]; then
   echo "  register shape (compact ranges, not per-id rows):"
   cli run "$COMPANY" getSegments '{}' --abi "$CT/CompanySIIR.abi.json" || true
   FB10=$(cli run "$COMPANY" getBalanceOf "{\"owner\":\"$(legacy "$FOUNDER")\"}" --abi "$CT/CompanySIIR.abi.json" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0", json.load(sys.stdin).get("count","?")))' 2>/dev/null || echo "?")
+    | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("count",0) or 0, 16))' 2>/dev/null || echo "?")
   echo "  founder balance: $FB10 (expect 10000000000)"
   [ "$FB10" = "10000000000" ] && echo "  [ok] balance counts derived ids from one segment" || echo "  [fail] balance mismatch"
   echo "  one transferRange moves all 10B ids to the holder:"
@@ -313,6 +324,7 @@ fi
 # ---------- 8. deposit dividends (10 SHELL + 5,000 eccUSDC) ----------
 echo "== 8. deposit 10 SHELL + 5000 eccUSDC + 1 NACKL dividends =="
 # the founder wallet must actually hold every attached currency (ecc 2, 3, 1)
+topup "$FOUNDER" 9000000000 "founder"
 FBAL=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("3",0))' 2>/dev/null || echo 0)
 FBAL2=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("2",0))' 2>/dev/null || echo 0)
 FBAL1=$(cli account "$FOUNDER" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ecc_balance",{}).get("1",0))' 2>/dev/null || echo 0)
@@ -343,7 +355,7 @@ cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 echo "== 9. holder claims (SHELL + eccUSDC + NACKL in one transfer) =="
 # the claim costs ~1e9 VMSHELL to send from the wallet; top up if it ran dry
 HB=$(cli account "$HOLDER" 2>/dev/null | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("balance") or 0))' 2>/dev/null || echo 0)
-[ "${HB:-0}" -lt 3000000000 ] && { echo "  holder vmshell low (${HB}); funding..."; fund "$HOLDER" 50000000000; sleep 3; }
+[ "${HB:-0}" -lt 12000000000 ] && { echo "  holder vmshell low (${HB}); funding..."; fund "$HOLDER" 120000000000; sleep 3; }
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
   "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/CompanySIIR.abi.json" claim '{"ids":["1"]}')\"}" >/dev/null || true
@@ -505,6 +517,9 @@ fi
 echo "== 13. marketplace =="
 echo "  marketplace: $MARKET"
 # 13a. seller (holder) escrows SIIR #1 into the marketplace (it owns it after step 7)
+# each flag:1 wallet send costs ~12.9e9 net (3e9 value + burn), so ensure a
+# fresh reserve for escrow + list + acceptBid
+topup "$HOLDER" 40000000000 "holder"
 OWNER1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
 echo "  SIIR #1 owner: $OWNER1 (seller escrows it)"
 if [ "$OWNER1" = "0:$HOLDER_RAW" ]; then
@@ -523,6 +538,7 @@ sleep 4
 echo "  listings:"
 cli run "$MARKET" getListings '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
 # 13c. buyer (founder) bids 5 SHELL, valid 1 hour
+topup "$FOUNDER" 9000000000 "founder"
 cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
   "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{\"2\":5000000000},\"bounce\":true,\"flags\":1,\
     \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" bid "{\"company\":\"$(legacy "$COMPANY")\",\"ids\":[\"1\"],\"price\":5000000000,\"currencyId\":2,\"validUntil\":$(( $(date +%s) + 3600 ))}")\"}" >/dev/null || true

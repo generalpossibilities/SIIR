@@ -533,11 +533,11 @@ holder data) and §6.31 (legacy fallback) were both caught by them.
 ### 8.4 Live deployment (FORCE redeploy to v2.0.0, shellnet)
 
 ```
-dapp-id:    46a62cc3b48b5b2a48d935872bb8953579917f50082c60775402dccce439153a
-factory:    <dapp-id>::46a62cc3b48b5b2a48d935872bb8953579917f50082c60775402dccce439153a
-marketplace:<dapp-id>::8f00e03c690001a028568551ccb93e4420f0dce1f69de72b86466efb05839d5b
-company:    <dapp-id>::a9f00423e961fae96bf660aa9679fc06162a3214a3e97e77ae277f9861faaca3
-rounds:     <dapp-id>::87f1208700bd669e1a4d8c89183ddd8d0ce4cd418aacb9c266728b36d1c18177
+dapp-id:    4e9a5b9c820eacd5e5be6bf8d8ee62b5a55c706405280f937df67a32a2bd3c0b
+factory:    <dapp-id>::4e9a5b9c820eacd5e5be6bf8d8ee62b5a55c706405280f937df67a32a2bd3c0b
+marketplace:<dapp-id>::9e8c960079e2a9a6133bdfb758ad09b18f0b0e5042a235223583ef2df5c3d745
+company:    <dapp-id>::5f0777ceb141780eb86e7fa96c6214d4a327a0572e6498dfb4951ea31e9f0fe5
+rounds:     <dapp-id>::fee2ebf7f0614397738c32df1f968d07e0a77252b212f17599f45d2209a2f577
 founder:    c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb::<same>
 holder:     0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa::<same>
 factory ownerPubkey: 0xb7df23e9a73343f1fc3a11e15ae3f6bf227b9df955f2da558c96904021e92b8b
@@ -586,6 +586,18 @@ cross-dapp gram transfer; the deploy script now does so for factory,
 wallets, and the marketplace, and step 13e verifies the settlement
 (deed → bidder, listing `active:false`) with a hard `[fail]` + exit 1.
 
+Two more funding lessons from the 10B proof runs:
+
+- **A wallet `flag:1` send of 3e9 grams costs ~12.9e9 net** (the action
+  phase burns value + forward fees from the reserve). A single 5e10
+  top-up covers only three of the holder's four sends (claim, escrow,
+  list, acceptBid) — the fourth aborts with action `error_code=37,
+  no_funds:true`. The script now refills the holder to 1.2e11 at step 9
+  and re-checks before step 13a (`topup` helper).
+- **Every contract-initiated gram send needs reserve** — including the
+  founder's `transferRange` in step 5b and the deposit in step 8; the
+  `topup` helper runs before each.
+
 Note: the old §8.5 "transfer aborts with exit code 50" is resolved —
 that abort was the 0-gram claim payout bouncing at the receiver for
 lack of forward fee; the claim now pays `value:1e9, flag:1` in one
@@ -623,11 +635,21 @@ ver 2.0.0, company Active, genesis issued, three-currency deposits
 landed, gzip UI bundle stored on-chain, and the full demo lifecycle now
 passes **steps 1–13**, including the marketplace escrow → list → bid →
 `acceptBid` settle (deed → bidder, listing closed, verified in step
-13e). The last blocker was the VMSHELL reserve trap (§8.5): contract
-senders need flag-16 reserve top-ups before cross-dapp gram sends —
-`fund "$MARKET" 40000000000` now runs unconditionally after step 2.
+13e). The last blockers were VMSHELL-reserve issues (§8.5): contract
+senders need flag-16 reserve top-ups before cross-dapp gram sends, and
+a wallet `flag:1` 3e9 send costs ~12.9e9 net — `fund`/`topup` calls now
+run unconditionally before every sender.
 
-**Next:** the 10-billion-SIIR proof run (`PLAN_COUNT=10000000000` issue
-→ single segment row → O(1) claim math); then governance & dissolution
-safeguards, and wiring the explorer's live marketplace views against
-the §8.4 addresses.
+**10B-scale proof (live, `PLAN_COUNT=10000000000`):** the genesis issue
+of **10,000,000,000 SIIRs** lands as a *single segment row* —
+`issuedCount:10000000000, totalWeight:10000000000000, nextId:0x2540be401`;
+`getSIIR` resolves id 1 / 5,000,000,000 / 10,000,000,000 off one plan
+row; `getBalanceOf` counts 10B from one segment; one `transferRange`
+moves all 10B ids to the holder in one record (segments: one row, owner
+swapped) with per-id history event. The full 13-step lifecycle then
+passed with the 10B plan, including deposits (indices 1e6/5e8/1e5),
+the consolidated claim (payouts round to 1/500/0 nano — zero-amount
+currencies are skipped by design), and the marketplace settle.
+
+**Next:** governance & dissolution safeguards, and wiring the
+explorer's live marketplace views against the §8.4 addresses.
