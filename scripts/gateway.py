@@ -1340,6 +1340,27 @@ a{{color:#1d4ed8}} li{{margin:6px 0}}</style></head><body>
     return body
 
 
+def fresh_pubkey():
+    """Generate a throwaway ed25519 keypair, return its public key, discard
+    the private half. Used only to derive a unique company address for a
+    test deploy (the company's real authority is the founder wallet + its
+    governing founders)."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".keys.json")
+    os.close(fd)
+    try:
+        out = tvm_cli("genphrase", "--dump", path)
+        if out.returncode != 0:
+            return {"error": out.stderr[:200]}
+        pub = json.load(open(path)).get("public", "")
+        return {"founderPubkey": ("0x" + pub) if pub else ""}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def deploy_form_page(addr):
     """Founder-wallet company deploy form (dev/ops only, requires --writes).
     Signing happens here on the gateway with scripts/.work/holder.keys.json;
@@ -1380,6 +1401,7 @@ the excess. Signing happens on this server with the gateway's key — it never l
 <label>founder pubkey (optional — a fresh 0x… pubkey makes a unique company address; the factory
 derives it from founder+pubkey, so reuse collides with existing companies)</label>
 <input id="f-pub" placeholder="0x…">
+<p><button type="button" id="f-fresh">generate a fresh key</button></p>
 <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
 <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-gov" style="width:auto">
 governance enabled</label>
@@ -1394,6 +1416,11 @@ sealed charter</label></div>
 <div id="out"></div>
 <script>
 var FORM=document.getElementById('df');
+document.getElementById('f-fresh').addEventListener('click',function(){{
+  fetch('/factory/{escape(addr)}/keygen').then(function(r){{return r.json()}}).then(function(j){{
+    if(j.founderPubkey)document.getElementById('f-pub').value=j.founderPubkey;
+  }});
+}});
 FORM.addEventListener('submit',function(e){{
   e.preventDefault();
   var plans=[];
@@ -1772,6 +1799,12 @@ class Handler(BaseHTTPRequestHandler):
                                       "text/plain", 403)
                 return self._send(deploy_form_page(addr).encode(),
                                   "text/html; charset=utf-8")
+            if len(parts) > 2 and parts[2] == "keygen":
+                if not ALLOW_WRITES:
+                    return self._send(b"writes disabled (run with --writes)",
+                                      "text/plain", 403)
+                return self._send(
+                    json.dumps(fresh_pubkey()).encode(), "application/json")
             if len(parts) > 2 and parts[2] == "companies.json":
                 return self._send(json.dumps({
                     "companies": load_companies_from(addr),

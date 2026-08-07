@@ -564,11 +564,23 @@ async function factoryPage(addr) {
         <div class="v"><select id="d-model"><option value="0">full-cap</option><option value="1">rounds</option></select></div></div>
       <p><input id="d-plans" placeholder="plans: count:weight:label, count:weight:label (comma-separated)" spellcheck="false"></p>
       <p><input id="d-pub" placeholder="founder pubkey (optional: a fresh 0x… key makes a unique company)" spellcheck="false"></p>
+      <p><button type="button" id="d-fresh" class="btn">generate a fresh founder key</button> — picks a unique company address so deploys never collide</p>
       <p><input id="d-init" value="20000000000" placeholder="initial value (raw)" spellcheck="false"></p>
       <p><button id="d-go" class="btn">deploy (≈30s settle)</button> <span class="mut" id="d-msg"></span></p>
     </div>` : ""}`;
     main.innerHTML = html;
     const go = document.getElementById("d-go");
+    const fresh = document.getElementById("d-fresh");
+    if (fresh) fresh.addEventListener("click", async () => {
+        const msg = document.getElementById("d-msg");
+        msg.textContent = "generating…";
+        try {
+            const r = await fetch(`${location.origin}/factory/${encodeURIComponent(addr)}/keygen`);
+            const j = await r.json();
+            if (j.founderPubkey) { document.getElementById("d-pub").value = j.founderPubkey; msg.textContent = "fresh founder key ready"; }
+            else msg.textContent = "keygen failed: " + (j.error || "?");
+        } catch (e) { msg.textContent = "keygen failed: " + e; }
+    });
     if (go) go.addEventListener("click", async () => {
         const msg = document.getElementById("d-msg");
         const plans = (document.getElementById("d-plans").value || "")
