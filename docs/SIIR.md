@@ -247,10 +247,19 @@ Protocol rule — pending dividends belong to the SIIR, not the holder:
 - No record-date snapshot, no per-holder accounting, no settlement on
   transfer. Only the SIIR's checkpoint ever changes.
 - Dividends are paid in **any ecc currency** that the network (or any
-  wallet's dapp) creates — SHELL (ecc id 2), eccUSDC (ecc id 3), NACKL
-  (ecc id 1), or a token that does not even exist yet. Ecc currencies
-  transfer across Dapp IDs, so contributors and holders are never bound
-  by the app boundary VMSHELL imposes.
+  wallet's dapp) creates — eccUSDC (ecc id 3), NACKL (ecc id 1), or a
+  token that does not even exist yet. Ecc currencies transfer across
+  Dapp IDs, so contributors and holders are never bound by the app
+  boundary VMSHELL imposes. **SHELL (ecc id 2) is the exception
+  (v2.5.0):** SHELL is the network's fuel — every contract entry
+  converts a slice of the caller's attached SHELL to gas — so it is
+  *never* a dividend. `depositDividends` first converts its own fuel
+  slice (the message pays for itself), then rejects any track whose
+  `currencyId == 2` with `ERR_BAD_DIVIDEND_CURRENCY` (133); the
+  company's headline treasury value is the first non-SHELL track, and
+  `claim` never settles a SHELL track. SHELL remains tradable on the
+  marketplace — it is barred from being a dividend, not from being a
+  currency.
 - The treasury is **currency-agnostic**: every currency id ever attached
   to a `depositDividends()` message becomes a payout track with its own
   dividend index, its own total deposited, and its own checkpoint per
@@ -259,6 +268,11 @@ Protocol rule — pending dividends belong to the SIIR, not the holder:
   `ERR_TOO_MANY_CURRENCIES` beyond that). A future token needs zero
   protocol changes — a wallet attaches its ecc id and holders claim it
   like any other.
+- **No recovery function (deliberate).** The protocol has no key
+  recovery or clawback path: a SIIR's pending dividends belong to the
+  SIIR, only its owner's wallet can claim them, and a lost key simply
+  means those dividends stay unclaimed. This is the design's stated
+  position, not a limitation to be patched.
 
 ## Transfer
 
@@ -372,11 +386,14 @@ end to end in one pass:
 6. `depositDividends(currencyIds)` credits the currencies the message
    actually carried (whatever ids the caller declared); each currency gets
    its own track, and its index rises by `amount * SCALE / totalWeight`.
+   SHELL (ecc id 2) is rejected with `ERR_BAD_DIVIDEND_CURRENCY` — it is
+   fuel, never a dividend (v2.5.0).
 7. `claim(ids)` pays the holder its share of **every** active track in one
    transfer, exactly `weight * index / SCALE` per track (verified live:
-   a 1000-weight SIIR of 100000 total collects 0.1 SHELL, 50 eccUSDC and
-   0.01 NACKL per 10-SHELL / 5000-USDC / 1-NACKL deposit, all in one
-   claim; `getDividendCurrencies()` lists every track).
+   a 1000-weight SIIR of 100000 total collects 50 eccUSDC and 0.01 NACKL
+   per 5000-USDC / 1-NACKL deposit, all in one claim — the same run under
+   v2.1 also paid 0.1 SHELL per 10-SHELL deposit, which v2.5.0
+   deliberately forbids; `getDividendCurrencies()` lists every track).
 
 Model B (rounds) is verified too: Genesis → Round 1 → Round 2 issue
 50/1000 → 75/200000 → 100/200000, each `issue()` minting exactly the next

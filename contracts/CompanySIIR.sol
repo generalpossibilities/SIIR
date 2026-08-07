@@ -51,6 +51,14 @@
  * design — key-signed externals cannot carry currencies on this network —
  * and run on the small native reserve the company received at deployment,
  * which the founder's deploy SHELL funded.
+ *
+ * v2.5: SHELL is fuel, never a dividend. depositDividends rejects
+ * currencyId 2 (ERR_BAD_DIVIDEND_CURRENCY): the attached SHELL still pays
+ * the entry's gas, but no SHELL dividend track can ever form — dividends
+ * are paid in any other ecc currency (eccUSDC=3, NACKL=1, ...). getCompanyInfo
+ * reports the first non-SHELL track. Key-loss stance (by design): no
+ * recovery function exists; a lost wallet key means the SIIRs' dividends
+ * are lost with it — the register and history stay immutable.
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
@@ -60,13 +68,14 @@ import "./SIIRFuel.sol";
 
 contract CompanySIIR is SIIRFuel {
     // ---------- constants ----------
-    string constant version = "2.4.0";
+    string constant version = "2.5.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
 
     // SHELL is ecc currency id 2 (the computation token, cross-DAPP transferable).
-    // eccUSDC (TIP-3-style ecc id 3) is the second supported dividend currency.
+    // v2.5: SHELL is FUEL ONLY — never a dividend track. Dividend currencies
+    // are any other ecc id (eccUSDC=3, NACKL=1, or a token created later).
     // CURRENCY_SHELL is inherited from SIIRFuel.
     uint32 constant CURRENCY_USDC  = 3;
 
@@ -108,6 +117,7 @@ contract CompanySIIR is SIIRFuel {
     uint16 constant ERR_BAD_DISSOLUTION   = 130;
     uint16 constant ERR_ALREADY_GRANTED   = 131;
     uint16 constant ERR_NOT_GRANTED       = 132;
+    uint16 constant ERR_BAD_DIVIDEND_CURRENCY = 133;
 
     // Dissolution grace period: claims stay open this long after the company
     // dissolves, then the founder may sweep the unclaimed treasury.
@@ -647,8 +657,9 @@ contract CompanySIIR is SIIRFuel {
     }
 
     // ---------- treasury / dividends ----------
-    /// Anyone may deposit SHELL (ecc currency id 2) and/or eccUSDC (ecc
-    /// currency id 3). Unlike VMSHELL, these transfer across Dapp IDs, so
+    /// Anyone may deposit dividends in any ecc currency except SHELL (ecc
+    /// currency id 2 — SHELL is fuel by design and can never be a dividend).
+    /// eccUSDC (3), NACKL (1) or any future token transfer across Dapp IDs, so
     /// contributors are never bound by app boundaries. Each track has its own
     /// index; the deposit is split by what the message actually carried.
     function depositDividends(uint32[] currencyIds) public internalMsg {
@@ -658,10 +669,11 @@ contract CompanySIIR is SIIRFuel {
         // distribution the founder may still deposit during the grace period.
         require(!_finalized && (!_dissolved || !_finalDeposited), ERR_REGISTER_FROZEN);
         tvm.accept();
-        // The attached SHELL IS the dividend: convert only a small fuel slice
-        // (own gas + slack) and credit the rest to the treasury. Deposits in
-        // other currencies run on the company's deploy reserve — the company
-        // is receiving value, not spending it.
+        // The attached SHELL pays the entry's gas: convert only a small fuel
+        // slice (own gas + slack) and leave the rest to be refunded — SHELL
+        // is never credited to a dividend track. Deposits in other
+        // currencies run on the company's deploy reserve — the company is
+        // receiving value, not spending it.
         uint128 inboundShell = uint128(msg.currencies[CURRENCY_SHELL]);
         uint128 fuelSlice = _fuelOwn();
         uint128 convert = inboundShell > fuelSlice ? fuelSlice : inboundShell;
@@ -670,10 +682,8 @@ contract CompanySIIR is SIIRFuel {
         }
         for (uint256 i = 0; i < currencyIds.length; i++) {
             uint32 cur = currencyIds[i];
+            require(cur != CURRENCY_SHELL, ERR_BAD_DIVIDEND_CURRENCY);
             uint128 amount = uint128(msg.currencies[cur]);
-            if (cur == CURRENCY_SHELL) {
-                amount = amount > convert ? amount - convert : 0;
-            }
             if (amount == 0) continue;
             require(_divCurrencies.length < MAX_DIV_CURRENCIES ||
                     _dividendIndex.exists(cur), ERR_TOO_MANY_CURRENCIES);
@@ -691,10 +701,11 @@ contract CompanySIIR is SIIRFuel {
     }
 
     /// Claim pending dividends for owned SIIRs. Every active payout track is
-    /// settled in one transfer: the caller receives its share of SHELL,
-    /// eccUSDC, and any other currency the company treasury has ever received
-    /// — in the same message, so funds arrive at the wallet on any Dapp ID,
-    /// including currency ids created after this company was deployed.
+    /// settled in one transfer: the caller receives its share of eccUSDC,
+    /// NACKL, and any other non-SHELL currency the company treasury has ever
+    /// received — in the same message, so funds arrive at the wallet on any
+    /// Dapp ID, including currency ids created after this company was
+    /// deployed. SHELL is never a track (v2.5).
     function claim(uint256[] ids) public internalMsg {
         require(!_finalized, ERR_REGISTER_FROZEN);
         mapping(uint32 => uint128) totals;
@@ -757,11 +768,20 @@ contract CompanySIIR is SIIRFuel {
         uint128 dividendCount,
         uint256 nextId
     ) {
+        // v2.5: the scalar headline is the FIRST non-SHELL track (SHELL is
+        // fuel, never a dividend); 0 when no dividends have ever been paid.
+        uint128 divIndex = 0;
+        uint128 depositedTotal = 0;
+        if (_divCurrencies.length > 0) {
+            uint32 primary = _divCurrencies[0];
+            divIndex = _dividendIndex[primary];
+            depositedTotal = _deposited[primary];
+        }
         return (
             _name, _description, _website, _metadataUri,
             _factory, _founder, _founderPubkey,
             _issuanceModel, _totalWeight, _issuedCount,
-            _dividendIndex[CURRENCY_SHELL], _deposited[CURRENCY_SHELL],
+            divIndex, depositedTotal,
             uint128(_divCurrencies.length), _nextId
         );
     }

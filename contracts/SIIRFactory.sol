@@ -33,7 +33,7 @@ import "./SIIRMarketplace.sol";
 import "./SIIRFuel.sol";
 
 contract SIIRFactory is SIIRFuel {
-    string constant version = "2.4.0";
+    string constant version = "2.5.0";
 
     uint16 constant ERR_NOT_OWNER = 200;
     uint16 constant ERR_BAD_ARGS   = 201;

@@ -14,6 +14,7 @@
 */
 
 const NET = "shellnet.ackinacki.org";
+const GATEWAY_DEPLOY = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(location.hostname || "");
 const main = document.getElementById("main");
 const inp = document.getElementById("q");
 const sug = document.getElementById("suggest");
@@ -41,6 +42,30 @@ function fmtBig(v) {
 function tok(id) {
     const t = tokenOf(id);
     return t ? `<span class="tok ${t[1]}">${t[0]}</span>` : `<span class="tok ot">${esc(id)}</span>`;
+}
+
+// v2.5: SHELL (ecc 2) is network fuel by design — never a dividend. Drop it
+// from every treasury/claim view (old companies may still carry a SHELL
+// track from before the rule; the UI never presents it as a dividend).
+function noShellTracks(ids, indices, deposits) {
+    const out = {ids: [], indices: [], deposits: []};
+    for (let i = 0; i < ids.length; i++) {
+        if (String(ids[i]) === "2") continue;
+        out.ids.push(ids[i]);
+        out.indices.push(indices[i]);
+        out.deposits.push(deposits[i]);
+    }
+    return out;
+}
+
+function noShellPairs(cur, amt) {
+    const c = [], a = [];
+    for (let i = 0; i < cur.length; i++) {
+        if (String(cur[i]) === "2") continue;
+        c.push(cur[i]);
+        a.push(amt[i]);
+    }
+    return [c, a];
 }
 
 function toast(msg) {
@@ -328,8 +353,9 @@ function overviewSection(ms, c, plans, div, content, fp) {
     const grid = `<div class="grid">${
         kvs.map(([k, v]) => `<div class="kv"><div class="k">${esc(k)}</div><div class="v addr">${esc(v)}</div></div>`).join("")
     }</div>`;
+    const divs = noShellTracks(div.ids, div.indices, div.deposits);
     const divsTable = `<table><tbody><tr><th>currency</th><th>index</th><th>deposited</th></tr>${
-        div.ids.map((id, i) => `<tr><td>${tok(id)}</td><td>${fmtBig(div.indices[i])}</td><td>${fmtBig(div.deposits[i])}</td></tr>`).join("")
+        divs.ids.map((id, i) => `<tr><td>${tok(id)}</td><td>${fmtBig(divs.indices[i])}</td><td>${fmtBig(divs.deposits[i])}</td></tr>`).join("")
     }</tbody></table>`;
     const plansTable = `<table><tbody><tr><th>plan</th><th>count</th><th>weight</th><th>issued</th></tr>${
         plans.map((p) => `<tr><td>${esc(p.label)}</td><td>${esc(p.count)}</td><td>${esc(p.weight)}</td><td>${p.issued ? "yes" : "no"}</td></tr>`).join("")
@@ -415,7 +441,7 @@ async function siirPage(addr, id) {
     if (!ms._decoded) return errCard(ms.error);
     const s = ms.siir(id);
     if (!s) return error("SIIR #" + esc(id) + " not found.");
-    const [cur, amt] = ms.claimable(id);
+    const [cur, amt] = noShellPairs(...ms.claimable(id));
     const hist = ms.history(id);
     let fp = "…";
     try { fp = await ms.fingerprint(id); } catch {}
@@ -441,7 +467,7 @@ async function holderPage(addr, owner) {
     const ranges = ms.idsOf(owner);
     if (ranges.length === 0) return error("No SIIRs for " + esc(owner));
     const total = ms.balanceOf(owner);
-    const [cur, amt] = ms.claimableOf(owner);
+    const [cur, amt] = noShellPairs(...ms.claimableOf(owner));
     let rows;
     if (total <= 200n) {
         const ids = [];
@@ -528,8 +554,54 @@ async function factoryPage(addr) {
     </div>
     <div class="card"><h2 id="fcount">registered (${companies.length})</h2>
       <table id="frows"><tbody><tr><th>#</th><th>name</th><th>model</th><th>company (dapp::acct)</th></tr>${rows}</tbody></table></div>
-    ${companies.length ? "" : '<div class="err">no companies registered in this factory yet.</div>'}`;
+    ${companies.length ? "" : '<div class="err">no companies registered in this factory yet.</div>'}
+    ${GATEWAY_DEPLOY ? `
+    <div class="card"><h2>deploy a company</h2>
+      <p class="mut">signed on the gateway with its wallet key (${esc(location.host)}) — never sent to your browser's client. needs fuel in the gateway wallet.</p>
+      <p><input id="d-name" placeholder="company name" spellcheck="false"></p>
+      <p><input id="d-desc" placeholder="one-line description" spellcheck="false"></p>
+      <div class="kv"><div class="k">model</div>
+        <div class="v"><select id="d-model"><option value="0">full-cap</option><option value="1">rounds</option></select></div></div>
+      <p><input id="d-plans" placeholder="plans: count:weight:label, count:weight:label (comma-separated)" spellcheck="false"></p>
+      <p><input id="d-pub" placeholder="founder pubkey (optional: a fresh 0x… key makes a unique company)" spellcheck="false"></p>
+      <p><input id="d-init" value="20000000000" placeholder="initial value (raw)" spellcheck="false"></p>
+      <p><button id="d-go" class="btn">deploy (≈30s settle)</button> <span class="mut" id="d-msg"></span></p>
+    </div>` : ""}`;
     main.innerHTML = html;
+    const go = document.getElementById("d-go");
+    if (go) go.addEventListener("click", async () => {
+        const msg = document.getElementById("d-msg");
+        const plans = (document.getElementById("d-plans").value || "")
+            .split(",").map((s) => s.trim()).filter(Boolean).map((s) => {
+                const [count, weight, label] = s.split(":").map((x) => x.trim());
+                return { count: parseInt(count, 10) || 0, weight: parseInt(weight, 10) || 0, label: label || "" };
+            });
+        const body = {
+            name: document.getElementById("d-name").value.trim(),
+            description: document.getElementById("d-desc").value.trim(),
+            issuanceModel: parseInt(document.getElementById("d-model").value, 10),
+            initialValue: parseInt(document.getElementById("d-init").value, 10) || 20000000000,
+            founderPubkey: document.getElementById("d-pub").value.trim() || null,
+            plans,
+        };
+        if (!body.name || !plans.length) { msg.textContent = "need a name and at least one plan"; return; }
+        msg.textContent = "sending…";
+        go.disabled = true;
+        try {
+            const r = await fetch(`${location.origin}/factory/${encodeURIComponent(addr)}/deploy`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            const j = await r.json();
+            if (j.error) { msg.textContent = "error: " + j.error; go.disabled = false; return; }
+            msg.textContent = "deployed — " + (j.company || "?");
+            msg.innerHTML = `<a href="#/company/${esc(j.company || "")}">open ${esc(j.company ? j.company.split("::")[1].slice(0, 8) : "")}…</a>`;
+            setTimeout(() => loadFactory(addr).then((f) => f._decoded && factoryPage(addr)), 32000);
+        } catch (e) {
+            msg.textContent = "failed: " + e;
+        }
+        go.disabled = false;
+    });
     const box = document.getElementById("fsearch");
     if (!box) return;
     box.addEventListener("keyup", () => {

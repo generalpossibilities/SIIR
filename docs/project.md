@@ -796,7 +796,84 @@ body via tvm-cli, sends it through the holder wallet with the deploy fuel
 current factory with a fresh `founderPubkey` — the predicted company
 came up Active with the 20e9 reserve. (Pitfall: the same founder pubkey
 re-derives the same address, so a "new" deploy can silently hit an old
-company — tests must use a fresh pubkey.)
+company — tests must use a fresh pubkey. Second pitfall, found in the
+v2.5 browser-form work: `deployCompany` is `onlyOwnerOrFounder` and must
+be delivered to the **factory**, not to the predicted company address —
+sending it to the child creates a code-less value account instead; fixed
+in §8.9 and re-verified live.)
+
+---
+
+### 8.9 SHELL is never a dividend, gateway analytics, and the browser deploy form (v2.5.0)
+
+**SHELL is fuel, not a dividend.** SHELL (ecc id 2) is the network's
+computation currency: every contract entry converts just enough of the
+caller's attached SHELL to gas (§8.8). v2.5.0 makes the division of
+labour explicit on-chain: `depositDividends` first converts its fuel
+slice (the message still pays for itself), then *rejects* any track
+whose `currencyId == 2` with `ERR_BAD_DIVIDEND_CURRENCY = 133` —
+dividends exist only in non-fuel currencies (NACKL, eccUSDC, future
+tokens). `getCompanyInfo`'s headline treasury now reports the first
+non-SHELL track (0 if none), and `claim` never sees a SHELL track.
+SHELL stays tradable on the marketplace — it is only barred from being
+a dividend. The gateway and the browser explorer both filter SHELL out
+of holder/claimable/treasury views (`non_shell_tracks`, `non_shell_pairs`,
+`noShellTracks`, `noShellPairs`). Verified live: the deployed company's
+old SHELL track no longer appears in `analytics.json`.
+
+**No recovery function (deliberate).** Lost founder or wallet keys mean
+the dividends parked on those SIIRs are unreachable — the protocol has
+no key-recovery or clawback path, by design: a SIIR's pending dividends
+belong to the SIIR, and only the owner of the register can claim.
+Operators should document this for participants (it is the flip side
+of "pending dividends price into the trade").
+
+**Gateway analytics & statements (read-only).** Three new endpoints,
+all mirror-decoded (no on-chain oracles, no extra writes):
+- `GET /marketplace/<addr>/stats.json` — per-currency live order-book
+  summary: best bid/ask, mark (mid, or the live side when only one
+  exists), spread, open bid/ask counts and values. No last-trade or
+  volume: Acki Nacki keeps no on-chain trade history, so valuation is
+  mark-only, by design.
+- `GET /company/<addr>/analytics.json` — issuance, per-currency
+  treasury tracks with `dividendsPer1000Weight = 1000·index/1e9`,
+  current marks read from the factory's marketplace, charter
+  fingerprint, contract version. (Pitfall: the mirror decodes the
+  company's `_factory` as legacy `0:<hex>` — normalize to the
+  self-rooted `<hex>::<hex>` before factory calls.)
+- `GET /company/<addr>/holder/<owner>/statement.csv` — per-holder
+  statement (owned ids with weight, per-currency claimable, bounded
+  history) for spreadsheets. Registers can hold 10B ids as one range,
+  so rows are **sampled** (first 50 ids per range + a range row): an
+  earlier unbounded `list(range(...))` raised MemoryError on a 10B
+  register and was fixed this way.
+
+Both the index and the marketplace page now render a "market stats"
+card from `stats.json` (empty-book placeholder when no orders are open).
+
+**Browser deploy form (P1.8 done).** The gateway gained
+`GET /factory/<addr>/deploy` — a form page (only under `--writes`) that
+POSTs JSON to the existing deploy endpoint; signing happens server-side
+with `scripts/.work/holder.keys.json` and the key never leaves the
+server. The browser bundle shows a matching "deploy a company" card on
+its factory page when it is served from the gateway (localhost only).
+The form gained an optional `founderPubkey` field after the first live
+test: the default (gateway wallet + its pubkey) re-derived the address
+of an existing company and the factory correctly refused to clobber it.
+A full e2e with a fresh pubkey then deployed a company Active with code
+and registry entry; it was dissolved afterwards and is settling. Along
+the way the deploy endpoint's delivery bug surfaced (§8.8): the message
+must reach the factory, and `txid` must be read from `tx_hash` (tvm-cli
+`callx` output, not `Transaction.id`).
+
+**Live deployment (v2.5.0 contracts, kept as-is).** No redeploy: the
+running shellnet stack remains the v2.4.0-era factory `d0f0bb83…`
+self-rooted, NJD Ventures `…::a334e243…`, rounds `…::4967f8e1…`,
+marketplace `…::3f1cc88a…`. The v2.5.0 contracts build fresh
+(`CompanySIIR.tvc`, `SIIRFactory.tvc`) but are not deployed; the next
+`deploy.sh` run will notice `factory_stale` and bring the chain to
+v2.5.0. Analytics read live state across both generations (the old
+company's getters decode fine under the new ABI).
 
 ---
 
@@ -870,3 +947,14 @@ explorer's deploy form is the remaining UI flow (TODO P1.8). Current
 shellnet deployment (v2.4.0 stack): factory `d0f0bb83…` self-rooted,
 demo company `d0f0bb83…::a334e243…` (10B SIIRs, operating), rounds
 company `d0f0bb83…::4967f8e1…`, marketplace `d0f0bb83…::3f1cc88a…`.
+
+**v2.5.0 (SHELL is never a dividend; analytics; browser deploy form,
+§8.9):** `depositDividends` rejects SHELL tracks with
+`ERR_BAD_DIVIDEND_CURRENCY = 133` (fuel slice still converts first);
+`getCompanyInfo` headlines the first non-SHELL track; gateway and
+browser filter SHELL out of all dividend views. The gateway ships
+market/book stats, company analytics and per-holder CSV statements
+(10B-safe bounded sampling), plus the browser deploy form page —
+verified end-to-end live (deploy → Active → dissolve), after fixing
+the endpoint's deliver-to-the-factory bug. Contracts build at v2.5.0
+but the live deployment stays on the v2.4.0 stack (no redeploy).

@@ -397,8 +397,8 @@ else
   cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 fi
 
-# ---------- 8. deposit dividends (10 SHELL + 5,000 eccUSDC) ----------
-echo "== 8. deposit 10 SHELL + 5000 eccUSDC + 1 NACKL dividends =="
+# ---------- 8. deposit dividends (5,000 eccUSDC + 1 NACKL; SHELL = fuel only) ----------
+echo "== 8. deposit 5000 eccUSDC + 1 NACKL dividends (SHELL is fuel, never a dividend) =="
 # the founder wallet must actually hold every attached currency (ecc 2, 3, 1)
 topup_shell "$FOUNDER" 30000000000 "founder"
 # the founder wallet must actually hold every attached currency (ecc 2, 3, 1);
@@ -420,12 +420,13 @@ sleep 3
 div_dep() { cli run "$COMPANY" getDividendCurrencies {} --abi "$CT/CompanySIIR.abi.json" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); ids=d.get('ids') or d.get('value0') or []; deps=d.get('deposits') or d.get('value2') or []; print(deps[ids.index('$1')] if '$1' in ids else 0)" 2>/dev/null || echo 0; }
 PRE_USDC=$(div_dep 3)
-# v2.3.0: the attached SHELL is the dividend; only the fuel slice (gas +
-# slack, ~1 VMSHELL) is converted, the rest is credited to the treasury.
-# The +F_OP margin simply guarantees the slice never eats the dividend.
+# v2.5.0: SHELL is fuel only — never a dividend. The attached SHELL pays the
+# entry's gas (a small slice is converted, the rest refunded); dividends are
+# declared in eccUSDC (3) + NACKL (1). The +F_OP margin guarantees the fuel
+# slice never eats into anything.
 cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":$((10000000000 + F_OP)),\"3\":5000000000000,\"1\":1000000000},\"bounce\":true,\"flags\":1,\
-    \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["2","3","1"]}')\"}" >/dev/null || true
+  "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":$F_OP,\"3\":5000000000000,\"1\":1000000000},\"bounce\":true,\"flags\":1,\
+    \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["3","1"]}')\"}" >/dev/null || true
 for attempt in $(seq 1 15); do
   NOW_USDC=$(div_dep 3)
   [ "$NOW_USDC" != "$PRE_USDC" ] && break
@@ -437,7 +438,7 @@ cli run "$COMPANY" getDividendCurrencies {} --abi "$CT/CompanySIIR.abi.json"
 cli run "$COMPANY" getClaimable '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
 
 # ---------- 9. claim ----------
-echo "== 9. holder claims (SHELL + eccUSDC + NACKL in one transfer) =="
+echo "== 9. holder claims (eccUSDC + NACKL in one transfer; SHELL is fuel only) =="
 # v2.3.0 claimer-pays: the attached SHELL funds the payout envelope; the
 # claim never drains the company reserve. VMSHELL comes from bootstrap.
 topup_shell "$HOLDER" 20000000000 "holder"
@@ -737,11 +738,11 @@ if [ "${DEMO_DISSOLUTION:-0}" = "1" ]; then
     echo "  after dissolve: $(GOV_FMT)"
   fi
   # 14d. one final distribution may still be deposited during the grace period
-  # (1 VMSHELL dividend + fuel slice; a bare 1e9 would be fully converted and
-  # rejected as ERR_NOTHING_DEPOSITED)
+  # (1 eccUSDC dividend + SHELL fuel slice; a bare 1e9 of SHELL alone would
+  # be rejected as ERR_BAD_DIVIDEND_CURRENCY — SHELL is never a dividend)
   cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":$((1000000000 + F_OP))},\"bounce\":true,\"flags\":1,\
-      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["2"]}')\"}" >/dev/null || true
+    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":$F_OP,\"3\":1000000000},\"bounce\":true,\"flags\":1,\
+      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" depositDividends '{"currencyIds":["3"]}')\"}" >/dev/null || true
   sleep 3
   FD=$(GOV | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("_finalDeposited","?")).lower())' 2>/dev/null || echo "?")
   [ "$FD" = "true" ] && echo "  [ok] one final distribution accepted after dissolution" || echo "  [fail] final deposit rejected (finalDeposited=$FD)"

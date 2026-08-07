@@ -22,8 +22,12 @@ tvm-cli getters) and serves:
   GET /company/<addr>/claim               claim form for the gateway's wallet
   POST /company/<addr>/claim              send claim() via the wallet (JSON body {"ids":[...]} or form)
   POST /factory/<addr>/deploy             deployCompany via the founder wallet (JSON body; mirrors deploy.sh §4)
+  GET /factory/<addr>/deploy              deploy form page (--writes only; posts JSON to the same URL)
   GET /company/<addr>/plans, /treasury, /history/<id>   JSON
   GET /company/<addr>/search?q=...        address -> holder page; else label/metadata/owner scan
+  GET /marketplace/<addr>/stats.json      per-currency order-book summary (best bid/ask, mark, spread, opens)
+  GET /company/<addr>/analytics.json      issuance + treasury tracks + marks + charter fingerprint (+ /statement)
+  GET /company/<addr>/holder/<owner>/statement.csv   per-holder CSV statement (ranges sampled: first 50 ids)
 
 Everything served here is stored on-chain; nothing is cached by us for
 longer than a few seconds. Claim signs with scripts/.work/holder.keys.json
@@ -634,7 +638,8 @@ def holder_data(addr, owner_raw):
         "company": info.get("name", ""),
         "balance": str(balance),
         "siirs": rows,
-        "claimable": list(zip(claim.get("currencies", []), claim.get("amounts", []))),
+        "claimable": non_shell_pairs(zip(claim.get("currencies", []),
+                                         claim.get("amounts", []))),
     }
 
 
@@ -650,7 +655,8 @@ def siir_data(addr, id_s):
     out = {"id": sid, "fingerprint": fp.get("fp", "")}
     for k in ("weight", "owner", "createdAt", "round", "label", "metadataUri"):
         out[k] = s.get(k)
-    out["claimable"] = list(zip(cl.get("currencies", []), cl.get("amounts", [])))
+    out["claimable"] = non_shell_pairs(zip(cl.get("currencies", []),
+                                           cl.get("amounts", [])))
     out["history"] = h.get("entries", [])
     return out
 
@@ -661,8 +667,7 @@ def full_data(addr):
     ver = run_getter(addr, "getVersion") or {}
     return {
         "company": run_getter(addr, "getCompanyInfo") or {},
-        "treasury": list(zip(divs.get("ids", []), divs.get("indices", []),
-                             divs.get("deposits", []))),
+        "treasury": non_shell_tracks(divs),
         "plans": (run_getter(addr, "getPlans") or {}).get("plans", []),
         "content": ci,
         "version": ver.get("value0", ""),
@@ -671,6 +676,160 @@ def full_data(addr):
 
 def claimable_pairs(pairs):
     return [f"ecc:{escape(str(c))} = {escape(str(a))}" for c, a in pairs]
+
+
+# v2.5: SHELL (ecc 2) is network fuel by design — it can never be a
+# dividend. Filter it out of every treasury/claim view (old companies may
+# still carry a SHELL track from before the rule; the UI must not present
+# it as a dividend).
+def non_shell_pairs(pairs):
+    return [(c, a) for c, a in pairs if as_int(c) != 2]
+
+
+def non_shell_tracks(divs):
+    return [
+        (c, i, d) for c, i, d in zip(divs.get("ids", []), divs.get("indices", []),
+                                    divs.get("deposits", []))
+        if as_int(c) != 2
+    ]
+
+
+# ---------- market analytics (live order book; no on-chain history) ----------
+
+def market_stats(mkt):
+    """Per-currency book summary from the marketplace's CURRENT state:
+    best bid/ask, mark (mid when both sides exist, else the live side),
+    spread, open counts and value. There is no on-chain trade history, so
+    volume/last-trade are deliberately absent — the book is the market."""
+    listings = run_getter(mkt, "getListings", abi=MARKETPLACE_ABI) or {}
+    bids = run_getter(mkt, "getBids", abi=MARKETPLACE_ABI) or {}
+    book = {}
+    for price, cid, act in zip(listings.get("askPrice", []),
+                               listings.get("currencyId", []),
+                               listings.get("active", [])):
+        if not act:
+            continue
+        s = book.setdefault(str(cid), {"currency": str(cid), "bestAsk": None,
+                                       "bestBid": None, "openAsks": 0,
+                                       "openBids": 0, "askValue": 0,
+                                       "bidValue": 0, "mark": None})
+        p = as_int(price)
+        if s["bestAsk"] is None or p < s["bestAsk"]:
+            s["bestAsk"] = p
+        s["openAsks"] += 1
+        s["askValue"] += p
+    for price, cid, acc in zip(bids.get("price", []),
+                               bids.get("currencyId", []),
+                               bids.get("accepted", [])):
+        if acc:
+            continue
+        s = book.setdefault(str(cid), {"currency": str(cid), "bestAsk": None,
+                                       "bestBid": None, "openAsks": 0,
+                                       "openBids": 0, "askValue": 0,
+                                       "bidValue": 0, "mark": None})
+        p = as_int(price)
+        if s["bestBid"] is None or p > s["bestBid"]:
+            s["bestBid"] = p
+        s["openBids"] += 1
+        s["bidValue"] += p
+    for s in book.values():
+        bb, ba = s["bestBid"], s["bestAsk"]
+        if bb is not None and ba is not None:
+            s["mark"] = (bb + ba) // 2
+            s["spread"] = ba - bb
+        elif bb is not None:
+            s["mark"] = bb
+        elif ba is not None:
+            s["mark"] = ba
+        for k in ("bestAsk", "bestBid", "mark", "askValue", "bidValue", "spread"):
+            if s[k] is not None:
+                s[k] = str(s[k])
+    return book
+
+
+def company_analytics(addr):
+    """Compliance/valuation report for one company: issuance, treasury
+    (SHELL excluded), dividends paid per 1000-weight to date, and the
+    current mark from the factory's marketplace book."""
+    info = run_getter(addr, "getCompanyInfo") or {}
+    divs = run_getter(addr, "getDividendCurrencies") or {}
+    plans = (run_getter(addr, "getPlans") or {}).get("plans", [])
+    charter = run_getter(addr, "getCharter") or {}
+    ver = run_getter(addr, "getVersion") or {}
+    total_weight = as_int(info.get("totalWeight"), 1) or 1
+    tracks = []
+    for cid, idx, dep in non_shell_tracks(divs):
+        idx_i = as_int(idx)
+        div1000 = 1000 * idx_i // 1000000000
+        tracks.append({"currency": str(cid), "deposited": str(dep),
+                       "index": str(idx),
+                       "dividendsPer1000Weight": str(div1000)})
+    factory = (info.get("factory") or "").strip()
+    mkt = ""
+    marks = {}
+    if factory:
+        # the decoded address is legacy "0:<hex>"; the factory is
+        # self-rooted, so the full form is <hex>::<hex>
+        if factory.startswith("0:"):
+            factory = factory[2:]
+        if "::" not in factory:
+            factory = f"{factory}::{factory}"
+        mkt = (run_getter(factory, "getMarketplaceAddress",
+                          abi=FACTORY_ABI) or {}).get("value0", "")
+        book = market_stats(mkt)
+        for cid, s in book.items():
+            if s.get("mark") is not None:
+                marks[cid] = s
+    return {
+        "company": addr,
+        "name": info.get("name", ""),
+        "issued": str(info.get("issuedCount", "")),
+        "totalWeight": str(info.get("totalWeight", "")),
+        "dividendTracks": tracks,
+        "marks": marks,
+        "marketplace": mkt,
+        "plans": plans,
+        "charterRatified": charter.get("ratified", False),
+        "charterFingerprint": (run_getter(addr, "getCharterFingerprint")
+                               or {}).get("fp", ""),
+        "version": ver.get("value0", ""),
+        "generatedAt": int(time.time()),
+    }
+
+
+def holder_statement_csv(addr, owner_raw):
+    """Per-holder statement: every owned id (or range head) with weight,
+    per-currency claimable, and per-id history rows — CSV for spreadsheets.
+    Ranges are sampled (first ids only) so 10B-id registers stay bounded."""
+    owner = owner_raw.split(":")[-1]
+    d = holder_data(addr, owner)
+    out = ["id,weight,round,currency,claimable"]
+    for row in d.get("siirs", []):
+        start = row["id"]
+        end = row.get("idEnd", start)
+        for i in range(start, min(end, start + 49) + 1):
+            for cur, amt in d.get("claimable", []):
+                if str(cur) == "2":
+                    continue
+                out.append(f"{i},{row.get('weight','')},{row.get('round','')},"
+                           f"{cur},{amt}")
+        if end > start + 49:
+            out.append(f"{start}–{end},(range, first 50 listed),,,")
+    out.append("")
+    out.append("history: id,timestamp,from,to")
+    for row in d.get("siirs", []):
+        start = row["id"]
+        end = row.get("idEnd", start)
+        for i in range(start, min(end, start + 49) + 1):
+            h = (run_getter(addr, "getHistory", '{"id":%d}' % i) or {})
+            for e in h.get("entries", [])[:10]:
+                out.append(f"{i},{e.get('timestamp','')},{e.get('from','')},"
+                           f"{e.get('to','')}")
+    out.append("")
+    out.append(f"owner,{owner}")
+    out.append(f"company,{d.get('company','')}")
+    out.append(f"balance,{d.get('balance','')}")
+    return "\n".join(out) + "\n"
 
 
 # ---------- wallet (claim) ----------
@@ -726,10 +885,10 @@ def pending_for(addr, ids):
     total = 0
     for i in ids:
         cl = run_getter(addr, "getClaimable", '{"id":%d}' % i) or {}
-        total += sum(as_int(a) for a in cl.get("amounts", []))
+        pairs = non_shell_pairs(zip(cl.get("currencies", []),
+                                    cl.get("amounts", [])))
+        total += sum(as_int(a) for _, a in pairs)
     return total
-
-
 ALLOW_WRITES = False
 WRITE_RATE = (10, 60)  # max requests per window (per IP) on write endpoints
 _write_hits = {}
@@ -841,7 +1000,9 @@ def do_deploy(factory, req):
     except (json.JSONDecodeError, KeyError):
         return {"error": f"failed to build deployCompany body: {body.stdout[:200]}"}
     tx = {
-        "dest": "0:" + company.split(":")[-1],
+        # deployCompany must reach the factory (onlyOwnerOrFounder path): the
+        # factory converts the attached SHELL to fuel and deploys the child
+        "dest": "0:" + factory.split("::")[-1],
         "value": str(DEPLOY_NATIVE),
         "cc": {"2": str(F_DEPLOY)},
         "bounce": True,
@@ -853,7 +1014,7 @@ def do_deploy(factory, req):
     if out.returncode != 0:
         return {"error": f"sendTransaction failed: {out.stderr[:300]}"}
     try:
-        txid = (json.loads(out.stdout).get("Transaction") or {}).get("id", "")
+        txid = (json.loads(out.stdout) or {}).get("tx_hash", "")
     except json.JSONDecodeError:
         txid = ""
     dapp = factory.split("::")[0]
@@ -933,7 +1094,8 @@ def claim_form_page(addr):
     rows = ""
     for i in ids:
         cl = run_getter(addr, "getClaimable", '{"id":%d}' % i) or {}
-        pairs = list(zip(cl.get("currencies", []), cl.get("amounts", [])))
+        pairs = non_shell_pairs(zip(cl.get("currencies", []),
+                                    cl.get("amounts", [])))
         total = sum(as_int(a) for _, a in pairs)
         if total > 0:
             rows += (f'<tr><td><input type="checkbox" name="ids" value="{i}" checked></td>'
@@ -1128,8 +1290,7 @@ def explore_page(addr, qs):
     )
     trows = "".join(
         f"<tr><td>ecc:{escape(str(c))}</td><td>{escape(str(i))}</td><td>{escape(str(d))}</td></tr>"
-        for c, i, d in zip(divs.get("ids", []), divs.get("indices", []),
-                           divs.get("deposits", []))
+        for c, i, d in non_shell_tracks(divs)
     )
     prows = "".join(
         f"<tr><td>{escape(str(p.get('label','')))}</td>"
@@ -1179,6 +1340,99 @@ a{{color:#1d4ed8}} li{{margin:6px 0}}</style></head><body>
     return body
 
 
+def deploy_form_page(addr):
+    """Founder-wallet company deploy form (dev/ops only, requires --writes).
+    Signing happens here on the gateway with scripts/.work/holder.keys.json;
+    the private key never leaves the server. POSTs JSON to the same URL."""
+    w = gateway_wallet()
+    wallet = (w[0] if w else "") or ""
+    plans_rows = "".join(
+        '<tr><td><input name="p-count" class="num" value="1" placeholder="count"></td>'
+        '<td><input name="p-weight" class="num" value="1000" placeholder="weight"></td>'
+        '<td><input name="p-label" placeholder="label (e.g. early birds)"></td></tr>'
+        for _ in range(3))
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>deploy company — SIIR</title>
+<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 16px;color:#111}}
+label{{display:block;margin:10px 0 4px;font-weight:600;font-size:14px}}
+input,select,textarea{{width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;font:13px ui-monospace,Menlo,Consolas,monospace}}
+input.num{{width:110px}} table{{border-collapse:collapse;width:100%}} td{{padding:4px}}
+button{{cursor:pointer;font:inherit;font-weight:700;background:#1d4ed8;color:#fff;border:0;border-radius:9px;padding:10px 18px;margin-top:14px}}
+.ok{{color:#15803d}} .err{{color:#b91c1c}} .mut{{color:#64748b;font-size:13px}}
+#out{{white-space:pre-wrap;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;font:12px ui-monospace,monospace;display:none}}
+a{{color:#1d4ed8}}</style></head><body>
+<h1>Deploy a company</h1>
+<p class="mut">the gateway's wallet (<code>{escape(wallet)}</code>) calls <code>factory.deployCompany</code>
+as an internal message attaching SHELL fuel; the factory converts exactly the child reserve + gas and refunds
+the excess. Signing happens on this server with the gateway's key — it never leaves.</p>
+<form id="df">
+<label>company name</label><input id="f-name" required placeholder="Acme SIIRs">
+<label>description</label><input id="f-desc" placeholder="one line about the company">
+<label>website</label><input id="f-web" placeholder="https://…">
+<div style="display:flex;gap:14px;flex-wrap:wrap">
+<div style="flex:1"><label>issuance model</label>
+<select id="f-model"><option value="0">full-cap (classic)</option><option value="1">rounds</option></select></div>
+<div style="flex:1"><label>initial value (per SIIR, raw)</label>
+<input id="f-init" value="20000000000"></div></div>
+<label>plans (count · weight · label — one row per tier)</label>
+<table>{plans_rows}</table>
+<label>founder (default: gateway wallet)</label>
+<input id="f-founder" placeholder="{escape(wallet)}">
+<label>founder pubkey (optional — a fresh 0x… pubkey makes a unique company address; the factory
+derives it from founder+pubkey, so reuse collides with existing companies)</label>
+<input id="f-pub" placeholder="0x…">
+<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-gov" style="width:auto">
+governance enabled</label>
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-gov2" style="width:auto">
+governance v2</label>
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-ld" style="width:auto">
+locked dividends</label>
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-c" style="width:auto">
+sealed charter</label></div>
+<p><button type="submit">deploy</button> <span class="mut">~30s settle</span></p>
+</form>
+<div id="out"></div>
+<script>
+var FORM=document.getElementById('df');
+FORM.addEventListener('submit',function(e){{
+  e.preventDefault();
+  var plans=[];
+  document.querySelectorAll('#df table tr').forEach(function(tr){{
+    var c=tr.querySelector('[name=p-count]'),w=tr.querySelector('[name=p-weight]'),
+        l=tr.querySelector('[name=p-label]');
+    if(c&&w&&l&&parseInt(c.value,10)>0&&l.value.trim())
+      plans.push({{count:parseInt(c.value,10),weight:parseInt(w.value,10),label:l.value.trim()}});
+  }});
+  var body={{name:document.getElementById('f-name').value,
+    description:document.getElementById('f-desc').value,
+    website:document.getElementById('f-web').value,
+    issuanceModel:parseInt(document.getElementById('f-model').value,10),
+    initialValue:parseInt(document.getElementById('f-init').value,10),
+    plans:plans,
+    founder:document.getElementById('f-founder').value||null,
+    founderPubkey:document.getElementById('f-pub').value||null,
+    governanceEnabled:document.getElementById('f-gov').checked,
+    governanceV2:document.getElementById('f-gov2').checked,
+    lockedDividends:document.getElementById('f-ld').checked,
+    sealedCharter:document.getElementById('f-c').checked}};
+  var out=document.getElementById('out');
+  out.style.display='block';out.textContent='sending…';
+  fetch('/factory/{escape(addr)}/deploy',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify(body)}})
+   .then(function(r){{return r.json()}})
+   .then(function(j){{
+     if(j.error){{out.className='err';out.textContent='error: '+j.error;return}}
+     out.className='ok';
+     out.textContent='company: '+j.company+'\\nmodel: '+j.issuanceModel+
+       '\\nstatus: '+(j.settled?'settled ✓':'pending…')+'\\ntxid: '+(j.txid||'?');
+   }}).catch(function(e){{out.className='err';out.textContent='failed: '+e;}});
+}});
+</script>
+<p class="mut"><a href="/factory/{escape(addr)}/">factory directory</a></p>
+</body></html>"""
+
+
 def factory_page(addr):
     info = run_getter(addr, "getCompanyList") or {}
     count = run_getter(addr, "getCompanyCount") or {}
@@ -1199,6 +1453,7 @@ a{{color:#1d4ed8}} li{{margin:6px 0}} code{{font-size:12px}}</style></head><body
 <p>companies registered in <code>{escape(addr)}</code> — read straight from the factory's
 on-chain registry (mirror decode).</p>
 <p><strong>{count.get('count', '?')}</strong> registered · marketplace: {mkt_href}</p>
+{'<p><a href="/factory/%s/deploy">deploy a company (gateway wallet)</a></p>' % escape(addr) if ALLOW_WRITES else ''}
 <ul>{rows or '<li>no companies registered</li>'}</ul>
 <p><small><a href="/factory/">back to factory index</a></small></p></body></html>"""
     return body
@@ -1296,9 +1551,29 @@ def marketplace_page(addr, q=""):
     bids = run_getter(addr, "getBids") or {}
     n_list = run_getter(addr, "getListingCount") or {}
     n_bids = run_getter(addr, "getBidCount") or {}
+    book = market_stats(addr)
     def tok(cid):
         n, c = _market_tok(cid)
         return f'<span class="tok {c}">{escape(n)}</span>'
+    def money(x):
+        return "—" if x is None else f'{int(x):,}'
+    srows = "".join(
+        f"<tr><td>{tok(cid)}</td>"
+        f"<td>{money(s.get('bestBid'))}</td><td>{money(s.get('bestAsk'))}</td>"
+        f"<td>{money(s.get('mark'))}</td>"
+        f"<td>{money(s.get('spread'))}</td>"
+        f"<td>{s.get('openBids', 0)}</td><td>{s.get('openAsks', 0)}</td>"
+        f"<td>{money(s.get('bidValue'))}</td><td>{money(s.get('askValue'))}</td></tr>"
+        for cid, s in sorted(book.items(), key=lambda kv: kv[0])
+    )
+    stats_card = f"""<div class="card"><h2>market stats</h2>
+<p class="mut">live order book only — Acki Nacki keeps no on-chain trade history,
+so last-trade price and volume are deliberately absent. mark = mid of best bid/ask
+(or the live side when only one exists). valuation is market-determined.</p>
+<table><tr><th>token</th><th>best bid</th><th>best ask</th><th>mark</th><th>spread</th>
+<th>bids</th><th>asks</th><th>bid value</th><th>ask value</th></tr>
+{srows or '<tr><td colspan=9 class="empty">empty book — no open orders</td></tr>'}</table>
+<p><small><a href="/marketplace/{escape(addr)}/stats.json">stats.json</a></small></p></div>"""
     lrows = "".join(
         f'<tr data-cur="{escape(cid)}"><td>#{escape(i)}</td><td><a href="/company/{escape(c)}/">'
         f'{escape(c.split("::")[1][:10])}…</a></td>'
@@ -1334,6 +1609,7 @@ NACKL, SHELL and eccUSDC pairs trade here. State decoded from the marketplace co
 <p class="mut">all trades settle through the custodial escrow (the marketplace contract). one click
 copies the address; hold the button to reveal the full value.</p>
 {_escrow_card(addr)}</div>
+{stats_card}
 <div class="card"><h2>tokens</h2>
 <button class="chip on" data-cur="all">all tokens</button>
 <button class="chip" data-cur="1">NACKL</button>
@@ -1440,6 +1716,7 @@ def company_page(addr):
 <p><a href="/company/{addr}/info">info.json</a> ·
    <a href="/company/{addr}/charter">charter.json</a> ·
    <a href="/company/{addr}/explore">explore register</a> ·
+   <a href="/company/{addr}/analytics.json">analytics.json</a> ·
    <a href="/">index</a></p>
 </body></html>"""
     return body.encode(), "text/html"
@@ -1489,6 +1766,12 @@ class Handler(BaseHTTPRequestHandler):
             data = run_getter(addr, "getCompanyList", abi=FACTORY_ABI)
             if data is None:
                 return self._send(b"factory unreachable", "text/plain", 503)
+            if len(parts) > 2 and parts[2] == "deploy":
+                if not ALLOW_WRITES:
+                    return self._send(b"writes disabled (run with --writes)",
+                                      "text/plain", 403)
+                return self._send(deploy_form_page(addr).encode(),
+                                  "text/html; charset=utf-8")
             if len(parts) > 2 and parts[2] == "companies.json":
                 return self._send(json.dumps({
                     "companies": load_companies_from(addr),
@@ -1507,6 +1790,10 @@ class Handler(BaseHTTPRequestHandler):
             data = run_getter(addr, "getListings", abi=MARKETPLACE_ABI)
             if data is None:
                 return self._send(b"marketplace unreachable", "text/plain", 503)
+            if len(parts) > 2 and parts[2] == "stats.json":
+                return self._send(
+                    json.dumps(market_stats(addr)).encode(),
+                    "application/json")
             if len(parts) > 2 and parts[2] in ("listings.json", "bids.json"):
                 key = "getListings" if parts[2] == "listings.json" else "getBids"
                 return self._send(
@@ -1572,6 +1859,24 @@ class Handler(BaseHTTPRequestHandler):
                     bids.get("validUntil", []), bids.get("accepted", []))
             )
         escrow_html = _escrow_card(mkt) if mkt else '<p class="empty">no marketplace configured on the factory.</p>'
+        stats_html = ""
+        if mkt:
+            book = market_stats(mkt)
+            def money(x):
+                return "—" if x is None else f'{int(x):,}'
+            srows = "".join(
+                f"<tr><td>{tok(cid)}</td>"
+                f"<td>{money(s.get('bestBid'))}</td><td>{money(s.get('bestAsk'))}</td>"
+                f"<td>{money(s.get('mark'))}</td>"
+                f"<td>{money(s.get('spread'))}</td>"
+                f"<td>{s.get('openBids', 0)}</td><td>{s.get('openAsks', 0)}</td></tr>"
+                for cid, s in sorted(book.items(), key=lambda kv: kv[0]))
+            stats_html = f"""<div class="card"><h2>market stats</h2>
+<p class="mut">live order book only (Acki Nacki keeps no on-chain trade history — no last-trade or
+volume). mark = mid of best bid/ask, or the live side when only one exists. valuation is
+market-determined.</p>
+<table><tr><th>token</th><th>best bid</th><th>best ask</th><th>mark</th><th>spread</th><th>bids</th><th>asks</th></tr>
+{srows or '<tr><td colspan=7 class="empty">empty book — no open orders</td></tr>'}</table></div>"""
         html = f"""<div class="card" style="background:linear-gradient(135deg,#0f172a,#1e293b);color:#f1f5f9;border:0">
 <h1 style="color:#fff">SIIR on-chain market</h1>
 <p class="mut" style="color:#94a3b8;max-width:560px">A custodial escrow exchange for SIIR deeds on the
@@ -1583,6 +1888,7 @@ from the contracts on-chain via the public mirror node.</p>
 <a href="/factory/{escape(factory)}/">directory</a> &middot;
 <a href="/marketplace/{escape(mkt)}/">marketplace page</a></p>
 </div>
+{stats_html}
 <div class="card"><h2>escrow</h2>
 <p class="mut">all trades settle through the custodial escrow (the marketplace contract). one click
 copies the address; hold the button to reveal the full value.</p>
@@ -1754,12 +2060,21 @@ SIIRs are reachable only through the search bar.</p></div>
         if what == "full":
             return self._send(json.dumps(full_data(addr)).encode(),
                               "application/json")
+        if what in ("analytics", "analytics.json", "statement", "statement.json"):
+            return self._send(json.dumps(company_analytics(addr)).encode(),
+                              "application/json")
         if what in ("register", "register.json"):
             return self._send(json.dumps(register_data(addr, qs)).encode(),
                               "application/json")
         if what in ("holders", "holders.json"):
             return self._send(json.dumps(holders_data(addr)).encode(),
                               "application/json")
+        if what == "holder" and len(rest) > 2 and rest[2] == "statement.csv":
+            return self._send(
+                holder_statement_csv(addr, rest[1]).encode(),
+                "text/csv; charset=utf-8",
+                extra={"Content-Disposition":
+                       'attachment; filename="holder-statement.csv"'})
         if what in ("holder", "holder.json") and len(rest) > 1:
             if what == "holder":
                 return self._send(holder_page(addr, rest[1]).encode(),
@@ -1785,8 +2100,12 @@ SIIRs are reachable only through the search bar.</p></div>
             plans = (run_getter(addr, "getPlans") or {}).get("plans", [])
             return self._send(json.dumps(plans).encode(), "application/json")
         if what == "treasury":
+            divs = run_getter(addr, "getDividendCurrencies") or {}
+            tracks = non_shell_tracks(divs)
             return self._send(
-                json.dumps(run_getter(addr, "getDividendCurrencies") or {}).encode(),
+                json.dumps({"ids": [c for c, _, _ in tracks],
+                            "indices": [i for _, i, _ in tracks],
+                            "deposits": [d for _, _, d in tracks]}).encode(),
                 "application/json")
         if what == "history" and len(rest) > 1:
             try:

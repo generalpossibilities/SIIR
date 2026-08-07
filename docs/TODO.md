@@ -26,7 +26,9 @@ Current live deployment (shellnet, v2.4.0 stack): factory
    per-IP rate limit 10/min on write endpoints). Company creation via the
    gateway is **DONE**: `POST /factory/<addr>/deploy` (with `--writes`)
    validates + sends `deployCompany` from the gateway wallet with the
-   deploy SHELL fuel and returns the new company — verified live (§8.8).
+   deploy SHELL fuel and returns the new company — verified live (§8.8,
+   §8.9; the deploy form page and the explorer's factory-page card are the
+   v2.5.0 UI for it).
    Remaining: the browser wallet itself — sign external messages in-browser
    (ed25519 via WebCrypto) and relay them to the chain endpoint; the public
    shellnet mirror GraphQL accepts external messages (verified live: signed
@@ -77,7 +79,12 @@ Current live deployment (shellnet, v2.4.0 stack): factory
    wallets), issue, transfer, deposit dividends, claim, charter upload +
    ratification, marketplace list/bid/acceptBid. Signing: in-browser ed25519
    (WebCrypto) + external-message relay to the chain endpoint; first pin the
-   relay request format (see P0.1).
+   relay request format (see P0.1). **Done (v2.5.0, gateway-signed subset):**
+   company creation is live through the gateway's deploy form page
+   (`GET /factory/<addr>/deploy` under `--writes`, §8.9) and the explorer's
+   factory-page deploy card when served from the gateway; `POST /claim`
+   covers dividend claiming. Remaining for the pure-browser path: funding,
+   issue, transfer, deposit, charter, marketplace (P0.1 relay still open).
 9. **Live verification of every UI action**: after each browser write, the
    explorer must reflect it instantly via mirror read-back (extend the
    gateway parity scripts to cover the write paths).

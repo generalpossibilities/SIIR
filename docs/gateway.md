@@ -30,13 +30,18 @@ HTTP face, so the gateway translates getter calls into web responses:
 | `GET /company/<addr>/siir/<id>/deed` | printable deed card: company + logo, holder, weight, claimable, fingerprint, provenance |
 | `GET /company/<addr>/claim` | read-only claim page: pending amounts + how to sign from your own wallet. With `--writes`: the server-side claim form for the gateway's wallet |
 | `POST /company/<addr>/claim` | **disabled by default (403)** — the gateway is read-only per the user-paid gas model; no server-side keys in production. With `--writes` (dev networks only, rate-limited 10/min/IP): sends `claim(ids)` signed by the gateway wallet (JSON body `{"ids":["1"]}` or a form `ids=1&ids=2`; JSON reply when `Accept: application/json`) |
-| `POST /factory/<addr>/deploy` | **disabled by default (403)**, same model as `/claim`. With `--writes`: deploys a new company through the factory, signed by the gateway wallet (JSON body `{"name", "description", "website", "metadataUri", "founderPubkey", "issuanceModel", "plans":[{count,weight,label,issued,image}], "logoImage", "siirImage", "ui", "charter", "initialValue", "governanceEnabled", "quorumPermille", "dissolutionRule", "dissolutionDest"}`; plan image + logo/deed ≤ 1 MiB, UI ≤ 4 MiB, charter ≤ 1 MiB). Sends `deployCompany` with the deploy fuel (26e9 SHELL + 3e9 VMSHELL), then polls `getCompanyInfo` (~30 s) and returns `{company, txid, active, name, founder}` |
+| `POST /factory/<addr>/deploy` | **disabled by default (403)**, same model as `/claim`. With `--writes`: deploys a new company through the factory, signed by the gateway wallet (JSON body `{"name", "description", "website", "metadataUri", "founderPubkey", "issuanceModel", "plans":[{count,weight,label,issued,image}], "logoImage", "siirImage", "ui", "charter", "initialValue", "governanceEnabled", "quorumPermille", "dissolutionRule", "dissolutionDest"}`; plan image + logo/deed ≤ 1 MiB, UI ≤ 4 MiB, charter ≤ 1 MiB). Sends `deployCompany` with the deploy fuel (26e9 SHELL + 3e9 VMSHELL), then polls `getCompanyInfo` (~30 s) and returns `{company, txid, active, name, founder}`. `deployCompany` is `onlyOwnerOrFounder` — the message must reach the **factory**, not the predicted child address. A non-empty `founderPubkey` derives a unique company address; leaving it blank defaults to the gateway wallet + its key (reuse collides with existing companies and the factory refuses) |
+| `GET /factory/<addr>/deploy` | **with `--writes` only (403 otherwise):** the browser deploy form page — fields for name/description/website/model/plans/founder/pubkey/governance; POSTs JSON to the same URL, renders the result. Signing is server-side (the gateway wallet's key never leaves the server) |
 | `GET /company/<addr>/plans` | `getPlans` as JSON |
 | `GET /company/<addr>/treasury` | `getDividendCurrencies` as JSON |
 | `GET /company/<addr>/history/<id>` | `getHistory` entries as JSON |
 | `GET /company/<addr>/search?q=...` | if `q` is an owner address -> holder page; otherwise substring scan of labels, metadata URIs and owner addresses. The same data is on `.../search.json?q=` |
 | `GET /factory/` · `GET /factory/<addr>/` | factory index + directory (registry decoded from the factory contract); `.../companies.json` for the JSON form |
 | `GET /marketplace/<addr>/` | marketplace page (escrow card, token filters, listings + bids); `.../listings.json` and `.../bids.json` for the JSON forms |
+| `GET /marketplace/<addr>/stats.json` | per-currency live order-book summary: best bid/ask, mark (mid, or the live side when only one exists), spread, open bid/ask counts + values. No last-trade/volume (Acki Nacki keeps no on-chain trade history) — valuation is mark-only by design |
+| `GET /company/<addr>/analytics.json` | issuance, per-currency treasury tracks with `dividendsPer1000Weight = 1000·index/1e9`, current marks from the factory's marketplace, charter fingerprint, contract version; `.../statement` for the human page |
+| `GET /company/<addr>/holder/<owner>/statement.csv` | per-holder statement for spreadsheets (ids with weight, per-currency claimable, bounded history). Ranges are sampled (first 50 ids per range + a range row) so 10B-id registers stay bounded |
+| `GET /company/<addr>/plans` | `getPlans` as JSON |
 
 ## Run
 
@@ -79,6 +84,14 @@ Then open `http://127.0.0.1:8000/`.
 - Companies are registered by `scripts/deploy.sh` (writes
   `scripts/.work/companies.json` at the end of a run); you can also hand-edit
   that file with any company address.
+- **SHELL is never shown as a dividend (v2.5.0):** holder/claimable/
+  treasury/statement views filter out currency id 2 (the contracts reject
+  SHELL dividend tracks with `ERR_BAD_DIVIDEND_CURRENCY`); SHELL still
+  shows on the marketplace as a trade currency.
+- Analytics endpoints are pure mirror reads — valuation uses the live
+  order-book mark only (no on-chain oracles, no extra writes). The
+  company's decoded `_factory` is legacy `0:<hex>`; analytics normalizes
+  it to the self-rooted `<hex>::<hex>` before factory getters.
 
 ## Notes / limits
 
