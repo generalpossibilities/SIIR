@@ -14,6 +14,14 @@
  * (governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest)
  * through to the company contract (see SIIR.md §Governance §Dissolution).
  *
+ * v2.3: SHELL fuel. The founder wallet (the `founder` argument of
+ * deployCompany) sends the call as an internal message attaching SHELL; the
+ * factory converts exactly the deploy fuel — its own gas, the child's
+ * `initialValue` native reserve, and the forward fees of the constructor
+ * body and company code cell — and refunds the excess. The owner-key path
+ * (external message, no currencies possible) is kept for the factory
+ * operator and runs on the factory's bootstrap reserve.
+ *
  * The factory never modifies deployed companies. It only creates them.
  */
 pragma gosh-solidity >=0.76.1;
@@ -22,9 +30,10 @@ pragma AbiHeader pubkey;
 
 import "./CompanySIIR.sol";
 import "./SIIRMarketplace.sol";
+import "./SIIRFuel.sol";
 
-contract SIIRFactory {
-    string constant version = "2.1.0";
+contract SIIRFactory is SIIRFuel {
+    string constant version = "2.4.0";
 
     uint16 constant ERR_NOT_OWNER = 200;
     uint16 constant ERR_BAD_ARGS   = 201;
@@ -32,11 +41,13 @@ contract SIIRFactory {
     uint16 constant ERR_SIIR_IMG_TOO_LARGE = 203;
     uint16 constant ERR_UI_TOO_LARGE      = 204;
     uint16 constant ERR_CHARTER_TOO_LARGE = 205;
+    uint16 constant ERR_PLAN_IMG_TOO_LARGE = 206;
 
     // On-chain content caps, matching CompanySIIR (validated here so a bad
     // upload fails fast at the factory instead of as a construction revert).
     uint32 constant MAX_LOGO_SIZE        = 1 << 20;
     uint32 constant MAX_SIIR_IMAGE_SIZE  = 1 << 20;
+    uint32 constant MAX_PLAN_IMAGE_SIZE  = 1 << 12;  // 4 KiB per tier art (deploy-message budget is the real cap)
     uint32 constant MAX_UI_SIZE          = 4 << 20;
     uint32 constant MAX_CHARTER_SIZE     = 1 << 20;
 
@@ -80,8 +91,11 @@ contract SIIRFactory {
         }();
     }
 
-    modifier onlyOwner() {
-        require(msg.pubkey() == _ownerPubkey, ERR_NOT_OWNER);
+    /// deployCompany may be called by the founder wallet itself (internal
+    /// message, SHELL-fueled) or by the factory owner's key (external
+    /// message; runs on the factory's bootstrap native reserve).
+    modifier onlyOwnerOrFounder(address founder) {
+        require(msg.sender == founder || msg.pubkey() == _ownerPubkey, ERR_NOT_OWNER);
         tvm.accept();
         _;
     }
@@ -123,15 +137,29 @@ contract SIIRFactory {
         uint16 quorumPermille,
         uint8 dissolutionRule,
         address dissolutionDest
-    ) public onlyOwner returns (address company) {
+    ) public onlyOwnerOrFounder(founder) returns (address company) {
         require(plans.length > 0, ERR_BAD_ARGS);
         require(founder.value != 0, ERR_BAD_ARGS);
         require(bytes(logoImage).length <= MAX_LOGO_SIZE, ERR_LOGO_TOO_LARGE);
         require(bytes(siirImage).length <= MAX_SIIR_IMAGE_SIZE, ERR_SIIR_IMG_TOO_LARGE);
         require(bytes(ui).length <= MAX_UI_SIZE, ERR_UI_TOO_LARGE);
         require(bytes(charter).length <= MAX_CHARTER_SIZE, ERR_CHARTER_TOO_LARGE);
+        for (uint256 i = 0; i < plans.length; i++) {
+            require(plans[i].count > 0, ERR_BAD_ARGS);
+            require(bytes(plans[i].image).length <= MAX_PLAN_IMAGE_SIZE, ERR_PLAN_IMG_TOO_LARGE);
+        }
+        TvmCell init = _companyStateInit(founder, founderPubkey);
+        TvmCell body = abi.encodeBody(CompanySIIR, name, description, website, metadataUri,
+            issuanceModel, plans, logoImage, siirImage, ui, charter,
+            governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest);
+        if (msg.sender == founder) {
+            // founder wallet path: the attached SHELL pays the child's deploy
+            // value + the factory's own gas + both forward fees; excess goes
+            // back to the founder wallet in the same message
+            _fuel(_fuelDeploy(initialValue, init, body));
+        }
         company = new CompanySIIR{
-            stateInit: _companyStateInit(founder, founderPubkey),
+            stateInit: init,
             value: varuint16(initialValue),
             flag: 1
         }(name, description, website, metadataUri, issuanceModel, plans,

@@ -9,7 +9,7 @@ global.atob = (s) => Buffer.from(s, "base64").toString("binary");
 const XP = require("./core.js");
 const ABI = { fields: require("./fields.js").ABI_FIELDS };
 
-const ADDR = process.env.PARITY_ADDR || "ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f::fba5b22395a75f9c8dae21068d09e3fdbbf98ee6d6325acf25136b3a085f7fef";
+const ADDR = process.env.PARITY_ADDR || "d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::a334e243be3f9e8b95814e06c2a718095f05803f6d9635e1dbdd501d37762303";
 const F = process.env.PARITY_FOUNDER || "0:c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb";
 const H = process.env.PARITY_HOLDER || "0:0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa";
 

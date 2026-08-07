@@ -749,11 +749,58 @@ JS/Python ALL MATCH on the 3 founder fields → revoke), and the on-chain
 grant readback (`gov_state.py founders`) showed the exact wallet
 `0:c4d173…` + pubkey `0x4af1476b…` entry.
 
+### 8.8 SHELL fuel (v2.3.0), the seal (v2.4.0) and the gateway deploy endpoint
+
+**The fuel model.** On Acki Nacki, VMSHELL attached to a message is
+nullified when the message crosses Dapp IDs, so gas can't travel. The
+protocol's second currency — SHELL (ecc id 2) — *does* travel, and is
+converted to native VMSHELL 1:1 at the destination (`cnvrtshellq`). SIIR
+contracts therefore fuel every entry from the **caller's attached SHELL**:
+`_fuel(needed)` converts exactly `needed` (own gas + outbound value +
+forward fees), converts the excess back to SHELL and refunds it in the
+same message. `deployCompany` fuel (26e9) covers the 20e9 child reserve +
+bundle forward fees; `claim` fuel (3e9) covers the payout envelope. The
+wallet attaches SHELL with `sendTransaction(..., cc: {"2": N})` — N is a
+generous upper bound, the contracts refund the difference. This was
+verified live: a deploy message carrying `cc: {}` reached the factory but
+aborted (no fuel to convert), while `cc: {"2": 26e9}` deployed the company
+Active with the 20e9 reserve, and the wallet's SHELL balance moved by
+exactly what was consumed.
+
+**Addressing verified (again).** During a blocked-deploy investigation I
+suspected post-migration routing had broken legacy addressing (self-rooted
+senders → self-rooted targets). It had not: `0:<hex>` resolves to the
+self-rooted `<hex>::<hex>` for **every** sender, root dapp included
+(verified live: giver, DappRoot and the self-rooted wallet all reach the
+self-rooted factory this way; the early failures were transient network
+queueing, not routing). The factory deploys self-rooted; children
+(companies, marketplace) inherit its dapp id; wallets are self-rooted
+multisigs.
+
+**The seal (v2.4.0).** Each SIIR page renders a protocol-fixed SVG stamp:
+200×264 viewBox, scalloped border, circular clip (r=62), six-color tier
+palette (bronze/silver/gold/platinum/genesis/diamond), label + `SIIR #id`
+banner. The plan's `image` fills a centered 116×116 window with
+`preserveAspectRatio="xMidYMid meet"` — never cropped, never stretched;
+an empty image falls back to a tiered gradient card. Rendered identically
+in the browser (`static/app.js` `sealCard`) and by the gateway
+(`scripts/gateway.py` `seal_svg`) from the same geometry constants.
+
+**Gateway deploy endpoint.** `POST /factory/<addr>/deploy` (gated by
+`--writes`, rate-limited): validates the payload (plans > 0, plan image
+≤ 4 KiB, logo/deed/charter ≤ 1 MiB, UI ≤ 4 MiB), builds the `deployCompany`
+body via tvm-cli, sends it through the holder wallet with the deploy fuel
+(`cc: {"2": 26e9}`, bounce, flags 1), predicts the company via
+`getCompanyAddress`, then polls `getCompanyInfo` (~30 s) and returns
+`{company, txid, active, name, founder}`. Verified live against the
+current factory with a fresh `founderPubkey` — the predicted company
+came up Active with the 20e9 reserve. (Pitfall: the same founder pubkey
+re-derives the same address, so a "new" deploy can silently hit an old
+company — tests must use a fresh pubkey.)
+
 ---
 
-## 9. Current status and next steps
-
-**Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
+## 9. Current status and next steps**Done (verified on shellnet):** spec (`SIIR.md`), README, contracts
 (`SIIRFactory`, `CompanySIIR`), `Makefile`, `scripts/deploy.sh`, docs
 (`giver3.md`, `wallet.md`, `project.md`, `usage.md`, `gateway.md`), full
 dividend-paying lifecycle, the Model-B (rounds) issuance path, on-chain
@@ -811,3 +858,15 @@ both governance modes (§8.4, §8.6). The explorer and gateway now show
 the governance card and a `/company/<addr>/governance` endpoint read
 from mirror state, and `deploy.sh` step 14 exercises the whole
 lifecycle with hard assertions.
+
+**v2.3.0–v2.4.0 (fuel, seal, deploy endpoint):** every entry is
+SHELL-fueled from the caller's attached SHELL (§8.8), verified live —
+a deploy with no SHELL aborts at the factory, with 26e9 it lands
+Active including the 20e9 child reserve. The SIIR seal renders
+identically in the browser and the gateway (plan image window, tiered
+fallback). The gateway gained `POST /factory/<addr>/deploy`
+(`--writes`), verified live against the current deployment; the
+explorer's deploy form is the remaining UI flow (TODO P1.8). Current
+shellnet deployment (v2.4.0 stack): factory `d0f0bb83…` self-rooted,
+demo company `d0f0bb83…::a334e243…` (10B SIIRs, operating), rounds
+company `d0f0bb83…::4967f8e1…`, marketplace `d0f0bb83…::3f1cc88a…`.

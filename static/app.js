@@ -105,6 +105,70 @@ function logoCard(ms) {
     return `<img class="logo" src="data:image/svg+xml;base64,${b64}" alt="logo">`;
 }
 
+// ---------- The Seal: the official SIIR deed silhouette ----------
+// Protocol-fixed trademark shape: scalloped stamp border, circular image
+// window, banner with label + serial. The window fits ANY artwork whole
+// (preserveAspectRatio="meet") — never cropped, never covered. Without a
+// plan image the window renders a deterministic tier card (label palette).
+const SEAL_TIERS = [
+    ["bronze", "#cd7f32", "#7c4a1e"],
+    ["silver", "#c0c0c0", "#5f6b76"],
+    ["gold", "#ffd700", "#8a6d00"],
+    ["platinum", "#e5e4e2", "#6b7280"],
+    ["genesis", "#34d399", "#065f46"],
+    ["diamond", "#22d3ee", "#155e75"],
+];
+const SEAL_TIER_FALLBACK = ["#9aa5b1", "#4b5563"];
+
+function sealTier(label) {
+    const l = (label || "").toLowerCase();
+    for (const [name, c1, c2] of SEAL_TIERS) {
+        if (l.includes(name)) return [c1, c2];
+    }
+    return SEAL_TIER_FALLBACK;
+}
+
+function sealInner(plan, label) {
+    const img = (plan && plan.image) || "";
+    if (img) {
+        const b64 = img.replace(/^data:[^,]+,/, "");
+        return `<image href="data:image/svg+xml;base64,${b64}" x="42" y="42" width="116" height="116" preserveAspectRatio="xMidYMid meet"/>`;
+    }
+    const [c1, c2] = sealTier(label);
+    const mark = (label || "SIIR").toUpperCase().slice(0, 9);
+    return `<defs><linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/></linearGradient></defs>
+        <rect x="42" y="42" width="116" height="116" rx="10" fill="url(#tg)"/>
+        <circle cx="100" cy="100" r="38" fill="none" stroke="#fff" stroke-width="5" opacity=".85"/>
+        <path d="M100 78l8 16 18 3-13 12 3 18-16-8-16 8 3-18-13-12 18-3z" fill="#fff"/>
+        <text x="100" y="148" font-size="11" fill="#fff" text-anchor="middle" font-family="monospace">${esc(mark)}</text>`;
+}
+
+function sealCard(ms, s, id, opts) {
+    opts = opts || {};
+    const plans = ms.plansAbi ? ms.plansAbi() : [];
+    const plan = plans[Number(s.round)] || {};
+    const label = esc(s.label || "");
+    const width = opts.width || 230;
+    const serial = opts.serial !== undefined ? opts.serial : `#${fmtBig(id)}`;
+    return `<svg class="seal" viewBox="0 0 200 264" width="${width}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SIIR deed seal">
+        <defs><radialGradient id="sbg" cx=".5" cy=".35" r=".8">
+            <stop offset="0" stop-color="#2a3344"/><stop offset="1" stop-color="#101623"/></radialGradient></defs>
+        <rect x="0" y="0" width="200" height="264" rx="18" fill="url(#sbg)"/>
+        <circle cx="100" cy="108" r="86" fill="none" stroke="#7d8aa0" stroke-width="10" stroke-dasharray="3.2 4.6"/>
+        <circle cx="100" cy="108" r="81" fill="none" stroke="#3d4a5e" stroke-width="1.5"/>
+        <circle cx="100" cy="108" r="73" fill="#0b1220"/>
+        <circle cx="100" cy="108" r="66" fill="none" stroke="#55647c" stroke-width="1"/>
+        <clipPath id="sw"><circle cx="100" cy="108" r="62"/></clipPath>
+        <g clip-path="url(#sw)">${sealInner(plan, s.label)}</g>
+        <circle cx="100" cy="108" r="62" fill="none" stroke="#7d8aa0" stroke-width="2.5"/>
+        <circle cx="100" cy="108" r="69" fill="none" stroke="#cdd6e4" stroke-width="1.5" stroke-dasharray="1 6"/>
+        <rect x="28" y="200" width="144" height="44" rx="10" fill="#161d2b" stroke="#3d4a5e"/>
+        <text x="100" y="218" font-size="12.5" fill="#e5e7eb" text-anchor="middle" font-family="sans-serif">${label}</text>
+        <text x="100" y="236" font-size="9.5" fill="#8b96a8" text-anchor="middle" font-family="monospace">SIIR ${serial}</text>
+    </svg>`;
+}
+
 async function loadCompany(addr) {
     if (state.ms && state.ms.address === addr && state.ms._decoded) return state.ms;
     state.ms = new MirrorState(addr, ABI_FIELDS, NET);
@@ -358,6 +422,7 @@ async function siirPage(addr, id) {
     const rows = cur.map((c, i) => `<tr><td>${tok(c)}</td><td>${amt[i]}</td></tr>`).join("");
     const histRows = hist.map((h) => `<tr><td>${h.timestamp}</td><td class="addr">${esc(h.from)}</td><td class="addr">${esc(h.to)}</td></tr>`).join("");
     return `<div class="card"><h1>SIIR #${esc(id)}</h1>
+            ${sealCard(ms, s, id)}
             <div class="grid">
             <div class="kv"><div class="k">weight</div><div class="v">${esc(s.weight)}</div></div>
             <div class="kv"><div class="k">round</div><div class="v">${esc(s.round)}</div></div>
@@ -585,6 +650,6 @@ document.addEventListener("click", (e) => {
     route();
 });
 
-const FACTORY_ADDR = "ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f::ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f";
-const DEMO_ADDR = "ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f::fba5b22395a75f9c8dae21068d09e3fdbbf98ee6d6325acf25136b3a085f7fef";
+const FACTORY_ADDR = "d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea";
+const DEMO_ADDR = "d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::a334e243be3f9e8b95814e06c2a718095f05803f6d9635e1dbdd501d37762303";
 route();

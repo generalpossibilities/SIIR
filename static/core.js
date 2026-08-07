@@ -745,6 +745,7 @@ class MirrorState {
             weight: String(p[1]),
             label: p[2] || "",
             issued: !!p[3],
+            image: p[4] || "",
         }));
     }
 

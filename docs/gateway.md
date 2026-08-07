@@ -26,10 +26,11 @@ HTTP face, so the gateway translates getter calls into web responses:
 | `GET /company/<addr>/register.json` | paginated SIIR register: `?offset=&limit=` (default offset 0, limit 25, max 100) |
 | `GET /company/<addr>/holders.json` | holders aggregated from the register (`{owner: {count, weight}}`); full scan, so large registers are capped by a time budget (`truncated`) |
 | `GET /company/<addr>/holder/<owner>` | holder page (SIIRs + balance + claimable). Accepts `64-hex`, `0:64-hex`, or `dapp_id::account_id`; the same data is on `.../holder.json/<owner>` |
-| `GET /company/<addr>/siir/<id>` | SIIR page (weight, owner, round, label, metadata, fingerprint, claimable, transfer history); same data on `.../siir.json/<id>` |
+| `GET /company/<addr>/siir/<id>` | SIIR page (weight, owner, round, label, metadata, fingerprint, claimable, transfer history); same data on `.../siir.json/<id>` — includes the SVG **seal** (protocol-fixed 200×264 stamp; the plan's `image` fills a centered window without cropping, else a tiered fallback card), identical to the in-browser renderer |
 | `GET /company/<addr>/siir/<id>/deed` | printable deed card: company + logo, holder, weight, claimable, fingerprint, provenance |
 | `GET /company/<addr>/claim` | read-only claim page: pending amounts + how to sign from your own wallet. With `--writes`: the server-side claim form for the gateway's wallet |
 | `POST /company/<addr>/claim` | **disabled by default (403)** — the gateway is read-only per the user-paid gas model; no server-side keys in production. With `--writes` (dev networks only, rate-limited 10/min/IP): sends `claim(ids)` signed by the gateway wallet (JSON body `{"ids":["1"]}` or a form `ids=1&ids=2`; JSON reply when `Accept: application/json`) |
+| `POST /factory/<addr>/deploy` | **disabled by default (403)**, same model as `/claim`. With `--writes`: deploys a new company through the factory, signed by the gateway wallet (JSON body `{"name", "description", "website", "metadataUri", "founderPubkey", "issuanceModel", "plans":[{count,weight,label,issued,image}], "logoImage", "siirImage", "ui", "charter", "initialValue", "governanceEnabled", "quorumPermille", "dissolutionRule", "dissolutionDest"}`; plan image + logo/deed ≤ 1 MiB, UI ≤ 4 MiB, charter ≤ 1 MiB). Sends `deployCompany` with the deploy fuel (26e9 SHELL + 3e9 VMSHELL), then polls `getCompanyInfo` (~30 s) and returns `{company, txid, active, name, founder}` |
 | `GET /company/<addr>/plans` | `getPlans` as JSON |
 | `GET /company/<addr>/treasury` | `getDividendCurrencies` as JSON |
 | `GET /company/<addr>/history/<id>` | `getHistory` entries as JSON |
@@ -48,15 +49,16 @@ python3 scripts/gateway.py --port 8000 --multisig-abi <path-to-UpdateCustodianMu
 
 **Gas & signing model**: transactions are signed by the user's own wallet and
 paid for with the sender's own VMSHELL (the gateway is read-only in
-production — it never holds keys). `--writes` exists so `scripts/deploy.sh`
-and the local demos can keep using the dev keys
+production — it never holds keys). `--writes` exists so `scripts/deploy.sh`,
+the deploy endpoint, and the local demos can keep using the dev keys
 (`scripts/.work/*.keys.json`); it must never be enabled on a public host.
 
-With `--writes`, `/claim` signs with `scripts/.work/holder.keys.json` (the
-wallet deployed by `scripts/deploy.sh`); the keys never leave the server.
-Without the multisig ABI (auto-located in `contracts/0.79.3_compiled/...` or
-the acki-research checkout) or without the holder keys, the claim form
-explains what is missing.
+With `--writes`, `/claim` and `/factory/<addr>/deploy` sign with
+`scripts/.work/holder.keys.json` (the wallet deployed by
+`scripts/deploy.sh`); the keys never leave the server. Without the multisig
+ABI (auto-located in `contracts/0.79.3_compiled/...` or the acki-research
+checkout) or without the holder keys, the claim form / deploy form explains
+what is missing.
 
 Then open `http://127.0.0.1:8000/`.
 

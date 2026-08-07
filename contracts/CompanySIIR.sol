@@ -39,24 +39,41 @@
  * founder powers. Single-admin: only the original founder manages the set,
  * and can never be revoked. Grants double as key rotation (grant a
  * replacement pubkey before revoking a lost one).
+ *
+ * v2.3: SHELL fuel (P0.5). Wallet ops (transfer, transferRange, voteDissolve,
+ * claim) convert just enough attached SHELL to native for their own compute
+ * and outbound value/forward fees, refunding the excess to the caller —
+ * the caller pays, the register keeps no user-op reserve. claim() is
+ * claimer-pays: the holder's attached SHELL funds the payout envelope, so a
+ * claim never drains the company. depositDividends converts only a small
+ * fuel slice out of the attached SHELL (the rest IS the dividend). Founder-
+ * key ops (issue, ratify, dissolve, finalize, grant/revoke) are exempt by
+ * design — key-signed externals cannot carry currencies on this network —
+ * and run on the small native reserve the company received at deployment,
+ * which the founder's deploy SHELL funded.
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
 pragma AbiHeader pubkey;
 
-contract CompanySIIR {
+import "./SIIRFuel.sol";
+
+contract CompanySIIR is SIIRFuel {
     // ---------- constants ----------
-    string constant version = "2.2.0";
+    string constant version = "2.4.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
 
     // SHELL is ecc currency id 2 (the computation token, cross-DAPP transferable).
     // eccUSDC (TIP-3-style ecc id 3) is the second supported dividend currency.
-    uint32 constant CURRENCY_SHELL = 2;
+    // CURRENCY_SHELL is inherited from SIIRFuel.
     uint32 constant CURRENCY_USDC  = 3;
 
     uint128 constant MAX_UINT128 = 340282366920938463463374607431768211455;
+
+    // Value attached to one outbound payout/currency envelope (native grams).
+    uint128 constant PAYOUT_VALUE = 1 vmshell;
 
     // Gas kept on the company contract for its own operations
     uint128 constant GAS_RESERVE = 1 vmshell;
@@ -83,6 +100,7 @@ contract CompanySIIR {
     uint16 constant ERR_ALREADY_DISSOLVED = 123;
     uint16 constant ERR_REGISTER_FROZEN   = 124;
     uint16 constant ERR_GRACE_NOT_OVER    = 125;
+    uint16 constant ERR_PLAN_IMG_TOO_LARGE = 126;
     uint16 constant ERR_ALREADY_FINALIZED = 126;
     uint16 constant ERR_BAD_GOVERNANCE    = 127;
     uint16 constant ERR_ALREADY_VOTED     = 128;
@@ -108,6 +126,7 @@ contract CompanySIIR {
     // single account never becomes pathological). Base64 data-URI strings.
     uint32 constant MAX_LOGO_SIZE        = 1 << 20;  // 1 MiB
     uint32 constant MAX_SIIR_IMAGE_SIZE  = 1 << 20;  // 1 MiB
+    uint32 constant MAX_PLAN_IMAGE_SIZE  = 1 << 12;  // 4 KiB per tier art (deploy-message budget is the real cap)
     uint32 constant MAX_UI_SIZE          = 4 << 20;  // 4 MiB (static HTML/JS bundle)
     uint32 constant MAX_CHARTER_SIZE     = 1 << 20;  // 1 MiB (immutable commitment text)
 
@@ -183,6 +202,7 @@ contract CompanySIIR {
         uint128 weight;         // weight per SIIR
         string label;           // display tier label ("" = none)
         bool issued;            // true once minted
+        string image;           // optional per-tier SVG deed art ("" = none; v2.4)
     }
 
     struct SIIR {
@@ -283,14 +303,17 @@ contract CompanySIIR {
         uint8 dissolutionRule,
         address dissolutionDest
     ) accept {
-        gosh.cnvrtshellq(0);
-        tvm.accept();
         require(msg.sender == _factory, ERR_NOT_OWNER);
         require(issuanceModel == MODEL_FULL_CAP || issuanceModel == MODEL_ROUNDS, ERR_BAD_ISSUANCE);
+        require(plans.length > 0, ERR_BAD_ISSUANCE);
         require(bytes(logoImage).length <= MAX_LOGO_SIZE, ERR_LOGO_TOO_LARGE);
         require(bytes(siirImage).length <= MAX_SIIR_IMAGE_SIZE, ERR_SIIR_IMG_TOO_LARGE);
         require(bytes(ui).length <= MAX_UI_SIZE, ERR_UI_TOO_LARGE);
         require(bytes(charter).length <= MAX_CHARTER_SIZE, ERR_CHARTER_TOO_LARGE);
+        for (uint256 i = 0; i < plans.length; i++) {
+            require(plans[i].count > 0, ERR_BAD_ISSUANCE);
+            require(bytes(plans[i].image).length <= MAX_PLAN_IMAGE_SIZE, ERR_PLAN_IMG_TOO_LARGE);
+        }
         require(!governanceEnabled || (quorumPermille > 0 && quorumPermille <= 1000), ERR_BAD_GOVERNANCE);
         require(dissolutionRule <= DISSOLUTION_BURN, ERR_BAD_DISSOLUTION);
         require(dissolutionRule == DISSOLUTION_TREASURY || dissolutionRule == DISSOLUTION_BURN
@@ -419,6 +442,7 @@ contract CompanySIIR {
         require(!_dissolved && !_finalized, ERR_ALREADY_DISSOLVED);
         require(!_votedDissolve[msg.sender], ERR_ALREADY_VOTED);
         tvm.accept();
+        _fuel(_fuelOwn());
         uint128 weight = _weightOf(msg.sender);
         require(weight > 0, ERR_NOT_OWNER);
         _votedDissolve[msg.sender] = true;
@@ -552,11 +576,12 @@ contract CompanySIIR {
     /// Transfer SIIRs. Only the current owner of each SIIR may move it.
     /// Ownership is a state change in the register; the SIIR carries its
     /// history, and pending dividends stay attached (cum-dividend).
-    function transfer(uint256[] ids, address newOwner) public {
+    function transfer(uint256[] ids, address newOwner) public internalMsg {
         require(!_dissolved, ERR_REGISTER_FROZEN);
         require(newOwner.value != 0, ERR_NOT_OWNER);
         require(msg.sender != newOwner, ERR_NOT_OWNER);
         tvm.accept();
+        _fuel(_fuelOwn());
         for (uint256 i = 0; i < ids.length; i++) {
             uint256 id = ids[i];
             (SIIR s, ) = _resolve(id);
@@ -571,12 +596,13 @@ contract CompanySIIR {
 
     /// Transfer a whole contiguous range [start, end] in one record. The
     /// range must lie inside a single segment owned by the caller.
-    function transferRange(uint256 start, uint256 end, address newOwner) public {
+    function transferRange(uint256 start, uint256 end, address newOwner) public internalMsg {
         require(!_dissolved, ERR_REGISTER_FROZEN);
         require(newOwner.value != 0, ERR_NOT_OWNER);
         require(msg.sender != newOwner, ERR_NOT_OWNER);
         require(start >= 1 && start <= end && end < _nextId, ERR_NO_SIIR);
         tvm.accept();
+        _fuel(_fuelOwn());
         uint256 i;
         bool found = false;
         for (i = 0; i < _segments.length; i++) {
@@ -632,9 +658,22 @@ contract CompanySIIR {
         // distribution the founder may still deposit during the grace period.
         require(!_finalized && (!_dissolved || !_finalDeposited), ERR_REGISTER_FROZEN);
         tvm.accept();
+        // The attached SHELL IS the dividend: convert only a small fuel slice
+        // (own gas + slack) and credit the rest to the treasury. Deposits in
+        // other currencies run on the company's deploy reserve — the company
+        // is receiving value, not spending it.
+        uint128 inboundShell = uint128(msg.currencies[CURRENCY_SHELL]);
+        uint128 fuelSlice = _fuelOwn();
+        uint128 convert = inboundShell > fuelSlice ? fuelSlice : inboundShell;
+        if (convert > 0) {
+            gosh.cnvrtshellq(uint64(convert));
+        }
         for (uint256 i = 0; i < currencyIds.length; i++) {
             uint32 cur = currencyIds[i];
             uint128 amount = uint128(msg.currencies[cur]);
+            if (cur == CURRENCY_SHELL) {
+                amount = amount > convert ? amount - convert : 0;
+            }
             if (amount == 0) continue;
             require(_divCurrencies.length < MAX_DIV_CURRENCIES ||
                     _dividendIndex.exists(cur), ERR_TOO_MANY_CURRENCIES);
@@ -680,6 +719,9 @@ contract CompanySIIR {
         }
         require(combined > 0, ERR_NO_CLAIM);
         tvm.accept();
+        // claimer pays: the attached SHELL funds the payout envelope (value +
+        // forward fee) so a claim never drains the company's reserve
+        _fuel(_fuelFor(PAYOUT_VALUE, _emptyBody()));
         mapping(uint32 => varuint32) cc2;
         bool any = false;
         for (uint256 c = 0; c < _divCurrencies.length; c++) {
@@ -694,7 +736,7 @@ contract CompanySIIR {
         // at the receiver and its bounce cannot pay the return fee, losing
         // the currency; always attach VMSHELL gas)
         if (any) {
-            msg.sender.transfer({value: varuint16(1000000000), flag: 1, currencies: cc2});
+            msg.sender.transfer({value: varuint16(PAYOUT_VALUE), flag: 1, currencies: cc2});
         }
     }
 

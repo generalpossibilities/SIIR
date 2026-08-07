@@ -414,6 +414,27 @@ Verified on-chain mechanics learned while building:
   their ecc balance (giver `sendCurrency`, no flag 16); VMSHELL gas is
   separate. A wallet that tries to attach more of a currency than it holds
   simply bounces its own send — top up the sender, not the destination.
+- **Fuel (v2.3.0)**: VMSHELL is nullified crossing Dapp IDs, so every entry
+  converts just enough of the caller's attached SHELL (ecc 2) to native for
+  its own gas + outbound value + forward fees, refunds the excess, and
+  keeps the destination funded the same way (deployCompany carries the
+  child's 20e9 reserve as SHELL). Wallet sends attach it via
+  `sendTransaction(..., cc: {"2": N})`; `cc: {}` reaches the factory but
+  aborts with no fuel to convert.
+- **Addressing (re-verified live)**: legacy `0:<hex>` resolves to the
+  self-rooted `<hex>::<hex>` for every sender — root dapp, giver, and
+  self-rooted wallets alike — so the factory, its children and the wallets
+  all talk over legacy addresses.
+- **The seal (v2.4.0)**: every SIIR page renders a protocol-fixed 200×264
+  SVG stamp (scalloped border, circular clip r=62, tiered palette). The
+  plan's `image` fills a centered 116×116 window (`xMidYMid meet`, never
+  cropped); without an image, a tiered gradient card falls back. The
+  geometry is identical in the browser (`sealCard`) and the gateway
+  (`seal_svg`).
+- **Browser company creation**: `POST /factory/<addr>/deploy` on the
+  gateway (`--writes`) sends `deployCompany` from the gateway wallet with
+  the deploy fuel and returns the new company (plan image ≤ 4 KiB, logo/
+  deed/charter ≤ 1 MiB, UI ≤ 4 MiB).
 
 ## Guiding Principle
 

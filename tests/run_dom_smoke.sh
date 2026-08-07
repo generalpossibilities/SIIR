@@ -46,7 +46,7 @@ wait_ready "/" || { echo "gateway never became ready"; cat "$OUT/gw.log"; exit 1
 
 dump "/"           "$OUT/landing.html"
 dump "/search?q=njd" "$OUT/search.html"
-dump "/company/ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f::fba5b22395a75f9c8dae21068d09e3fdbbf98ee6d6325acf25136b3a085f7fef" "$OUT/company.html"
+dump "/company/d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::a334e243be3f9e8b95814e06c2a718095f05803f6d9635e1dbdd501d37762303" "$OUT/company.html"
 
 echo "== asserting =="
 check "landing title"        "$OUT/landing.html"  "SIIR"

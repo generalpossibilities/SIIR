@@ -21,6 +21,7 @@ tvm-cli getters) and serves:
   GET /company/<addr>/siir/<id>/deed      printable deed card
   GET /company/<addr>/claim               claim form for the gateway's wallet
   POST /company/<addr>/claim              send claim() via the wallet (JSON body {"ids":[...]} or form)
+  POST /factory/<addr>/deploy             deployCompany via the founder wallet (JSON body; mirrors deploy.sh §4)
   GET /company/<addr>/plans, /treasury, /history/<id>   JSON
   GET /company/<addr>/search?q=...        address -> holder page; else label/metadata/owner scan
 
@@ -341,6 +342,78 @@ def decode_data_uri(uri):
 def escape(s):
     s = "" if s is None else str(s)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------- The Seal: official SIIR deed silhouette (mirrors app.js) ----------
+SEAL_TIERS = [
+    ("bronze", "#cd7f32", "#7c4a1e"),
+    ("silver", "#c0c0c0", "#5f6b76"),
+    ("gold", "#ffd700", "#8a6d00"),
+    ("platinum", "#e5e4e2", "#6b7280"),
+    ("genesis", "#34d399", "#065f46"),
+    ("diamond", "#22d3ee", "#155e75"),
+]
+SEAL_TIER_FALLBACK = ("#9aa5b1", "#4b5563")
+
+
+def seal_tier(label):
+    l = (label or "").lower()
+    for name, c1, c2 in SEAL_TIERS:
+        if name in l:
+            return (c1, c2)
+    return SEAL_TIER_FALLBACK
+
+
+def seal_inner(plan, label):
+    img = (plan or {}).get("image") or ""
+    if img:
+        b64 = img.split(",", 1)[1] if "," in img else img
+        return (
+            '<image href="data:image/svg+xml;base64,%s" x="42" y="42" width="116" '
+            'height="116" preserveAspectRatio="xMidYMid meet"/>' % b64
+        )
+    c1, c2 = seal_tier(label)
+    mark = (label or "SIIR").upper()[:9]
+    return (
+        '<defs><linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">'
+        '<stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/>'
+        "</linearGradient></defs>"
+        '<rect x="42" y="42" width="116" height="116" rx="10" fill="url(#tg)"/>'
+        '<circle cx="100" cy="100" r="38" fill="none" stroke="#fff" stroke-width="5" opacity=".85"/>'
+        '<path d="M100 78l8 16 18 3-13 12 3 18-16-8-16 8 3-18-13-12 18-3z" fill="#fff"/>'
+        '<text x="100" y="148" font-size="11" fill="#fff" text-anchor="middle" '
+        'font-family="monospace">%s</text>' % (c1, c2, escape(mark))
+    )
+
+
+def seal_svg(label, round_i, sid, plans, width=230):
+    plans = plans or []
+    plan = plans[round_i] if 0 <= round_i < len(plans) else {}
+    serial = "#%d" % int(sid)
+    return (
+        '<svg class="seal" viewBox="0 0 200 264" width="%d" '
+        'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SIIR deed seal">'
+        '<defs><radialGradient id="sbg" cx=".5" cy=".35" r=".8">'
+        '<stop offset="0" stop-color="#2a3344"/><stop offset="1" stop-color="#101623"/>'
+        "</radialGradient></defs>"
+        '<rect x="0" y="0" width="200" height="264" rx="18" fill="url(#sbg)"/>'
+        '<circle cx="100" cy="108" r="86" fill="none" stroke="#7d8aa0" stroke-width="10" stroke-dasharray="3.2 4.6"/>'
+        '<circle cx="100" cy="108" r="81" fill="none" stroke="#3d4a5e" stroke-width="1.5"/>'
+        '<circle cx="100" cy="108" r="73" fill="#0b1220"/>'
+        '<circle cx="100" cy="108" r="66" fill="none" stroke="#55647c" stroke-width="1"/>'
+        '<clipPath id="sw"><circle cx="100" cy="108" r="62"/></clipPath>'
+        '<g clip-path="url(#sw)">%s</g>'
+        '<circle cx="100" cy="108" r="62" fill="none" stroke="#7d8aa0" stroke-width="2.5"/>'
+        '<circle cx="100" cy="108" r="69" fill="none" stroke="#cdd6e4" stroke-width="1.5" stroke-dasharray="1 6"/>'
+        '<rect x="28" y="200" width="144" height="44" rx="10" fill="#161d2b" stroke="#3d4a5e"/>'
+        '<text x="100" y="218" font-size="12.5" fill="#e5e7eb" text-anchor="middle" '
+        'font-family="sans-serif">%s</text>'
+        '<text x="100" y="236" font-size="9.5" fill="#8b96a8" text-anchor="middle" '
+        'font-family="monospace">SIIR %s</text></svg>' % (
+            width, seal_inner(plan, label), escape(label or ""), serial
+        )
+    )
+
 
 
 def as_int(v, default=0):
@@ -689,6 +762,113 @@ for development (uses <code>scripts/.work/holder.keys.json</code> — dev networ
 <p><a href="/company/{addr}/">company</a></p></body></html>"""
 
 
+F_DEPLOY = 26000000000  # SHELL attached by the founder wallet for a company deploy
+DEPLOY_NATIVE = 3000000000
+
+
+def _keys_pubkey(keys_path):
+    try:
+        return json.load(open(keys_path)).get("public", "")
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def do_deploy(factory, req):
+    """Founder-wallet company deploy (mirrors deploy.sh §4): the founder wallet
+    calls factory.deployCompany as an internal message attaching SHELL; the
+    factory converts exactly the child reserve + gas + forward fees and refunds
+    the excess. Returns the predicted company address, txid, and settle status."""
+    w = gateway_wallet()
+    abi = wallet_abi()
+    if w is None:
+        return {"error": "gateway wallet not configured (scripts/.work/holder.keys.json)"}
+    if abi is None:
+        return {"error": "multisig ABI not found (see --multisig-abi)"}
+    wallet, keys = w
+    founder = req.get("founder") or wallet
+    if not str(founder).startswith("0:"):
+        founder = "0:" + str(founder)
+    founder_pub = req.get("founderPubkey") or ("0x" + _keys_pubkey(keys))
+    if founder_pub and not founder_pub.startswith("0x"):
+        founder_pub = "0x" + founder_pub
+    plans = req.get("plans") or []
+    if not isinstance(plans, list) or not plans:
+        return {"error": "plans: need at least one tier {count, weight, label, image}"}
+    for p in plans:
+        if as_int(p.get("count"), 0) <= 0:
+            return {"error": f"plan {p.get('label')}: count must be > 0"}
+        img = str(p.get("image") or "")
+        if len(img.encode()) > 1 << 12:
+            return {"error": f"plan {p.get('label')}: image exceeds 4 KiB (MAX_PLAN_IMAGE_SIZE)"}
+    for field, limit in (("logoImage", 1 << 20), ("siirImage", 1 << 20),
+                         ("ui", 4 << 20), ("charter", 1 << 20)):
+        if len(str(req.get(field) or "").encode()) > limit:
+            return {"error": f"{field} exceeds {limit} bytes"}
+    params = {
+        "name": str(req.get("name", "")),
+        "description": str(req.get("description", "")),
+        "website": str(req.get("website", "")),
+        "metadataUri": str(req.get("metadataUri", "")),
+        "founder": founder,
+        "founderPubkey": founder_pub,
+        "issuanceModel": as_int(req.get("issuanceModel"), 0),
+        "plans": [{
+            "count": str(as_int(p.get("count"), 0)),
+            "weight": str(as_int(p.get("weight"), 0)),
+            "label": str(p.get("label", "")),
+            "issued": bool(p.get("issued")),
+            "image": str(p.get("image") or ""),
+        } for p in plans],
+        "logoImage": str(req.get("logoImage") or ""),
+        "siirImage": str(req.get("siirImage") or ""),
+        "ui": str(req.get("ui") or ""),
+        "charter": str(req.get("charter") or ""),
+        "initialValue": str(as_int(req.get("initialValue"), 20000000000)),
+        "governanceEnabled": bool(req.get("governanceEnabled")),
+        "quorumPermille": as_int(req.get("quorumPermille"), 500),
+        "dissolutionRule": as_int(req.get("dissolutionRule"), 0),
+        "dissolutionDest": str(req.get("dissolutionDest") or founder),
+    }
+    company = (run_getter(factory, "getCompanyAddress",
+                          json.dumps({"founder": founder,
+                                      "founderPubkey": founder_pub}),
+                          abi=FACTORY_ABI) or {}).get("value0", "")
+    if not company:
+        return {"error": "factory.getCompanyAddress failed (bad factory address?)"}
+    body = tvm_cli("body", "--abi", FACTORY_ABI, "deployCompany", json.dumps(params))
+    try:
+        payload = json.loads(body.stdout)["Message"]
+    except (json.JSONDecodeError, KeyError):
+        return {"error": f"failed to build deployCompany body: {body.stdout[:200]}"}
+    tx = {
+        "dest": "0:" + company.split(":")[-1],
+        "value": str(DEPLOY_NATIVE),
+        "cc": {"2": str(F_DEPLOY)},
+        "bounce": True,
+        "flags": 1,
+        "payload": payload,
+    }
+    out = tvm_cli("callx", "--abi", abi, "--addr", wallet_ext(wallet),
+                  "--keys", keys, "-m", "sendTransaction", json.dumps(tx))
+    if out.returncode != 0:
+        return {"error": f"sendTransaction failed: {out.stderr[:300]}"}
+    try:
+        txid = (json.loads(out.stdout).get("Transaction") or {}).get("id", "")
+    except json.JSONDecodeError:
+        txid = ""
+    dapp = factory.split("::")[0]
+    company_addr = f"{dapp}::{company.split(':')[-1]}"
+    active = False
+    for _ in range(15):
+        time.sleep(2)
+        info = run_getter(company_addr, "getCompanyInfo") or {}
+        if info.get("name"):
+            active = True
+            break
+    return {"company": company_addr, "txid": txid, "active": active,
+            "name": params["name"], "founder": founder}
+
+
 def do_claim(addr, ids):
     """Sign and send claim(ids) from the gateway's wallet; poll until settled."""
     w = gateway_wallet()
@@ -868,14 +1048,17 @@ def siir_page(addr, id_s):
         f"<td>{escape(str(h.get('timestamp','')))}</td></tr>"
         for h in d.get("history", [])
     )
+    plans = lazy_mirror(addr).plans_abi() if lazy_mirror(addr) else []
+    seal = seal_svg(d.get("label", ""), as_int(d.get("round", 0)), d.get("id", 0), plans)
     body = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR #{d['id']}</title>
-<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
-table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}}
-pre{{background:#f6f6f6;padding:8px;border-radius:8px;white-space:pre-wrap;word-break:break-all}}
-a{{color:#1d4ed8}}</style></head><body>
-<h1>SIIR #{d['id']}</h1>
-<p><a href="/company/{addr}/">company</a> · <a href="/company/{addr}/explore">explore</a> ·
-<a href="/company/{addr}/siir/{d['id']}/deed">deed card</a></p>
+ <style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
+ table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}}
+ pre{{background:#f6f6f6;padding:8px;border-radius:8px;white-space:pre-wrap;word-break:break-all}}
+ a{{color:#1d4ed8}}svg.seal{{max-width:230px;height:auto}}</style></head><body>
+ <h1>SIIR #{d['id']}</h1>
+ {seal}
+ <p><a href="/company/{addr}/">company</a> · <a href="/company/{addr}/explore">explore</a> ·
+ <a href="/company/{addr}/siir/{d['id']}/deed">deed card</a></p>
 {claim_btn}
 <table>
 <tr><th>weight</th><td>{escape(str(d.get('weight','')))}</td></tr>
@@ -1456,6 +1639,18 @@ SIIRs are reachable only through the search bar.</p></div>
         path = unquote(parsed.path).strip("/")
         parts = path.split("/") if path else []
         qs = parse_qs(parsed.query)
+        if parts[:1] == ["factory"] and len(parts) >= 3 and parts[2:] == ["deploy"]:
+            factory = parts[1]
+            if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", factory):
+                return self._send(b"bad factory address (want dapp_id::account_id)",
+                                  "text/plain", 400)
+            if not ALLOW_WRITES:
+                return self._send(_writes_blocked(factory).encode(),
+                                  "text/html; charset=utf-8", 403)
+            if _rate_limited(self.client_address[0]):
+                return self._send(b"rate limit exceeded (write endpoints)",
+                                  "text/plain", 429)
+            return self.factory_deploy(factory)
         if parts[:1] == ["company"] and len(parts) >= 2:
             addr = parts[1]
             if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", addr):
@@ -1483,6 +1678,13 @@ SIIRs are reachable only through the search bar.</p></div>
             except json.JSONDecodeError:
                 return None
         return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace")).items()}
+
+    def factory_deploy(self, factory):
+        body = self._read_body()
+        if body is None:
+            return self._send(b"bad JSON body", "text/plain", 400)
+        r = do_deploy(factory, body)
+        return self._send(json.dumps(r).encode(), "application/json")
 
     def company_claim(self, addr, qs):
         body = self._read_body()

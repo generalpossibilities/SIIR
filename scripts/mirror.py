@@ -891,6 +891,7 @@ class MirrorState:
                 "weight": str(p[1]),
                 "label": p[2] or "",
                 "issued": bool(p[3]),
+                "image": p[4] if len(p) > 4 and p[4] else "",
             })
         return out
 

@@ -11,10 +11,10 @@ Project-end goals (per the founder):
 - **UI deployability**: everything currently done from the CLI
   (`scripts/deploy.sh`) must be reachable from a browser.
 
-Current live deployment (shellnet, v2.2.0 stack): factory
-`ed4358e13062277804377fac76d860b30ae9190c66b68bb6daf3b26bb491007f` (self-rooted),
-10B company `…::fba5b223…`, rounds company `…::dc3b5746…`, marketplace/escrow
-`…::dbcfe460…` (see `docs/project.md` §8.7).
+Current live deployment (shellnet, v2.4.0 stack): factory
+`d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea` (self-rooted),
+10B demo company `…::a334e243…`, rounds company `…::4967f8e1…`, marketplace
+`…::3f1cc88a…` (see `docs/project.md` §8.8).
 
 ## P0 — Security, keys & correctness
 
@@ -23,12 +23,22 @@ Current live deployment (shellnet, v2.2.0 stack): factory
    deploys are signed by the user's own keys (browser wallet) and submitted
    directly to the chain. The gateway is **read-only by default** (done this
    round: `POST /claim` → 403, `--writes` opt-in for dev networks only,
-   per-IP rate limit 10/min on write endpoints). Remaining: the browser
-   wallet itself — sign external messages in-browser (ed25519 via WebCrypto)
-   and relay them to the chain endpoint; the public shellnet mirror GraphQL
-   accepts external messages (verified live: signed `callx` lands with a
-   tx_hash through `https://shellnet.ackinacki.org/graphql`), the relay query
-   is the ton-node's hidden operation, format to be pinned in P1.8.
+   per-IP rate limit 10/min on write endpoints). Company creation via the
+   gateway is **DONE**: `POST /factory/<addr>/deploy` (with `--writes`)
+   validates + sends `deployCompany` from the gateway wallet with the
+   deploy SHELL fuel and returns the new company — verified live (§8.8).
+   Remaining: the browser wallet itself — sign external messages in-browser
+   (ed25519 via WebCrypto) and relay them to the chain endpoint; the public
+   shellnet mirror GraphQL accepts external messages (verified live: signed
+   `callx` lands with a tx_hash through
+   `https://shellnet.ackinacki.org/graphql`), the relay query is the
+   ton-node's hidden operation, format to be pinned in P1.8.
+1b. **Legacy addressing (closed investigation, not a defect)** — suspected
+   post-migration routing breakage (self-rooted senders → self-rooted
+   targets) turned out to be transient network queueing: legacy `0:<hex>`
+   resolves to `<hex>::<hex>` for every sender, root dapp included.
+   Verified live by cross-checking factory `last_trans_lt` movement and a
+   successful company deploy (`cc` SHELL attached; see §8.8).
 2. **Grant/revoke founder rights — DONE (v2.2.0)**: `grantFounderRights`
    + `revokeFounderRights` (original founder only, single-admin),
    co-founders hold full founder powers, key-rotation-friendly,
@@ -102,5 +112,13 @@ Current live deployment (shellnet, v2.2.0 stack): factory
 
 ## Closed this round
 
-- Explorer redesign items 6 (static + gateway landings) — commit + Pages deploy.
-- TODO rewritten to the P0–P3 production-readiness structure.
+- Company creation through the gateway: `POST /factory/<addr>/deploy`
+  (`--writes`, rate-limited), verified live against the current factory —
+  new company Active with the 20e9 reserve (§8.8).
+- The SIIR seal (v2.4.0): protocol-fixed SVG stamp, plan-image window,
+  tiered fallback, byte-identical browser/gateway renders; live on the
+  demo company's SIIR pages.
+- Routing investigation closed: legacy `0:<hex>` → self-rooted for every
+  sender (root dapp included); root-dapp redeploy was never needed.
+- Explainer updates: `project.md` §8.8, `SIIR.md` (fuel + seal + deploy
+  endpoint), `gateway.md` (deploy route), this file.
