@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "AKoin Nacki Wallet (shellnet)",
+  "name": "Acki Nacki Wallet (shellnet)",
   "version": "0.1.0",
   "description": "Browser wallet for Acki Nacki shellnet: sends ABI messages, native SHELL/VMSHELL transfers, MetaMask-style bridge for SIIR site.",
   "action": {

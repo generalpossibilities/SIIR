@@ -53,7 +53,7 @@ async function main() {
 }
 $("btn-gen").addEventListener("click", async () => {
   try {
-    const res = await rpcBg("sdk", "crypto.mnemonic_from_random", { word_count: 12 });
+    const res = await rpcBg("sdk", "crypto.mnemonic_from_random", { word_count: 24 });
     $("seed").value = res.mnemonic || res.phrase || "";
   } catch (e) {
     $("vault-err").textContent = e.message || String(e);
