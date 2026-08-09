@@ -232,13 +232,20 @@ no postRequests.** Live values: `rempEnabled=false`, `endpoints=[]`.
 
 ### Writes — external messages go to the Block Keeper API
 
+**VERIFIED LIVE 2026-08-09** (browser wasm SDK → router → BP → on-chain
+`exit_code: 0`): the wire format is NOT `message` — the fields are `id`,
+`body`, `account_id`, `dapp_id`:
+
 ```
 POST https://shellnet.ackinacki.org/v2/messages
 X-EXT-MSG-SENT: <epoch milliseconds>
 Content-Type: application/json
 
-body: JSON array of node requests, e.g. [{ "id": ..., "message": <boc>,
-                                           "dapp_id": <64hex> }, ...]
+body: JSON array, one element per external message:
+      [{ "id": <64-hex message_hash> (the BOC hash, used as nonce),
+         "body": <base64 external-message BOC>,
+         "account_id": <64hex>,   # destination account id
+         "dapp_id": <64hex> }]    # destination dapp id
 
 response: {"result": { "message_hash", "block_hash", "tx_hash",
                        "thread_id", "producers", "current_time",
@@ -247,6 +254,20 @@ response: {"result": { "message_hash", "block_hash", "tx_hash",
            "error":  { "code", "message", "data" },
            "ext_message_token": ...}
 ```
+
+Notes from the live run:
+- The message-router (shellnet.ackinacki.org) validates `account_id` and
+  `dapp_id` as 64-hex and forwards to the BP (`shellnet-2.testbk.ackinacki.org`)
+  over plain http → 308 redirect to https. The router injects an
+  `ext_message_token` object into each element; the BP accepts it.
+- The BP expects the field name `body` (the deployed http-server's
+  `IncomingMessage { id, body, thread_id?, ext_message_token?, dapp_id,
+  account_id }`); `message` → `400 Invalid request body`.
+- Transient `501 Unsupported method ('POST')` was observed from Cloudflare
+  edge nodes (curl and Chrome fetch both hit it intermittently) — retry.
+- Duplicate send (same message_hash twice) → `TVM_ERROR` compute-phase.
+- Verified: tx visible in GraphQL mirror (`last_paid` on the account updates
+  to `state_timestamp`, message hash queryable as an ExtIn message).
 
 Live proof: `POST https://shellnet.ackinacki.org/v2/messages` with `{}`
 returns HTTP 200 with `{"result":null,"error":{"code":"BAD_REQUEST",
@@ -471,3 +492,32 @@ Still open:
 | Mirror schema | `ackinacki/ackinacki` → `gql-server/src/schema/graphql_ext/mod.rs` (`QueryRoot` line ~94) |
 | Saved decode victim | `/tmp/opencode/acct.boc` (2470 bytes, 65 cells) |
 | Working client | `scripts/mirror.py` in this repo |
+
+## 11. Account address derivation (VERIFIED 2026-08-09)
+
+A SIIR-style account is a self-rooted `UpdateCustodianMultisigWallet`
+(ABI v2.4). Its address is computed purely locally, with no network call:
+
+```
+account_id = hash( state_init = { code, data } )
+```
+
+- `code` is fixed (same for every multisig deployment) — extract once via
+  `tvm-cli decode stateinit --tvc UpdateCustodianMultisigWallet.tvc`, keep
+  the `code` field as a constant.
+- `data` = `abi.encode_initial_data({ abi, initial_data: { _pubkey: "0x<pub>" } })`
+  with the **full contract ABI JSON** (the ABI's `fields` list contains
+  `{init: true, name: "_pubkey", type: "uint256"}`; all other fields encode
+  to zero/defaults automatically).
+- `account_id` = `boc.get_boc_hash(boc: encode_state_init({code, data}).state_init)`.
+
+Proven byte-for-byte against `tvm-cli genaddr --setkey`:
+- founder key → `c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb`
+- new random key `fb663d63…929c0e` → `e0392c357d34e226b205b01e9168f8cf3f2b8bc02552a70b3c851df3de68b5b1`
+
+Gotchas:
+- The real ABI must be passed (not a trimmed one): `encode_initial_data`
+  with a reduced ABI produced a minimal 60-char data cell that did NOT
+  match; the full ABI yields the exact 216-char cell the CLI writes.
+- `initial_pubkey` is rejected for ABI 2.4 ("must specify in initial_data");
+  pass `_pubkey` inside `initial_data`.

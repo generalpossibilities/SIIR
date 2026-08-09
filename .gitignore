@@ -33,3 +33,7 @@ scripts/__pycache__/
 static/bundle.html
 
 tests/__pycache__/
+ackinacki-wallet-latest.apk
+
+# Wallet extension node deps (dist is committed, no build needed for users)
+wallet/node_modules/
