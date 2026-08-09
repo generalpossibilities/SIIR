@@ -37,3 +37,6 @@ ackinacki-wallet-latest.apk
 
 # Wallet extension node deps (dist is committed, no build needed for users)
 wallet/node_modules/
+
+# User-extracted zip copies
+wallet/wallet-extension/
