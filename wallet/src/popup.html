@@ -14,7 +14,7 @@
 
   <main id="screen-vault" class="screen" hidden>
     <div id="vault-create" class="panel">
-      <h1>Create vault</h1>
+      <h1>Create wallet</h1>
       <p class="hint">Import an existing seed phrase (24 words for the SIIR founder key) or generate a new wallet.</p>
       <label>Seed phrase <textarea id="seed" rows="5" placeholder="24 words …"></textarea></label>
       <p class="hint">The password only encrypts the seed copy stored in this browser (AES-GCM, PBKDF2 210k). It is never sent anywhere — you re-enter it on each unlock to sign transactions.</p>
@@ -26,7 +26,7 @@
     </div>
     <div id="vault-unlock" class="panel" hidden>
       <h1>Unlock</h1>
-      <p class="hint">Same password you set when creating the vault — it decrypts the seed stored in this browser locally.</p>
+      <p class="hint">Same password you set when creating the wallet — it decrypts the seed stored in this browser locally.</p>
       <label>Password <input id="upw" type="password" /></label>
       <button id="btn-unlock">Unlock</button>
       <div class="err" id="unlock-err"></div>
