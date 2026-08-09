@@ -69,7 +69,7 @@ async function deriveAccountId(pubkeyHex) {
   return hash.hash;
 }
 async function deriveFromMnemonic(phrase) {
-  const kp = await callSdk("crypto.mnemonic_derive_sign_keys", { phrase, path: "m/44'/396'/0'/0/0" });
+  const kp = await callSdk("crypto.mnemonic_derive_sign_keys", { phrase, path: "m/44'/1331'/0'/0/0" });
   const account_id = await deriveAccountId(kp.public);
   return { phrase, public: kp.public, secret: kp.secret, account_id };
 }
