@@ -44,7 +44,7 @@ async function showAccount(kp) {
 async function main() {
   const status = await rpcBg("vault_status", null, null);
   $("screen-vault").hidden = false;
-  if (!status.hasVault) {
+  if (!status || !status.hasVault) {
     $("vault-create").hidden = false;
     $("vault-unlock").hidden = true;
   } else if (!status.unlocked) {

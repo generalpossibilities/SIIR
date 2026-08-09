@@ -276,7 +276,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       switch (msg && msg.kind) {
         case "vault_status": {
           const vault = await loadVault();
-          sendResponse({ ok: true, unlocked: SESSION.unlocked, hasVault: !!vault });
+          sendResponse({ ok: true, result: { unlocked: SESSION.unlocked, hasVault: !!vault } });
           return;
         }
         case "vault_create": {
