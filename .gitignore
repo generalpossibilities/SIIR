@@ -32,6 +32,13 @@ scripts/__pycache__/
 # Generated single-file bundle (build with static/bundle.py)
 static/bundle.html
 
+# Internal docs (not for the public repo)
+docs/
+
+# Wallet build artifacts (regenerate with wallet/build.mjs; dist gets rebuilt locally)
+wallet/dist/
+wallet/*.zip
+
 tests/__pycache__/
 ackinacki-wallet-latest.apk
 
