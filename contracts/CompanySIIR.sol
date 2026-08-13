@@ -59,16 +59,24 @@
  * reports the first non-SHELL track. Key-loss stance (by design): no
  * recovery function exists; a lost wallet key means the SIIRs' dividends
  * are lost with it — the register and history stay immutable.
+ *
+ * v2.6: explorer snapshots (P1). The factory passes the protocol explorer's
+ * address at creation; every issue() and depositDividends() publishes the
+ * register/treasury headline there (SIIRExplorer.pushSnapshot) so clients
+ * can list all companies + latest state from a single contract. Pushes are
+ * push-only and never read back; the explorer can never constrain this
+ * contract, which stays immutable forever.
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
 pragma AbiHeader pubkey;
 
 import "./SIIRFuel.sol";
+import "./SIIRExplorer.sol";
 
 contract CompanySIIR is SIIRFuel {
     // ---------- constants ----------
-    string constant version = "2.5.0";
+    string constant version = "2.6.0";
 
     // Fixed-point scale for the dividend index (9 decimals = SHELL decimals)
     uint128 constant SCALE = 1e9;
@@ -149,6 +157,11 @@ contract CompanySIIR is SIIRFuel {
     address static _factory;
     address static _founder;
     uint256 static _founderPubkey;
+
+    // Protocol explorer injected by the factory at creation (v2.6). Push-only
+    // sink for register/treasury snapshots; 0 when the founder deploys this
+    // contract directly without an explorer.
+    address _explorer;
 
     // ---------- identity ----------
     string _name;
@@ -311,7 +324,8 @@ contract CompanySIIR is SIIRFuel {
         bool governanceEnabled,
         uint16 quorumPermille,
         uint8 dissolutionRule,
-        address dissolutionDest
+        address dissolutionDest,
+        address explorer
     ) accept {
         require(msg.sender == _factory, ERR_NOT_OWNER);
         require(issuanceModel == MODEL_FULL_CAP || issuanceModel == MODEL_ROUNDS, ERR_BAD_ISSUANCE);
@@ -342,6 +356,7 @@ contract CompanySIIR is SIIRFuel {
         _quorumPermille = quorumPermille;
         _dissolutionRule = dissolutionRule;
         _dissolutionDest = dissolutionDest;
+        _explorer = explorer;
         _nextId = 1;
         emit CompanyCreated(_factory, _founder, _name, _issuanceModel);
     }
@@ -522,6 +537,15 @@ contract CompanySIIR is SIIRFuel {
         _mintPlan(plan);
         _plans[_planIndex].issued = true;
         _planIndex++;
+        if (_explorer.value != 0) {
+            // publish the register headline at the protocol explorer (v2.6);
+            // runs on the company's deploy reserve, like every founder-key op
+            SIIRExplorer(_explorer).pushSnapshot{
+                value: varuint16(PAYOUT_VALUE),
+                flag: 1
+            }(address(this), _totalWeight, _issuedCount, uint32(_plans.length),
+              _planIndex, _headlineIndex(), _headlineDeposited());
+        }
     }
 
     function _mintPlan(TierPlan plan) private {
@@ -676,6 +700,11 @@ contract CompanySIIR is SIIRFuel {
         // receiving value, not spending it.
         uint128 inboundShell = uint128(msg.currencies[CURRENCY_SHELL]);
         uint128 fuelSlice = _fuelOwn();
+        // v2.6: cover the explorer snapshot push (value + forward fee) from
+        // the attached SHELL too — but only when the depositor actually
+        // carried it; a thin depositor doesn't drain the company reserve.
+        bool push = _explorer.value != 0 && inboundShell >= fuelSlice + _snapshotFuel();
+        if (push) fuelSlice += _snapshotFuel();
         uint128 convert = inboundShell > fuelSlice ? fuelSlice : inboundShell;
         if (convert > 0) {
             gosh.cnvrtshellq(uint64(convert));
@@ -698,6 +727,36 @@ contract CompanySIIR is SIIRFuel {
         }
         require(total > 0, ERR_NOTHING_DEPOSITED);
         if (_dissolved) _finalDeposited = true;
+        if (push) {
+            SIIRExplorer(_explorer).pushSnapshot{
+                value: varuint16(PAYOUT_VALUE),
+                flag: 1
+            }(address(this), _totalWeight, _issuedCount, uint32(_plans.length),
+              _planIndex, _headlineIndex(), _headlineDeposited());
+        }
+    }
+
+    // ---------- explorer snapshots (v2.6) ----------
+    /// Headline track: the first non-SHELL dividend currency (matches
+    /// getCompanyInfo). 0 until any dividends have ever been deposited.
+    function _headlineIndex() private view returns (uint128) {
+        return _divCurrencies.length > 0 ? _dividendIndex[_divCurrencies[0]] : 0;
+    }
+
+    function _headlineDeposited() private view returns (uint128) {
+        return _divCurrencies.length > 0 ? _deposited[_divCurrencies[0]] : 0;
+    }
+
+    /// Push body with zeroed values — same cell size as the real push, so it
+    /// doubles as the forward-fee estimate.
+    function _snapshotBody() private pure returns (TvmCell) {
+        return abi.encodeBody(SIIRExplorer.pushSnapshot,
+            address(0), uint128(0), uint128(0), uint32(0), uint32(0),
+            uint128(0), uint128(0));
+    }
+
+    function _snapshotFuel() private view returns (uint128) {
+        return uint128(PAYOUT_VALUE) + _estimateFwdFee(_snapshotBody());
     }
 
     /// Claim pending dividends for owned SIIRs. Every active payout track is
@@ -784,6 +843,10 @@ contract CompanySIIR is SIIRFuel {
             divIndex, depositedTotal,
             uint128(_divCurrencies.length), _nextId
         );
+    }
+
+    function getExplorerAddress() external view returns (address) {
+        return _explorer;
     }
 
     /// Every active payout track: currency id, its accumulated index, and its

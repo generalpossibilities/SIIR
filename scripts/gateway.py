@@ -21,8 +21,6 @@ tvm-cli getters) and serves:
   GET /company/<addr>/siir/<id>/deed      printable deed card
   GET /company/<addr>/claim               claim form for the gateway's wallet
   POST /company/<addr>/claim              send claim() via the wallet (JSON body {"ids":[...]} or form)
-  POST /factory/<addr>/deploy             deployCompany via the founder wallet (JSON body; mirrors deploy.sh §4)
-  GET /factory/<addr>/deploy              deploy form page (--writes only; posts JSON to the same URL)
   GET /company/<addr>/plans, /treasury, /history/<id>   JSON
   GET /company/<addr>/search?q=...        address -> holder page; else label/metadata/owner scan
   GET /marketplace/<addr>/stats.json      per-currency order-book summary (best bid/ask, mark, spread, opens)
@@ -921,115 +919,6 @@ for development (uses <code>scripts/.work/holder.keys.json</code> — dev networ
 <p><a href="/company/{addr}/">company</a></p></body></html>"""
 
 
-F_DEPLOY = 26000000000  # SHELL attached by the founder wallet for a company deploy
-DEPLOY_NATIVE = 3000000000
-
-
-def _keys_pubkey(keys_path):
-    try:
-        return json.load(open(keys_path)).get("public", "")
-    except (OSError, json.JSONDecodeError):
-        return ""
-
-
-def do_deploy(factory, req):
-    """Founder-wallet company deploy (mirrors deploy.sh §4): the founder wallet
-    calls factory.deployCompany as an internal message attaching SHELL; the
-    factory converts exactly the child reserve + gas + forward fees and refunds
-    the excess. Returns the predicted company address, txid, and settle status."""
-    w = gateway_wallet()
-    abi = wallet_abi()
-    if w is None:
-        return {"error": "gateway wallet not configured (scripts/.work/holder.keys.json)"}
-    if abi is None:
-        return {"error": "multisig ABI not found (see --multisig-abi)"}
-    wallet, keys = w
-    founder = req.get("founder") or wallet
-    if not str(founder).startswith("0:"):
-        founder = "0:" + str(founder)
-    founder_pub = req.get("founderPubkey") or ("0x" + _keys_pubkey(keys))
-    if founder_pub and not founder_pub.startswith("0x"):
-        founder_pub = "0x" + founder_pub
-    plans = req.get("plans") or []
-    if not isinstance(plans, list) or not plans:
-        return {"error": "plans: need at least one tier {count, weight, label, image}"}
-    for p in plans:
-        if as_int(p.get("count"), 0) <= 0:
-            return {"error": f"plan {p.get('label')}: count must be > 0"}
-        img = str(p.get("image") or "")
-        if len(img.encode()) > 1 << 12:
-            return {"error": f"plan {p.get('label')}: image exceeds 4 KiB (MAX_PLAN_IMAGE_SIZE)"}
-    for field, limit in (("logoImage", 1 << 20), ("siirImage", 1 << 20),
-                         ("ui", 4 << 20), ("charter", 1 << 20)):
-        if len(str(req.get(field) or "").encode()) > limit:
-            return {"error": f"{field} exceeds {limit} bytes"}
-    params = {
-        "name": str(req.get("name", "")),
-        "description": str(req.get("description", "")),
-        "website": str(req.get("website", "")),
-        "metadataUri": str(req.get("metadataUri", "")),
-        "founder": founder,
-        "founderPubkey": founder_pub,
-        "issuanceModel": as_int(req.get("issuanceModel"), 0),
-        "plans": [{
-            "count": str(as_int(p.get("count"), 0)),
-            "weight": str(as_int(p.get("weight"), 0)),
-            "label": str(p.get("label", "")),
-            "issued": bool(p.get("issued")),
-            "image": str(p.get("image") or ""),
-        } for p in plans],
-        "logoImage": str(req.get("logoImage") or ""),
-        "siirImage": str(req.get("siirImage") or ""),
-        "ui": str(req.get("ui") or ""),
-        "charter": str(req.get("charter") or ""),
-        "initialValue": str(as_int(req.get("initialValue"), 20000000000)),
-        "governanceEnabled": bool(req.get("governanceEnabled")),
-        "quorumPermille": as_int(req.get("quorumPermille"), 500),
-        "dissolutionRule": as_int(req.get("dissolutionRule"), 0),
-        "dissolutionDest": str(req.get("dissolutionDest") or founder),
-    }
-    company = (run_getter(factory, "getCompanyAddress",
-                          json.dumps({"founder": founder,
-                                      "founderPubkey": founder_pub}),
-                          abi=FACTORY_ABI) or {}).get("value0", "")
-    if not company:
-        return {"error": "factory.getCompanyAddress failed (bad factory address?)"}
-    body = tvm_cli("body", "--abi", FACTORY_ABI, "deployCompany", json.dumps(params))
-    try:
-        payload = json.loads(body.stdout)["Message"]
-    except (json.JSONDecodeError, KeyError):
-        return {"error": f"failed to build deployCompany body: {body.stdout[:200]}"}
-    tx = {
-        # deployCompany must reach the factory (onlyOwnerOrFounder path): the
-        # factory converts the attached SHELL to fuel and deploys the child
-        "dest": "0:" + factory.split("::")[-1],
-        "value": str(DEPLOY_NATIVE),
-        "cc": {"2": str(F_DEPLOY)},
-        "bounce": True,
-        "flags": 1,
-        "payload": payload,
-    }
-    out = tvm_cli("callx", "--abi", abi, "--addr", wallet_ext(wallet),
-                  "--keys", keys, "-m", "sendTransaction", json.dumps(tx))
-    if out.returncode != 0:
-        return {"error": f"sendTransaction failed: {out.stderr[:300]}"}
-    try:
-        txid = (json.loads(out.stdout) or {}).get("tx_hash", "")
-    except json.JSONDecodeError:
-        txid = ""
-    dapp = factory.split("::")[0]
-    company_addr = f"{dapp}::{company.split(':')[-1]}"
-    active = False
-    for _ in range(15):
-        time.sleep(2)
-        info = run_getter(company_addr, "getCompanyInfo") or {}
-        if info.get("name"):
-            active = True
-            break
-    return {"company": company_addr, "txid": txid, "active": active,
-            "name": params["name"], "founder": founder}
-
-
 def do_claim(addr, ids):
     """Sign and send claim(ids) from the gateway's wallet; poll until settled."""
     w = gateway_wallet()
@@ -1361,105 +1250,6 @@ def fresh_pubkey():
             pass
 
 
-def deploy_form_page(addr):
-    """Founder-wallet company deploy form (dev/ops only, requires --writes).
-    Signing happens here on the gateway with scripts/.work/holder.keys.json;
-    the private key never leaves the server. POSTs JSON to the same URL."""
-    w = gateway_wallet()
-    wallet = (w[0] if w else "") or ""
-    plans_rows = "".join(
-        '<tr><td><input name="p-count" class="num" value="1" placeholder="count"></td>'
-        '<td><input name="p-weight" class="num" value="1000" placeholder="weight"></td>'
-        '<td><input name="p-label" placeholder="label (e.g. early birds)"></td></tr>'
-        for _ in range(3))
-    return f"""<!doctype html><html><head><meta charset="utf-8"><title>deploy company — SIIR</title>
-<style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 16px;color:#111}}
-label{{display:block;margin:10px 0 4px;font-weight:600;font-size:14px}}
-input,select,textarea{{width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;font:13px ui-monospace,Menlo,Consolas,monospace}}
-input.num{{width:110px}} table{{border-collapse:collapse;width:100%}} td{{padding:4px}}
-button{{cursor:pointer;font:inherit;font-weight:700;background:#1d4ed8;color:#fff;border:0;border-radius:9px;padding:10px 18px;margin-top:14px}}
-.ok{{color:#15803d}} .err{{color:#b91c1c}} .mut{{color:#64748b;font-size:13px}}
-#out{{white-space:pre-wrap;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;font:12px ui-monospace,monospace;display:none}}
-a{{color:#1d4ed8}}</style></head><body>
-<h1>Deploy a company</h1>
-<p class="mut">the gateway's wallet (<code>{escape(wallet)}</code>) calls <code>factory.deployCompany</code>
-as an internal message attaching SHELL fuel; the factory converts exactly the child reserve + gas and refunds
-the excess. Signing happens on this server with the gateway's key — it never leaves.</p>
-<form id="df">
-<label>company name</label><input id="f-name" required placeholder="Acme SIIRs">
-<label>description</label><input id="f-desc" placeholder="one line about the company">
-<label>website</label><input id="f-web" placeholder="https://…">
-<div style="display:flex;gap:14px;flex-wrap:wrap">
-<div style="flex:1"><label>issuance model</label>
-<select id="f-model"><option value="0">full-cap (classic)</option><option value="1">rounds</option></select></div>
-<div style="flex:1"><label>initial value (per SIIR, raw)</label>
-<input id="f-init" value="20000000000"></div></div>
-<label>plans (count · weight · label — one row per tier)</label>
-<table>{plans_rows}</table>
-<label>founder (default: gateway wallet)</label>
-<input id="f-founder" placeholder="{escape(wallet)}">
-<label>founder pubkey (optional — a fresh 0x… pubkey makes a unique company address; the factory
-derives it from founder+pubkey, so reuse collides with existing companies)</label>
-<input id="f-pub" placeholder="0x…">
-<p><button type="button" id="f-fresh">generate a fresh key</button></p>
-<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
-<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-gov" style="width:auto">
-governance enabled</label>
-<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-gov2" style="width:auto">
-governance v2</label>
-<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-ld" style="width:auto">
-locked dividends</label>
-<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="f-c" style="width:auto">
-sealed charter</label></div>
-<p><button type="submit">deploy</button> <span class="mut">~30s settle</span></p>
-</form>
-<div id="out"></div>
-<script>
-var FORM=document.getElementById('df');
-document.getElementById('f-fresh').addEventListener('click',function(){{
-  fetch('/factory/{escape(addr)}/keygen').then(function(r){{return r.json()}}).then(function(j){{
-    if(j.founderPubkey)document.getElementById('f-pub').value=j.founderPubkey;
-  }});
-}});
-FORM.addEventListener('submit',function(e){{
-  e.preventDefault();
-  var plans=[];
-  document.querySelectorAll('#df table tr').forEach(function(tr){{
-    var c=tr.querySelector('[name=p-count]'),w=tr.querySelector('[name=p-weight]'),
-        l=tr.querySelector('[name=p-label]');
-    if(c&&w&&l&&parseInt(c.value,10)>0&&l.value.trim())
-      plans.push({{count:parseInt(c.value,10),weight:parseInt(w.value,10),label:l.value.trim()}});
-  }});
-  var body={{name:document.getElementById('f-name').value,
-    description:document.getElementById('f-desc').value,
-    website:document.getElementById('f-web').value,
-    issuanceModel:parseInt(document.getElementById('f-model').value,10),
-    initialValue:parseInt(document.getElementById('f-init').value,10),
-    plans:plans,
-    founder:document.getElementById('f-founder').value||null,
-    founderPubkey:document.getElementById('f-pub').value||null,
-    governanceEnabled:document.getElementById('f-gov').checked,
-    governanceV2:document.getElementById('f-gov2').checked,
-    lockedDividends:document.getElementById('f-ld').checked,
-    sealedCharter:document.getElementById('f-c').checked}};
-  var out=document.getElementById('out');
-  out.style.display='block';out.textContent='sending…';
-  fetch('/factory/{escape(addr)}/deploy',{{method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify(body)}})
-   .then(function(r){{return r.json()}})
-   .then(function(j){{
-     if(j.error){{out.className='err';out.textContent='error: '+j.error;return}}
-     out.className='ok';
-     out.textContent='company: '+j.company+'\\nmodel: '+j.issuanceModel+
-       '\\nstatus: '+(j.settled?'settled ✓':'pending…')+'\\ntxid: '+(j.txid||'?');
-   }}).catch(function(e){{out.className='err';out.textContent='failed: '+e;}});
-}});
-</script>
-<p class="mut"><a href="/factory/{escape(addr)}/">factory directory</a></p>
-</body></html>"""
-
-
 def factory_page(addr):
     info = run_getter(addr, "getCompanyList") or {}
     count = run_getter(addr, "getCompanyCount") or {}
@@ -1480,7 +1270,6 @@ a{{color:#1d4ed8}} li{{margin:6px 0}} code{{font-size:12px}}</style></head><body
 <p>companies registered in <code>{escape(addr)}</code> — read straight from the factory's
 on-chain registry (mirror decode).</p>
 <p><strong>{count.get('count', '?')}</strong> registered · marketplace: {mkt_href}</p>
-{'<p><a href="/factory/%s/deploy">deploy a company (gateway wallet)</a></p>' % escape(addr) if ALLOW_WRITES else ''}
 <ul>{rows or '<li>no companies registered</li>'}</ul>
 <p><small><a href="/factory/">back to factory index</a></small></p></body></html>"""
     return body
@@ -1793,12 +1582,6 @@ class Handler(BaseHTTPRequestHandler):
             data = run_getter(addr, "getCompanyList", abi=FACTORY_ABI)
             if data is None:
                 return self._send(b"factory unreachable", "text/plain", 503)
-            if len(parts) > 2 and parts[2] == "deploy":
-                if not ALLOW_WRITES:
-                    return self._send(b"writes disabled (run with --writes)",
-                                      "text/plain", 403)
-                return self._send(deploy_form_page(addr).encode(),
-                                  "text/html; charset=utf-8")
             if len(parts) > 2 and parts[2] == "keygen":
                 if not ALLOW_WRITES:
                     return self._send(b"writes disabled (run with --writes)",
@@ -1978,18 +1761,6 @@ SIIRs are reachable only through the search bar.</p></div>
         path = unquote(parsed.path).strip("/")
         parts = path.split("/") if path else []
         qs = parse_qs(parsed.query)
-        if parts[:1] == ["factory"] and len(parts) >= 3 and parts[2:] == ["deploy"]:
-            factory = parts[1]
-            if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", factory):
-                return self._send(b"bad factory address (want dapp_id::account_id)",
-                                  "text/plain", 400)
-            if not ALLOW_WRITES:
-                return self._send(_writes_blocked(factory).encode(),
-                                  "text/html; charset=utf-8", 403)
-            if _rate_limited(self.client_address[0]):
-                return self._send(b"rate limit exceeded (write endpoints)",
-                                  "text/plain", 429)
-            return self.factory_deploy(factory)
         if parts[:1] == ["company"] and len(parts) >= 2:
             addr = parts[1]
             if not re.fullmatch(r"[0-9a-f]{64}::[0-9a-f]{64}", addr):
@@ -2018,12 +1789,6 @@ SIIRs are reachable only through the search bar.</p></div>
                 return None
         return {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace")).items()}
 
-    def factory_deploy(self, factory):
-        body = self._read_body()
-        if body is None:
-            return self._send(b"bad JSON body", "text/plain", 400)
-        r = do_deploy(factory, body)
-        return self._send(json.dumps(r).encode(), "application/json")
 
     def company_claim(self, addr, qs):
         body = self._read_body()

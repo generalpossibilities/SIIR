@@ -12,6 +12,9 @@
 # PLAN_COUNT=10000000000 additionally runs the 10B-scale proof: one O(1)
 # issue() for all 10B ids, derived getSIIR spot checks (1 / mid / last),
 # getBalanceOf, and a single transferRange covering the whole register.
+# PLANS_CONFIG=<path> replaces the hardcoded plans with plans derived from a
+# weight-based config (scripts/plans.py): totalWeight + tiers {label,
+# pct, weightPer} — SIIR counts are computed, never entered.
 # DEMO_FOUNDER_RIGHTS=1 runs the v2.2.0 founder-rights demo on the rounds
 # company: grant -> co-founder ratify -> single-admin check -> revoke -> dead key.
 #
@@ -73,8 +76,8 @@ fund() { # fund <self-or-full> <shell_nano>  — bootstrap only: VMSHELL gas (fl
 # the excess, so these are generous upper bounds, not exact budgets.
 F_OP=2000000000        # no-outbound ops: transfer, transferRange, voteDissolve, list, cancelBid
 F_CLAIM=3000000000     # claim: own gas + 1 VMSHELL payout + fwd fee
-F_DEPLOY=26000000000   # deployCompany A: 20 VMSHELL child reserve + bundle fwd fees
-F_DEPLOY_B=24000000000 # deployCompany B (no UI bundle)
+F_DEPLOY=30000000000   # deployCompany A: 20 VMSHELL child reserve + bundle fwd fees + explorer register push
+F_DEPLOY_B=28000000000 # deployCompany B (no UI bundle, same register push)
 F_BID_ESCROW=9000000000 # per-bid settlement escrow (acceptBid gas + 2 payout hops + deed SHELL fuel)
 
 fund_shell() { # fund_shell <fulladdr> <shell_nano> — mid-run refill, SHELL only (no flag16)
@@ -122,6 +125,7 @@ body() { # body <abi> <method> <json>
 
 company_code() { tvm-cli -j decode stateinit --tvc "$CT/CompanySIIR.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
 marketplace_code() { tvm-cli -j decode stateinit --tvc "$CT/SIIRMarketplace.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
+explorer_code() { tvm-cli -j decode stateinit --tvc "$CT/SIIRExplorer.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
 
 # On-chain content: base64 data-URI strings supplied at CompanySIIR deployment.
 # These round-trip through factory.deployCompany and are readable via getters.
@@ -143,6 +147,19 @@ TIER_BRONZE=$(tier_svg '#cd7f32' '#7c4a1e' BRONZE)
 TIER_SILVER=$(tier_svg '#c0c0c0' '#5f6b76' SILVER)
 TIER_GOLD=$(tier_svg '#ffd700' '#8a6d00' GOLD)
 TIER_PLATINUM=$(tier_svg '#e5e4e2' '#6b7280' PLATINUM)
+
+# ---- plans config (optional) ----
+# PLANS_CONFIG=<path> derives the deployCompany plans array from a weight-based
+# config (scripts/plans.py: totalWeight + tiers {label, pct, weightPer},
+# counts derived). Without it the legacy PLAN_COUNT genesis plan is used.
+GENESIS_PLANS="[{\"count\":${PLAN_COUNT:-100},\"weight\":1000,\"label\":\"Genesis\",\"issued\":false,\"image\":\"$TIER_GENESIS\"}]"
+PLANS_JSON="${PLANS_JSON:-}"
+if [ -n "${PLANS_CONFIG:-}" ]; then
+  PLANS_JSON=$(python3 "$ROOT/scripts/plans.py" "$PLANS_CONFIG" --emit) || exit 1
+  echo "  plans derived from $PLANS_CONFIG:"
+  python3 "$ROOT/scripts/plans.py" "$PLANS_CONFIG" | sed 's/^/    /' || true
+fi
+[ -n "$PLANS_JSON" ] || PLANS_JSON="$GENESIS_PLANS"
 UI_BUNDLE=$(python3 static/bundle.py --emit 2>/dev/null || python3 - <<'PY'
 import base64
 html = "<!doctype html><html><body><h1>NJD Ventures</h1><p>shareholder register on-chain</p></body></html>"
@@ -188,17 +205,20 @@ run() { cli run "$1" "$2" "$3" --abi "$4" 2>&1; }
 
 # does the deployed factory hold the current code cells (company + marketplace)?
 factory_stale() {
-  local local_cc stored_cc local_mc stored_mc ver want
+  local local_cc stored_cc local_mc stored_mc local_ec stored_ec ver want
   local_cc=$(company_code)
   stored_cc=$(cli run "$1" getCompanyCode '{}' --abi "$CT/SIIRFactory.abi.json" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"])' 2>/dev/null || echo "")
   local_mc=$(marketplace_code)
   stored_mc=$(cli run "$1" getMarketplaceCode '{}' --abi "$CT/SIIRFactory.abi.json" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+  local_ec=$(explorer_code)
+  stored_ec=$(cli run "$1" getExplorerCode '{}' --abi "$CT/SIIRFactory.abi.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
   ver=$(cli run "$1" getFactoryInfo '{}' --abi "$CT/SIIRFactory.abi.json" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ver",""))' 2>/dev/null || echo "")
   want=$(grep -m1 'string constant version' "$CT/SIIRFactory.sol" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-  [ "$stored_cc" != "$local_cc" ] || [ "$stored_mc" != "$local_mc" ] || [ "$ver" != "$want" ]
+  [ "$stored_cc" != "$local_cc" ] || [ "$stored_mc" != "$local_mc" ] || [ "$stored_ec" != "$local_ec" ] || [ "$ver" != "$want" ]
 }
 
 # ---------- 1. build ----------
@@ -220,9 +240,9 @@ if ! cli account "$FACTORY" 2>/dev/null | grep -q '"Active"' || factory_stale "$
   fi
   fund "$FACTORY" 100000000000
   sleep 5
-  echo "  deploying factory (with marketplace code)..."
+  echo "  deploying factory (with marketplace + explorer code)..."
   deploy_self SIIRFactory "$WORK/factory.keys.json" "$CT/SIIRFactory.abi.json" \
-    "{\"value\":30000000000,\"companyCode\":\"$(company_code)\",\"marketplaceCode\":\"$(marketplace_code)\"}"
+    "{\"value\":30000000000,\"companyCode\":\"$(company_code)\",\"marketplaceCode\":\"$(marketplace_code)\",\"explorerCode\":\"$(explorer_code)\"}"
   wait_active "$FACTORY" "factory"
 fi
 cli run "$FACTORY" getFactoryInfo {} --abi "$CT/SIIRFactory.abi.json"
@@ -230,6 +250,11 @@ MARKET_RAW=$(cli run "$FACTORY" getMarketplaceAddress '{}' --abi "$CT/SIIRFactor
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"].split(":")[1])' 2>/dev/null || echo "")
 MARKET=$(self "$MARKET_RAW")   # marketplace is factory's child: same dapp-id
 echo "  marketplace: $MARKET"
+EXPLORER_RAW=$(cli run "$FACTORY" getExplorerAddress '{}' --abi "$CT/SIIRFactory.abi.json" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["value0"].split(":")[1])' 2>/dev/null || echo "")
+EXPLORER=$(self "$EXPLORER_RAW")
+echo "  explorer: $EXPLORER"
+echo "$EXPLORER" > "$WORK/explorer.addr"
 # v2.3.0: no reserve topup — every op converts its fuel from the caller's
 # attached SHELL, and acceptBid runs on the bidder's escrow.
 if ! cli account "$MARKET" 2>/dev/null | grep -q '"Active"'; then
@@ -288,7 +313,7 @@ if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
         \"payload\":\"$(body "$CT/SIIRFactory.abi.json" deployCompany \
         "{\"name\":\"NJD Ventures\",\"description\":\"SIIR demo company\",\"website\":\"https://njd.example\",\
           \"metadataUri\":\"ipfs://QmSIIRdemo\",\"founder\":\"$(legacy "$FOUNDER")\",\"founderPubkey\":\"0x$FOUNDER_PUB\",\
-          \"issuanceModel\":0,\"plans\":[{\"count\":${PLAN_COUNT:-100},\"weight\":1000,\"label\":\"Genesis\",\"issued\":false,\"image\":\"$TIER_GENESIS\"}],\
+          \"issuanceModel\":0,\"plans\":$PLANS_JSON,\
           \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"$UI_BUNDLE\",\
           \"charter\":$CHARTER,\"initialValue\":20000000000,\
           \"governanceEnabled\":${GOV_ENABLED:-false},\"quorumPermille\":${GOV_QUORUM:-500},\
@@ -479,10 +504,7 @@ if ! cli account "$COMPANY_B" 2>/dev/null | grep -q '"Active"'; then
         \"payload\":\"$(body "$CT/SIIRFactory.abi.json" deployCompany \
         "{\"name\":\"Rounds Inc\",\"description\":\"model-B company\",\"website\":\"\",\"metadataUri\":\"\",\
           \"founder\":\"$(legacy "$HOLDER")\",\"founderPubkey\":\"0x$B_FOUNDER_PUB\",\"issuanceModel\":1,\
-          \"plans\":[{\"count\":25,\"weight\":1000,\"label\":\"Bronze\",\"issued\":false,\"image\":\"$TIER_BRONZE\"},\
-                    {\"count\":25,\"weight\":2000,\"label\":\"Silver\",\"issued\":false,\"image\":\"$TIER_SILVER\"},\
-                    {\"count\":25,\"weight\":4000,\"label\":\"Gold\",\"issued\":false,\"image\":\"$TIER_GOLD\"},\
-                    {\"count\":25,\"weight\":8000,\"label\":\"Platinum\",\"issued\":false,\"image\":\"$TIER_PLATINUM\"}],\
+          \"plans\":$PLANS_JSON,\
           \"logoImage\":\"$LOGO_SVG\",\"siirImage\":\"$SIIRIMG_SVG\",\"ui\":\"\",\
           \"charter\":$CHARTER,\"initialValue\":20000000000,\
           \"governanceEnabled\":${GOV_ENABLED:-false},\"quorumPermille\":${GOV_QUORUM:-500},\

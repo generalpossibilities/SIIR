@@ -28,6 +28,10 @@
  * converts from the escrow instead of charging the seller. cancelBid
  * returns the full escrow. Deed returns (delist), dividend forwarding
  * (claimAndForward/settleClaims) are fueled by the caller.
+ *
+ * v2.4: owner-key upgrade path (updateCode, tvm.setcode — state preserved).
+ * The factory owner's pubkey is supplied by the factory at deploy; the
+ * marketplace code itself remains pinned by the factory.
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
@@ -37,7 +41,7 @@ import "./CompanySIIR.sol";
 import "./SIIRFuel.sol";
 
 contract SIIRMarketplace is SIIRFuel {
-    string constant version = "2.3.0";
+    string constant version = "2.4.0";
 
     uint128 constant PAYOUT_VALUE = 1 vmshell;
 
@@ -62,6 +66,8 @@ contract SIIRMarketplace is SIIRFuel {
     }
 
     address static _factory;
+    uint256 _ownerPubkey;
+    TvmCell _code;
 
     // ask listings: listingId -> record. One listing per (company, SIIR id).
     struct Listing {
@@ -106,8 +112,20 @@ contract SIIRMarketplace is SIIRFuel {
     event Settled(uint256 listingId, uint256 bidId, address company, uint256 id, address buyer, address seller, uint128 price, uint32 currencyId);
     event DividendsForwarded(address company, uint256 id, address seller, uint32[] currencyIds);
 
-    constructor() accept {
+    constructor(uint256 ownerPubkey) accept {
         require(msg.sender == _factory, ERR_NOT_OWNER);
+        _ownerPubkey = ownerPubkey;
+        _code = tvm.code();
+    }
+
+    /// Factory-owner upgrade: replace this contract's code in place. State
+    /// (all listings/bids/escrows) is preserved.
+    function updateCode(TvmCell newCode) public {
+        require(msg.pubkey() == _ownerPubkey, ERR_NOT_OWNER);
+        tvm.accept();
+        _code = newCode;
+        tvm.setcode(newCode);
+        tvm.commit();
     }
 
     /// The deed-transfer body this marketplace sends on delist/acceptBid —

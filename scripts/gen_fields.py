@@ -15,7 +15,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CT = os.path.join(ROOT, "contracts")
 
-CONTRACTS = ["CompanySIIR", "SIIRFactory", "SIIRMarketplace"]
+CONTRACTS = ["CompanySIIR", "SIIRFactory", "SIIRMarketplace", "SIIRExplorer"]
 
 
 def main():

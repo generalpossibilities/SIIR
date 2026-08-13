@@ -734,6 +734,6 @@ document.addEventListener("click", (e) => {
     route();
 });
 
-const FACTORY_ADDR = "d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea";
-const DEMO_ADDR = "d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::a334e243be3f9e8b95814e06c2a718095f05803f6d9635e1dbdd501d37762303";
+const FACTORY_ADDR = "c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66::c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66";
+const DEMO_ADDR = "c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66::a7b699c76d325999b220d8470433a9e9bd5caf6f6fa1b177cf4fe842fe6be75c";
 route();

@@ -23,6 +23,12 @@
  * operator and runs on the factory's bootstrap reserve.
  *
  * The factory never modifies deployed companies. It only creates them.
+ *
+ * v2.6: the factory deploys the protocol explorer alongside the marketplace
+ * and registers every company there (SIIRExplorer.registerCompany) — the
+ * on-chain directory used by clients. The factory is also upgradeable by its
+ * owner key (updateCode, tvm.setcode — state preserved). CompanySIIR stays
+ * immutable forever.
  */
 pragma gosh-solidity >=0.76.1;
 pragma AbiHeader expire;
@@ -30,10 +36,11 @@ pragma AbiHeader pubkey;
 
 import "./CompanySIIR.sol";
 import "./SIIRMarketplace.sol";
+import "./SIIRExplorer.sol";
 import "./SIIRFuel.sol";
 
 contract SIIRFactory is SIIRFuel {
-    string constant version = "2.5.0";
+    string constant version = "2.6.0";
 
     uint16 constant ERR_NOT_OWNER = 200;
     uint16 constant ERR_BAD_ARGS   = 201;
@@ -57,9 +64,16 @@ contract SIIRFactory is SIIRFuel {
     }
 
     uint256 _ownerPubkey;
+    TvmCell _code;
     TvmCell _companyCode;
     TvmCell _marketplaceCode;
+    TvmCell _explorerCode;
     address _marketplace;
+    address _explorer;
+
+    // Value attached to one protocol push (company register / snapshot hop).
+    // v2.6: children inherit this factory's Dapp ID, so native VMSHELL holds.
+    uint128 constant PUSH_VALUE = 1 vmshell;
 
     // ---------- company directory (Dapp ID -> name) ----------
     struct CompanyEntry {
@@ -74,12 +88,14 @@ contract SIIRFactory is SIIRFuel {
     event CompanyDeployed(address company, address founder, string name, uint8 issuanceModel);
     event CompanyRegistered(uint32 index, address company, string name);
 
-    constructor(uint64 value, TvmCell companyCode, TvmCell marketplaceCode) accept {
+    constructor(uint64 value, TvmCell companyCode, TvmCell marketplaceCode, TvmCell explorerCode) accept {
         gosh.cnvrtshellq(value);
         tvm.accept();
         _ownerPubkey = tvm.pubkey();
+        _code = tvm.code();
         _companyCode = companyCode;
         _marketplaceCode = marketplaceCode;
+        _explorerCode = explorerCode;
         _marketplace = new SIIRMarketplace{
             stateInit: abi.encodeStateInit({
                 contr: SIIRMarketplace,
@@ -88,7 +104,16 @@ contract SIIRFactory is SIIRFuel {
             }),
             value: varuint16(1000000000),
             flag: 1
-        }();
+        }(_ownerPubkey);
+        _explorer = new SIIRExplorer{
+            stateInit: abi.encodeStateInit({
+                contr: SIIRExplorer,
+                varInit: {_factory: address(this)},
+                code: explorerCode
+            }),
+            value: varuint16(1000000000),
+            flag: 1
+        }(_ownerPubkey);
     }
 
     /// deployCompany may be called by the founder wallet itself (internal
@@ -151,12 +176,14 @@ contract SIIRFactory is SIIRFuel {
         TvmCell init = _companyStateInit(founder, founderPubkey);
         TvmCell body = abi.encodeBody(CompanySIIR, name, description, website, metadataUri,
             issuanceModel, plans, logoImage, siirImage, ui, charter,
-            governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest);
+            governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest,
+            _explorer);
+        address company = address.makeAddrStd(0, tvm.hash(init));
         if (msg.sender == founder) {
             // founder wallet path: the attached SHELL pays the child's deploy
-            // value + the factory's own gas + both forward fees; excess goes
-            // back to the founder wallet in the same message
-            _fuel(_fuelDeploy(initialValue, init, body));
+            // value + the factory's own gas + both forward fees + the explorer
+            // register push; excess goes back to the founder wallet
+            _fuel(_fuelDeploy(initialValue, init, body) + _registerFuel(company, name, issuanceModel, founder));
         }
         company = new CompanySIIR{
             stateInit: init,
@@ -164,9 +191,27 @@ contract SIIRFactory is SIIRFuel {
             flag: 1
         }(name, description, website, metadataUri, issuanceModel, plans,
           logoImage, siirImage, ui, charter,
-          governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest);
+          governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest,
+          _explorer);
         emit CompanyDeployed(company, founder, name, issuanceModel);
         _registerCompany(company, name, issuanceModel, founder);
+        if (_explorer.value != 0) {
+            SIIRExplorer(_explorer).registerCompany{
+                value: varuint16(PUSH_VALUE),
+                flag: 1
+            }(company, name, issuanceModel, founder);
+        }
+    }
+
+    function _registerBody(address company, string name, uint8 issuanceModel, address founder)
+        private pure returns (TvmCell) {
+        return abi.encodeBody(SIIRExplorer.registerCompany, company, name, issuanceModel, founder);
+    }
+
+    /// SHELL fuel for the explorer register push after a founder-wallet deploy.
+    function _registerFuel(address company, string name, uint8 issuanceModel, address founder)
+        private pure returns (uint128) {
+        return PUSH_VALUE + _estimateFwdFee(_registerBody(company, name, issuanceModel, founder));
     }
 
     function _registerCompany(address company, string name, uint8 issuanceModel, address founder) private {
@@ -207,8 +252,27 @@ contract SIIRFactory is SIIRFuel {
         return _marketplaceCode;
     }
 
+    function getExplorerCode() external view returns (TvmCell) {
+        return _explorerCode;
+    }
+
     function getMarketplaceAddress() external view returns (address) {
         return _marketplace;
+    }
+
+    function getExplorerAddress() external view returns (address) {
+        return _explorer;
+    }
+
+    /// Factory-owner upgrade: replace this contract's code in place. State
+    /// (company/marketplace/explorer code cells + addresses) is preserved.
+    /// Marketplace and explorer have their own owner-key updateCode.
+    function updateCode(TvmCell newCode) public {
+        require(msg.pubkey() == _ownerPubkey, ERR_NOT_OWNER);
+        tvm.accept();
+        _code = newCode;
+        tvm.setcode(newCode);
+        tvm.commit();
     }
 
     // ---------- company directory getters ----------

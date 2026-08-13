@@ -16,6 +16,9 @@ if [[ "${1:-}" == "--refresh" ]]; then
     python3 tests/gen_ground.py > "$FIX"
 fi
 echo "== python decoders import cleanly =="
-python3 -m py_compile scripts/mirror.py scripts/gov_state.py scripts/gateway.py
+python3 -m py_compile scripts/mirror.py scripts/gov_state.py scripts/gateway.py scripts/plans.py
+echo "== plans config generator (weight -> TierPlan[]) =="
+python3 tests/test_plans.py
+python3 scripts/plans.py --check scripts/plans.example.json
 echo "== JS vs Python parity ($FIX) =="
 node static/parity.js "$FIX"

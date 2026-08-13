@@ -1,0 +1,11 @@
+{
+  "totalWeight": 3000,
+  "tiers": [
+    {"label": "Bronze",   "pct": 33.333333333, "weightPer": 1},
+    {"label": "Silver",   "pct": 33.333333333, "weightPer": 10},
+    {"label": "Gold",     "pct": 16.666666667, "weightPer": 50},
+    {"label": "Platinum", "pct": 8.333333333,  "weightPer": 125},
+    {"label": "Diamond",  "pct": 5,            "weightPer": 50},
+    {"label": "Emerald",  "pct": 3.333333334,  "weightPer": 100}
+  ]
+}
