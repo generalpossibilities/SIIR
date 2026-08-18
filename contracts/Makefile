@@ -1,7 +1,7 @@
 SOLD ?= sold
 TVM_CLI ?= tvm-cli
 
-TVCS := CompanySIIR SIIRFactory SIIRMarketplace SIIRExplorer
+TVCS := CompanySIIR SIIRFactory SIIRMarketplace SIIRExplorer SIIRWallet
 
 build: clean
 	@for c in $(TVCS); do $(SOLD) --tvm-version gosh $$c.sol; done

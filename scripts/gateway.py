@@ -366,7 +366,67 @@ def seal_tier(label):
     return SEAL_TIER_FALLBACK
 
 
-def seal_inner(plan, label):
+def fnv1a(s):
+    h = 0x811C9DC5
+    for ch in (s or "").encode():
+        h ^= ch
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def seal_art(seed, sid, c1, c2, mark):
+    """Deterministic company art for the seal window (mirrors app.js
+    sealArt): the company-address hash picks hue + pattern, the tier
+    palette keeps the accent; the SIIR id rotates the motif."""
+    hue = seed % 360
+    pat = (seed >> 8) % 4
+    rot = (seed >> 16) % 90 + (int(sid or 0) % 5) * 18
+    if pat == 0:
+        motif = (
+            '<circle cx="100" cy="100" r="26" fill="none" stroke="%s" '
+            'stroke-width="2" opacity=".8"/>'
+            '<circle cx="100" cy="100" r="38" fill="none" stroke="%s" '
+            'stroke-width="1.5" opacity=".55"/>'
+            '<circle cx="100" cy="100" r="50" fill="none" stroke="%s" '
+            'stroke-width="1" opacity=".3"/>' % (c1, c1, c1)
+        )
+    elif pat == 1:
+        motif = (
+            '<g transform="rotate(%d 100 100)" stroke="%s" fill="none" opacity=".6">'
+            '<rect x="60" y="14" width="7" height="172"/><rect x="82" y="14" '
+            'width="7" height="172"/><rect x="104" y="14" width="7" height="172"/>'
+            '<rect x="126" y="14" width="7" height="172"/></g>' % (rot, c1)
+        )
+    elif pat == 2:
+        motif = "".join(
+            '<circle cx="%d" cy="%d" r="3.2" fill="%s" opacity=".55"/>' % (56 + c * 29, 56 + r * 29, c1)
+            for r in range(4) for c in range(4)
+        )
+    else:
+        motif = (
+            '<g transform="rotate(%d 100 100)" fill="none" stroke="%s" '
+            'stroke-width="2.5" opacity=".65">'
+            '<path d="M58 122 l21 -24 l21 24"/><path d="M100 122 l21 -24 l21 24"/>'
+            '<path d="M58 96 l21 -24 l21 24"/><path d="M100 96 l21 -24 l21 24"/></g>'
+            % (rot, c1)
+        )
+    return (
+        '<defs><radialGradient id="cg" cx=".5" cy=".38" r=".95">'
+        '<stop offset="0" stop-color="hsl(%d 50%% 36%%)"/>'
+        '<stop offset="1" stop-color="hsl(%d 50%% 15%%)"/></radialGradient>'
+        '<clipPath id="cw"><rect x="42" y="42" width="116" height="116" rx="10"/></clipPath></defs>'
+        '<rect x="42" y="42" width="116" height="116" rx="10" fill="url(#cg)"/>'
+        '<g clip-path="url(#cw)">%s</g>'
+        '<circle cx="100" cy="100" r="38" fill="none" stroke="%s" stroke-width="3" opacity=".9"/>'
+        '<path d="M100 78l8 16 18 3-13 12 3 18-16-8-16 8 3-18-13-12 18-3z" fill="%s"/>'
+        '<text x="100" y="148" font-size="11" fill="#fff" text-anchor="middle" '
+        'font-family="monospace">%s</text>' % (
+            hue, (hue + 40) % 360, motif, c1, c2, escape(mark)
+        )
+    )
+
+
+def seal_inner(plan, label, seed, sid):
     img = (plan or {}).get("image") or ""
     if img:
         b64 = img.split(",", 1)[1] if "," in img else img
@@ -376,22 +436,14 @@ def seal_inner(plan, label):
         )
     c1, c2 = seal_tier(label)
     mark = (label or "SIIR").upper()[:9]
-    return (
-        '<defs><linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">'
-        '<stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/>'
-        "</linearGradient></defs>"
-        '<rect x="42" y="42" width="116" height="116" rx="10" fill="url(#tg)"/>'
-        '<circle cx="100" cy="100" r="38" fill="none" stroke="#fff" stroke-width="5" opacity=".85"/>'
-        '<path d="M100 78l8 16 18 3-13 12 3 18-16-8-16 8 3-18-13-12 18-3z" fill="#fff"/>'
-        '<text x="100" y="148" font-size="11" fill="#fff" text-anchor="middle" '
-        'font-family="monospace">%s</text>' % (c1, c2, escape(mark))
-    )
+    return seal_art(seed, sid, c1, c2, mark)
 
 
-def seal_svg(label, round_i, sid, plans, width=230):
+def seal_svg(label, round_i, sid, plans, width=230, addr=""):
     plans = plans or []
     plan = plans[round_i] if 0 <= round_i < len(plans) else {}
     serial = "#%d" % int(sid)
+    seed = fnv1a(addr)
     return (
         '<svg class="seal" viewBox="0 0 200 264" width="%d" '
         'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SIIR deed seal">'
@@ -412,7 +464,7 @@ def seal_svg(label, round_i, sid, plans, width=230):
         'font-family="sans-serif">%s</text>'
         '<text x="100" y="236" font-size="9.5" fill="#8b96a8" text-anchor="middle" '
         'font-family="monospace">SIIR %s</text></svg>' % (
-            width, seal_inner(plan, label), escape(label or ""), serial
+            width, seal_inner(plan, label, seed, sid), escape(label or ""), serial
         )
     )
 
@@ -710,7 +762,8 @@ def market_stats(mkt):
         s = book.setdefault(str(cid), {"currency": str(cid), "bestAsk": None,
                                        "bestBid": None, "openAsks": 0,
                                        "openBids": 0, "askValue": 0,
-                                       "bidValue": 0, "mark": None})
+                                       "bidValue": 0, "mark": None,
+                                       "spread": None})
         p = as_int(price)
         if s["bestAsk"] is None or p < s["bestAsk"]:
             s["bestAsk"] = p
@@ -724,7 +777,8 @@ def market_stats(mkt):
         s = book.setdefault(str(cid), {"currency": str(cid), "bestAsk": None,
                                        "bestBid": None, "openAsks": 0,
                                        "openBids": 0, "askValue": 0,
-                                       "bidValue": 0, "mark": None})
+                                       "bidValue": 0, "mark": None,
+                                       "spread": None})
         p = as_int(price)
         if s["bestBid"] is None or p > s["bestBid"]:
             s["bestBid"] = p
@@ -1100,7 +1154,7 @@ def siir_page(addr, id_s):
         for h in d.get("history", [])
     )
     plans = lazy_mirror(addr).plans_abi() if lazy_mirror(addr) else []
-    seal = seal_svg(d.get("label", ""), as_int(d.get("round", 0)), d.get("id", 0), plans)
+    seal = seal_svg(d.get("label", ""), as_int(d.get("round", 0)), d.get("id", 0), plans, addr=addr)
     body = f"""<!doctype html><html><head><meta charset="utf-8"><title>SIIR #{d['id']}</title>
  <style>body{{font-family:ui-sans-serif,system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 16px;color:#111}}
  table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;text-align:left;font-size:13px}}

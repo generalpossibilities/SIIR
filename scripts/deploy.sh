@@ -123,6 +123,22 @@ body() { # body <abi> <method> <json>
   cli body --abi "$1" "$2" "$3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Message"])'
 }
 
+# last_id <getListings|getBids> -> newest (last) entry id (decimal), retried; "" on failure
+last_id() {
+  local getter="$1" out id
+  for attempt in $(seq 1 5); do
+    out=$(cli run "$MARKET" "$getter" '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" 2>/dev/null || true)
+    id=$(printf '%s' "$out" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(int(d["ids"][-1], 16) if d.get("ids") else "")
+except Exception:
+    print("")' 2>/dev/null || echo "")
+    [ -n "$id" ] && { echo "$id"; return; }
+    sleep 2
+  done
+}
+
 company_code() { tvm-cli -j decode stateinit --tvc "$CT/CompanySIIR.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
 marketplace_code() { tvm-cli -j decode stateinit --tvc "$CT/SIIRMarketplace.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
 explorer_code() { tvm-cli -j decode stateinit --tvc "$CT/SIIRExplorer.tvc" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'; }
@@ -191,7 +207,8 @@ deploy_self() { # deploy_self <work-tvc-name> <keys> <abi> <params-json> -> depl
   if cli account "$(self "$R")" 2>/dev/null | grep -q '"Active"'; then return 0; fi
   for attempt in $(seq 1 8); do
     cli deploy --abi "$abi" --sign "$keys" --dst-dapp-id "$R" "$WORK/$name.tvc" "$params" >/dev/null 2>&1 || true
-    sleep 3    cli account "$(self "$R")" 2>/dev/null | grep -q '"Active"' && return 0
+    sleep 3
+    cli account "$(self "$R")" 2>/dev/null | grep -q '"Active"' && return 0
     sleep 3
   done
   echo "[fail] deploy ${name} (${R}) not active after retries"; exit 1
@@ -300,7 +317,21 @@ if [ "$(echo -n "$UI_BUNDLE" | wc -c)" -gt 46000 ]; then
   UI_MODE=gzip
 fi
 echo "  ui bundle: $(echo -n "$UI_BUNDLE" | wc -c) bytes base64 ($UI_MODE)"
-if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
+# account-active probes are racy on shellnet right after a tx, so retry
+# briefly instead of trusting a single query
+company_active() { # company_active -> 0 (active) or 1
+  local i st
+  for i in $(seq 1 6); do
+    st=$(cli account "$COMPANY" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["acc_type"])' 2>/dev/null || echo "")
+    [ "$st" = "Active" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+COMPANY_DEPLOYED=0
+if ! company_active; then
+  COMPANY_DEPLOYED=1
   echo "  deploying company via factory (founder wallet pays SHELL fuel)..."
   # v2.3.0: the founder wallet calls deployCompany as an internal message
   # attaching SHELL; the factory converts exactly the child reserve + its own
@@ -318,8 +349,10 @@ if ! cli account "$COMPANY" 2>/dev/null | grep -q '"Active"'; then
           \"charter\":$CHARTER,\"initialValue\":20000000000,\
           \"governanceEnabled\":${GOV_ENABLED:-false},\"quorumPermille\":${GOV_QUORUM:-500},\
           \"dissolutionRule\":${DISSOLUTION_RULE:-0},\"dissolutionDest\":\"$(legacy "$FOUNDER")\"}")\"}" >/dev/null 2>&1
-    wait_active "$COMPANY" "company" 30
-    cli account "$COMPANY" 2>/dev/null | grep -q '"Active"' && break
+    if company_active; then
+      echo "  [ok] company is active"
+      break
+    fi
     echo "  [warn] deploy attempt $((C_DEPS+1)) did not land; retrying..."
     C_DEPS=$((C_DEPS+1))
     sleep 5
@@ -328,6 +361,41 @@ fi
 cli run "$COMPANY" getCompanyInfo {} --abi "$CT/CompanySIIR.abi.json"
 echo "  governance/dissolution config:"
 python3 scripts/gov_state.py "$COMPANY" || true
+
+# ---------- 4b. design digest (protocol-committed design identity) ----------
+echo "== 4b. design digest =="
+DIGEST_PARAMS=$(python3 - "$PLANS_JSON" "$LOGO_SVG" "$SIIRIMG_SVG" "$UI_BUNDLE" "$CHARTER" "$FOUNDER_RAW" <<'PY'
+import json, os, sys
+plans, logo, siir, ui, charter, founder_raw = sys.argv[1:7]
+print(json.dumps({
+    "name": "NJD Ventures",
+    "description": "SIIR demo company",
+    "website": "https://njd.example",
+    "metadataUri": "ipfs://QmSIIRdemo",
+    "issuanceModel": 0,
+    "governanceEnabled": os.environ.get("GOV_ENABLED", "false") == "true",
+    "quorumPermille": int(os.environ.get("GOV_QUORUM", "500")),
+    "dissolutionRule": int(os.environ.get("DISSOLUTION_RULE", "0")),
+    "dissolutionDest": founder_raw,
+    "plans": json.loads(plans),
+    "logoImage": logo,
+    "siirImage": siir,
+    "ui": ui,
+    "charter": json.loads(charter),
+}))
+PY
+)
+DIGEST_WANT=$(python3 "$ROOT/scripts/state_digest.py" "$COMPANY" 2>/dev/null \
+  || printf '%s' "$DIGEST_PARAMS" | python3 "$ROOT/scripts/design_digest.py")
+DIGEST_ON=$(cli run "$COMPANY" getDesignDigest '{}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+  | python3 -c 'import json,sys; v=json.load(sys.stdin).get("digest") or json.load(sys.stdin).get("value0",0); x=int(v,16) if isinstance(v,str) and v.startswith("0x") else int(v); print(f"{x:064x}")' 2>/dev/null || echo "")
+if [ -n "$DIGEST_ON" ] && [ "$DIGEST_ON" = "$DIGEST_WANT" ]; then
+  echo "  [ok] design digest committed on-chain == canonical compute"
+  echo "      digest: $DIGEST_WANT"
+else
+  echo "  [fail] design digest mismatch: on-chain=${DIGEST_ON:-?} want=$DIGEST_WANT"
+  exit 1
+fi
 
 # ---------- 5. issue genesis ----------
 echo "== 5. issue genesis =="
@@ -404,23 +472,49 @@ fi
 echo "== 7. transfer SIIR #1 to holder =="
 OWNER=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
 echo "  SIIR #1 owner: $OWNER"
-if [ "$OWNER" != "0:$FOUNDER_RAW" ]; then
-  echo "  owner is not founder wallet; skipping transfer"
-else
-  topup_shell "$FOUNDER" 20000000000 "founder"
-  cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
-    "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":$F_OP},\"bounce\":true,\"flags\":1,\
-      \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer "{\"ids\":[\"1\"],\"newOwner\":\"$(legacy "$HOLDER")\"}")\"}" >/dev/null || true
-  for attempt in $(seq 1 15); do
-    O1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
-    [ "$O1" = "0:$HOLDER_RAW" ] && break
-    sleep 2
-  done
-  echo "  SIIR #1 owner after transfer: ${O1:-?} (expect 0:$HOLDER_RAW)"
-  [ "$O1" = "0:$HOLDER_RAW" ] && echo "  [ok] transfer landed: SIIR #1 -> holder" || { echo "  [fail] transfer never landed"; exit 1; }
-  cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
-fi
+case "$OWNER" in
+  "0:$HOLDER_RAW")
+    echo "  owner is already the holder; nothing to transfer"
+    ;;
+  "0:$FOUNDER_RAW"|"0:$MARKET_RAW")
+    if [ "$OWNER" = "0:$MARKET_RAW" ]; then
+      echo "  deed escrowed at the marketplace (leftover from a previous run); settling it back first"
+      topup_shell "$HOLDER" 20000000000 "holder"
+      topup_shell "$FOUNDER" 30000000000 "founder"
+      LIST_ID=$(last_id getListings)
+      if [ -n "$LIST_ID" ]; then
+        cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+          "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{\"2\":$((5000000000 + F_BID_ESCROW))},\"bounce\":true,\"flags\":1,\
+            \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" bid "{\"company\":\"$(legacy "$COMPANY")\",\"ids\":[\"1\"],\"price\":5000000000,\"currencyId\":2,\"validUntil\":$(( $(date +%s) + 3600 ))}")\"}" >/dev/null || true
+        sleep 4
+        BID_ID=$(last_id getBids)
+        if [ -n "$BID_ID" ]; then
+          cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
+            "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
+              \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" acceptBid "{\"listingId\":$LIST_ID,\"bidId\":$BID_ID}")\"}" >/dev/null || true
+          sleep 4
+        fi
+      fi
+    fi
+    topup_shell "$FOUNDER" 20000000000 "founder"
+    cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.json" -m sendTransaction \
+      "{\"dest\":\"$(legacy "$COMPANY")\",\"value\":3000000000,\"cc\":{\"2\":$F_OP},\"bounce\":true,\"flags\":1,\
+        \"payload\":\"$(body "$CT/CompanySIIR.abi.json" transfer "{\"ids\":[\"1\"],\"newOwner\":\"$(legacy "$HOLDER")\"}")\"}" >/dev/null || true
+    for attempt in $(seq 1 15); do
+      O1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
+      [ "$O1" = "0:$HOLDER_RAW" ] && break
+      sleep 2
+    done
+    echo "  SIIR #1 owner after transfer: ${O1:-?} (expect 0:$HOLDER_RAW)"
+    [ "$O1" = "0:$HOLDER_RAW" ] && echo "  [ok] transfer landed: SIIR #1 -> holder" || { echo "  [fail] transfer never landed"; exit 1; }
+    cli run "$COMPANY" getSIIR '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json"
+    ;;
+  *)
+    echo "  [fail] unexpected SIIR #1 owner: $OWNER"
+    exit 1
+    ;;
+esac
 
 # ---------- 8. deposit dividends (5,000 eccUSDC + 1 NACKL; SHELL = fuel only) ----------
 echo "== 8. deposit 5000 eccUSDC + 1 NACKL dividends (SHELL is fuel, never a dividend) =="
@@ -614,8 +708,10 @@ d = base64.b64decode(b)
 print(gzip.decompress(d).decode(errors="replace") if gz else d.decode(errors="replace"))'; }
 if [ "$(printf '%s' "$R_UI" | ui_norm)" = "$(printf '%s' "$UI_BUNDLE" | ui_norm)" ]; then
   echo "  [ok] static UI bundle round-trips on-chain"
-else
+elif [ "$COMPANY_DEPLOYED" = "1" ]; then
   echo "  [fail] ui mismatch"
+else
+  echo "  [info] on-chain UI predates the current bundle (redeploy with FORCE=1 to update)"
 fi
 echo "  oversized uploads: capped at deploy by require() in the factory"
 echo "    (factory ERR_LOGO/SIIR/UI/CHARTER_TOO_LARGE 202-205, company 108-111)."
@@ -673,6 +769,7 @@ cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json"
 sleep 4
 echo "  listings:"
 cli run "$MARKET" getListings '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
+LIST_ID=$(last_id getListings)
 # 13c. buyer (founder) bids 5 SHELL + settlement escrow, valid 1 hour
 # (v2.3.0: the escrow pays acceptBid's gas + both payout hops, bidder-funded)
 topup_shell "$FOUNDER" 30000000000 "founder"
@@ -682,19 +779,20 @@ cli callx --abi "$MULTISIG_ABI" --addr "$FOUNDER" --keys "$WORK/company.keys.jso
 sleep 4
 echo "  bids:"
 cli run "$MARKET" getBids '{"offset":0,"limit":10}' --abi "$CT/SIIRMarketplace.abi.json" || true
+BID_ID=$(last_id getBids)
 # 13d. seller accepts the top bid — settlement fuel comes from the bidder's
 # escrow (the seller attaches no SHELL here)
 cli callx --abi "$MULTISIG_ABI" --addr "$HOLDER" --keys "$WORK/holder.keys.json" -m sendTransaction \
   "{\"dest\":\"$(legacy "$MARKET")\",\"value\":3000000000,\"cc\":{},\"bounce\":true,\"flags\":1,\
-    \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" acceptBid '{"listingId":1,"bidId":1}')\"}" >/dev/null || true
+    \"payload\":\"$(body "$CT/SIIRMarketplace.abi.json" acceptBid "{\"listingId\":$LIST_ID,\"bidId\":$BID_ID}")\"}" >/dev/null || true
 sleep 4
 echo "  after settlement — SIIR #1 owner:"
 cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" || true
 echo "  listing state:"
-cli run "$MARKET" getListing '{"listingId":1}' --abi "$CT/SIIRMarketplace.abi.json" || true
+cli run "$MARKET" getListing "{\"listingId\":$LIST_ID}" --abi "$CT/SIIRMarketplace.abi.json" || true
 # 13e. verify the settlement landed: deed with the bidder, listing closed
 O1=$(cli run "$COMPANY" getOwnerOf '{"id":"1"}' --abi "$CT/CompanySIIR.abi.json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value0",""))' 2>/dev/null || echo "")
-ACT=$(cli run "$MARKET" getListing '{"listingId":1}' --abi "$CT/SIIRMarketplace.abi.json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("active","?")).lower())' 2>/dev/null || echo "?")
+ACT=$(cli run "$MARKET" getListing "{\"listingId\":$LIST_ID}" --abi "$CT/SIIRMarketplace.abi.json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("active","?")).lower())' 2>/dev/null || echo "?")
 if [ "$O1" = "0:$FOUNDER_RAW" ] && [ "$ACT" = "false" ]; then
   echo "  [ok] acceptBid settled: deed -> bidder, listing closed"
 else

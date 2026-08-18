@@ -74,6 +74,17 @@
   .state { font-size:12px; font-weight:700; border-radius:6px; padding:1px 8px; }
   .state.open { color:var(--ok); background:#d1fae5; }
   .state.closed { color:var(--mut); background:#f1f5f9; }
+  #wslot { display:flex; align-items:center; gap:8px; margin-left:auto; }
+  #wslot .w-state { font-size:12px; color:#94a3b8; white-space:nowrap; }
+  #wslot .w-state b { color:#f1f5f9; font-weight:600; }
+  #wslot button { padding:7px 12px; font-size:12.5px; white-space:nowrap; }
+  #wslot button.ghost { background:transparent; color:#93c5fd; border:1px solid #475569; }
+  #wslot button.ghost:hover { background:#1e293b; color:#bfdbfe; }
+  #demo { background:#fef3c7; color:#92400e; border-bottom:1px solid #fde68a;
+          font-size:12.5px; padding:6px 20px; text-align:center; display:none; }
+  #demo code { font:11.5px var(--mono); }
+  button[data-claim] { margin-top:12px; }
+  button[data-claim]:disabled { opacity:.6; cursor:default; }
   .escrow { background:#f8fafc; border:1px dashed var(--line2); border-radius:12px; padding:14px 16px;
             display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:14px; }
   .escrow .lab { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
@@ -116,12 +127,16 @@
     <button id="go">search</button>
     <div id="suggest"></div>
   </div>
+  <div id="wslot"></div>
 </header>
+<div id="demo"></div>
 <main id="main"></main>
 <footer>read-only · data decoded in-browser from the shellnet mirror node · <code>static/core.js</code></footer>
 <div id="toast"></div>
 <script src="fields.js"></script>
 <script src="core.js"></script>
+<script src="abi.js"></script>
+<script src="wallet.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

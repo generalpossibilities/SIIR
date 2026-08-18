@@ -815,6 +815,74 @@ class MirrorState {
         return "0x" + toHex(h);
     }
 
+    // Protocol-committed design digest (CompanySIIR.getDesignDigest): XOR of
+    // sha256 atoms over the immutable design params — mirrors the contract's
+    // designDigestOf(). Each atom = the TVM cell representation hash of the
+    // value: sha256(d1 || d2 || data-with-completion-tag); d1 = refs count,
+    // d2 = (bits/8)<<1 (byte-aligned). Integers use type-width bit length;
+    // strings >127 bytes hash as a 127-byte ref chain (leaf depth 0).
+    async designDigest() {
+        const st = this.state || {};
+        const enc = new TextEncoder();
+        const sha = async (bytes) => new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+        const toBytes = (v, n) => {
+            const out = new Uint8Array(n);
+            let x = BigInt(v);
+            for (let i = n - 1; i >= 0; i--) { out[i] = Number(x & 0xffn); x >>= 8n; }
+            return out;
+        };
+        const xor = (a, b) => {
+            const o = new Uint8Array(32);
+            for (let i = 0; i < 32; i++) o[i] = a[i] ^ b[i];
+            return o;
+        };
+        const atomInt = async (v, bits) =>
+            await sha(new Uint8Array([0, bits / 4, ...toBytes(v, bits / 8)]));
+        const atomBool = async (v) => await sha(new Uint8Array([0, 1, v ? 0xc0 : 0x40]));
+        const atomBytes = async (data) => {
+            if (!data.length) return await sha(new Uint8Array([0, 0]));
+            if (data.length <= 127)
+                return await sha(new Uint8Array([0, data.length * 2, ...data]));
+            const chunks = [];
+            for (let i = 0; i < data.length; i += 127) chunks.push(data.slice(i, i + 127));
+            const tail = chunks[chunks.length - 1];
+            let depth = 0;
+            let hv = await sha(new Uint8Array([0, tail.length * 2, ...tail]));
+            for (let i = chunks.length - 2; i >= 0; i--) {
+                const c = chunks[i];
+                hv = await sha(new Uint8Array([1, 254, ...c, depth >> 8, depth & 0xff, ...hv]));
+                depth++;
+            }
+            return hv;
+        };
+        const raw = (s) => enc.encode(s || "");
+        const st8 = (v) => Number(st[v] ?? 0n);
+        let acc = await atomInt(st8("_issuanceModel"), 8);
+        acc = xor(acc, await atomBool(!!st._governanceEnabled));
+        acc = xor(acc, await atomInt(st8("_quorumPermille"), 16));
+        acc = xor(acc, await atomInt(st8("_dissolutionRule"), 8));
+        const dest = String(st._dissolutionDest || "").split(":")[1] || "0";
+        acc = xor(acc, await atomInt(BigInt("0x" + dest), 256));
+        for (const s of [st._name, st._description, st._website, st._metadataUri,
+                         st._logoImage, st._siirImage, st._ui, st._charter]) {
+            acc = xor(acc, await atomBytes(raw(s)));
+        }
+        const plans = st._plans || [];
+        acc = xor(acc, await atomInt(plans.length, 16));
+        for (const p of plans) {
+            acc = xor(acc, await atomInt(p[0], 128));
+            acc = xor(acc, await atomInt(p[1], 128));
+            acc = xor(acc, await atomBytes(raw(p[2])));
+            acc = xor(acc, await atomBytes(raw(p[4])));
+        }
+        const recomputed = toHex(acc);
+        let committed = "";
+        if (st._designDigest !== undefined && st._designDigest !== null && st._designDigest !== 0n) {
+            committed = BigInt(st._designDigest).toString(16).padStart(64, "0");
+        }
+        return { committed, recomputed, match: !!committed && committed === recomputed };
+    }
+
     async fingerprint(id) {
         const s = this.resolve(id);
         if (!s) return null;
@@ -944,8 +1012,181 @@ class MarketplaceState extends MirrorState {
     }
 }
 
+// ---------- cell building + BOC writing (for wallet actions) ----------
+
+function crc32c(bytes) {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0x82f63b78 ^ (c >>> 1)) : (c >>> 1);
+        table[i] = c >>> 0;
+    }
+    let crc = 0xffffffff;
+    for (const b of bytes) crc = (crc >>> 8) ^ table[(crc ^ b) & 0xff];
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+class Builder {
+    constructor() {
+        this.bits = "";
+        this.refs = [];
+    }
+    storeBits(bits) {
+        this.bits += bits;
+        return this;
+    }
+    storeUint(v, n) {
+        this.bits += bin(v, n);
+        return this;
+    }
+    storeBool(b) {
+        this.bits += b ? "1" : "0";
+        return this;
+    }
+    storeRef(cell) {
+        this.refs.push(cell);
+        return this;
+    }
+    asCell() {
+        return new Cell(this.bits, this.refs);
+    }
+}
+
+function bytesToB64(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+}
+
+function writeBoc(root) {
+    // SDK ordering: post-order children-first into a temp list, then reversed
+    // (root first in the stream); refs = cells_count - temp_index - 1 (forward).
+    // Identical cells (same bits + same refs) are deduped like the SDK writer.
+    const temp = [];
+    const seen = new Set();
+    const postOrder = (c) => {
+        if (seen.has(c)) return;
+        seen.add(c);
+        for (const r of c.refs) postOrder(r);
+        temp.push(c);
+    };
+    postOrder(root);
+    const fpOf = (c) => c.bits + ":" + c.refs.map((r) => fpOf(r)).join("|");
+    const uniq = [];
+    const fpMap = new Map();
+    const remap = new Map();
+    for (const c of temp) {
+        const fp = fpOf(c);
+        if (fpMap.has(fp)) { remap.set(c, fpMap.get(fp)); continue; }
+        fpMap.set(fp, c);
+        uniq.push(c);
+    }
+    const tempIndex = new Map(uniq.map((c, i) => [c, i]));
+    const cells = uniq.slice().reverse();
+    let refSize = 1;
+    while (cells.length > (1 << (8 * refSize)) - 1) refSize++;
+
+    const dataParts = []; // [bytes, bitLen]
+    for (const c of cells) {
+        const n = c.bits.length;
+        let dataBytes;
+        if (n % 8 === 0) dataBytes = bytesFromBits(c.bits);
+        else dataBytes = bytesFromBits(c.bits + "1" + "0".repeat(7 - (n % 8)));
+        dataParts.push([dataBytes, n]);
+    }
+    const totSize = dataParts.reduce((a, [d]) => a + d.length, 0)
+        + cells.reduce((a, c) => a + 2 + c.refs.length * refSize, 0);
+    let offsetSize = 1;
+    while (totSize > (1 << (8 * offsetSize)) - 1) offsetSize++;
+
+    const out = [];
+    const w = (arr) => { for (const b of arr) out.push(b); };
+    w([0xb5, 0xee, 0x9c, 0x72]);
+    w([refSize]); // no index, no crc (SDK convention)
+    w([offsetSize]);
+    const pushSize = (v) => {
+        for (let i = refSize - 1; i >= 0; i--) w([(v >>> (8 * i)) & 0xff]);
+    };
+    pushSize(cells.length);
+    pushSize(1);
+    pushSize(0);
+    for (let i = offsetSize - 1; i >= 0; i--) w([(totSize >>> (8 * i)) & 0xff]);
+    pushSize(0); // root index (root is first in stream)
+
+    for (let i = 0; i < cells.length; i++) {
+        const c = cells[i];
+        const [dataBytes, bitLen] = dataParts[i];
+        const d1 = c.refs.length & 0x07;
+        const tag = bitLen % 8 !== 0;
+        const d2 = ((bitLen >> 3) << 1) | (tag ? 1 : 0);
+        w([d1, d2]);
+        for (const b of dataBytes) w([b]);
+        for (const r of c.refs) pushSize(cells.length - tempIndex.get(remap.get(r) || r) - 1);
+    }
+    return Uint8Array.from(out);
+}
+
+// hashmapE dict: entries [{key: BigInt, value: bit-string}], keyBits bit keys.
+function buildDict(entries, keyBits) {
+    if (!entries.length) return new Cell("", []);
+    const k = keyBits.toString(2).length; // label length field width
+    const keys = entries.map((e) => bin(e.key, keyBits));
+    const vals = entries.map((e) => e.value);
+
+    const hml = (prefix, rem) => {
+        const len = prefix.length;
+        const nf = bin(len, k);
+        if (len === 0) return "00"; // hml_short, unary 0
+        const same = /^([01])\1*$/.test(prefix);
+        if (same) return "11" + prefix[0] + nf;
+        return "10" + nf + prefix;
+    };
+
+    const rec = (idxList, rem) => {
+        if (idxList.length === 1) {
+            const i = idxList[0];
+            const label = keys[i].slice(keyBits - rem);
+            return new Cell(hml(label, rem) + vals[i], []);
+        }
+        // common prefix over the remaining bits of the sorted keys
+        let p = keyBits - rem;
+        let prefix = "";
+        while (p < keyBits) {
+            const b = keys[idxList[0]][p];
+            if (!idxList.every((i) => keys[i][p] === b)) break;
+            prefix += b;
+            p++;
+        }
+        const left = [], right = [];
+        for (const i of idxList) (keys[i][p] === "0" ? left : right).push(i);
+        const cell = new Cell(hml(prefix, rem), [
+            rec(left, rem - prefix.length - 1),
+            rec(right, rem - prefix.length - 1),
+        ]);
+        return cell;
+    };
+
+    const order = entries.map((_, i) => i).sort((a, b) => (keys[a] < keys[b] ? -1 : 1));
+    return rec(order, keyBits);
+}
+
+// "0:hex"/"-1:hex" -> 267-bit std address [10][0 anycast][wc][addr]
+function addrToBits(addr) {
+    const [wcS, hex] = String(addr).split(":");
+    const wc = BigInt(wcS);
+    return "10" + "0" + (wc === -1n ? bin(255, 8) : bin(0, 8)) + bin(BigInt("0x" + hex), 256);
+}
+
+function addrToBitsNoTag(addr) {
+    const [wcS, hex] = String(addr).split(":");
+    const wc = BigInt(wcS);
+    return (wc === -1n ? bin(255, 8) : bin(0, 8)) + bin(BigInt("0x" + hex), 256);
+}
+
 const XP = {
     MirrorState, FactoryState, MarketplaceState,
     parseBoc, cellHash, cellDepth, computeCellBreaks, decodeDict, dappAddr,
+    Builder, writeBoc, buildDict, addrToBits, addrToBitsNoTag,
+    bytesToB64, crc32c, bin, bitsFromBytes, bytesFromBits, Cell, toHex,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = XP;

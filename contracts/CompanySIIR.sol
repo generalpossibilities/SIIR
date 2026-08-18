@@ -169,6 +169,10 @@ contract CompanySIIR is SIIRFuel {
     string _website;
     string _metadataUri;
 
+    // Protocol-committed design digest: XOR of sha256 atoms over the
+    // immutable design params (see getDesignDigest), fixed at deployment.
+    uint256 _designDigest;
+
     // ---------- on-chain content (supplied at deployment, immutable) ----------
     // Base64 data-URI strings, stored on-chain; Acki Nacki storage is free.
     // _logoImage:      company logo / brand.
@@ -358,7 +362,55 @@ contract CompanySIIR is SIIRFuel {
         _dissolutionDest = dissolutionDest;
         _explorer = explorer;
         _nextId = 1;
+        _designDigest = designDigestOf(
+            name, description, website, metadataUri,
+            issuanceModel, plans, logoImage, siirImage, ui, charter,
+            governanceEnabled, quorumPermille, dissolutionRule, dissolutionDest);
         emit CompanyCreated(_factory, _founder, _name, _issuanceModel);
+    }
+
+    /// Canonical design digest: XOR of sha256 atoms over every immutable
+    /// design param (mirrored by the explorer, which recomputes the same
+    /// value from decoded state):
+    ///   word(x) = abi.encode(x) (a 32-byte big-endian word)
+    ///   atom(word(uint8  issuanceModel))
+    ///   atom(word(bool   governanceEnabled))
+    ///   atom(word(uint16 quorumPermille))
+    ///   atom(word(uint8  dissolutionRule))
+    ///   atom(word(uint256 dissolutionDest.value))
+    ///   atom(bytes(name)) atom(bytes(description)) atom(bytes(website))
+    ///   atom(bytes(metadataUri)) atom(bytes(logoImage)) atom(bytes(siirImage))
+    ///   atom(bytes(ui)) atom(bytes(charter))
+    ///   atom(word(uint16 plans.length))
+    ///   per plan: atom(word(count)) atom(word(weight)) atom(bytes(label))
+    ///             atom(bytes(image))
+    function designDigestOf(
+        string name, string description, string website, string metadataUri,
+        uint8 issuanceModel, TierPlan[] plans,
+        string logoImage, string siirImage, string ui, string charter,
+        bool governanceEnabled, uint16 quorumPermille, uint8 dissolutionRule,
+        address dissolutionDest
+    ) private pure returns (uint256 digest) {
+        digest = tvm.hash(abi.encode(issuanceModel));
+        digest ^= tvm.hash(abi.encode(governanceEnabled));
+        digest ^= tvm.hash(abi.encode(quorumPermille));
+        digest ^= tvm.hash(abi.encode(dissolutionRule));
+        digest ^= tvm.hash(abi.encode(dissolutionDest.value));
+        digest ^= tvm.hash(bytes(name));
+        digest ^= tvm.hash(bytes(description));
+        digest ^= tvm.hash(bytes(website));
+        digest ^= tvm.hash(bytes(metadataUri));
+        digest ^= tvm.hash(bytes(logoImage));
+        digest ^= tvm.hash(bytes(siirImage));
+        digest ^= tvm.hash(bytes(ui));
+        digest ^= tvm.hash(bytes(charter));
+        digest ^= tvm.hash(abi.encode(uint16(plans.length)));
+        for (uint256 i = 0; i < plans.length; i++) {
+            digest ^= tvm.hash(abi.encode(plans[i].count));
+            digest ^= tvm.hash(abi.encode(plans[i].weight));
+            digest ^= tvm.hash(bytes(plans[i].label));
+            digest ^= tvm.hash(bytes(plans[i].image));
+        }
     }
 
     // ---------- auth helpers ----------
@@ -1063,6 +1115,16 @@ contract CompanySIIR is SIIRFuel {
             uint32(bytes(_siirImage).length),
             uint32(bytes(_ui).length)
         );
+    }
+
+    /// Protocol-committed design digest: sha256 atoms over the immutable
+    /// design params (name, description, website, metadata, issuance model,
+    /// plans, logo, deed image, ui, charter, governance + dissolution
+    /// params, dissolution destination). Fixed at deployment — the explorer
+    /// recomputes the same value from decoded state to prove the company's
+    /// design identity can never change.
+    function getDesignDigest() external view returns (uint256 digest) {
+        return _designDigest;
     }
 
     function getVersion() external pure returns (string, string) {

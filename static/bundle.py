@@ -91,6 +91,8 @@ def main():
     for src, tag in [
         ("fields.js", "script"),
         ("core.js", "script"),
+        ("abi.js", "script"),
+        ("wallet.js", "script"),
         ("app.js", "script"),
     ]:
         m, _, body = grab(src, tag)

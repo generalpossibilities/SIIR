@@ -134,7 +134,11 @@ function logoCard(ms) {
 // Protocol-fixed trademark shape: scalloped stamp border, circular image
 // window, banner with label + serial. The window fits ANY artwork whole
 // (preserveAspectRatio="meet") — never cropped, never covered. Without a
-// plan image the window renders a deterministic tier card (label palette).
+// plan image the window renders company-unique deterministic art: a stable
+// hash of the company address picks the hue + pattern (the gateway twin in
+// scripts/gateway.py derives the same art), and the tier label palette
+// keeps the accent — every company looks different, every SIIR of a
+// company keeps its house style.
 const SEAL_TIERS = [
     ["bronze", "#cd7f32", "#7c4a1e"],
     ["silver", "#c0c0c0", "#5f6b76"],
@@ -145,6 +149,17 @@ const SEAL_TIERS = [
 ];
 const SEAL_TIER_FALLBACK = ["#9aa5b1", "#4b5563"];
 
+// FNV-1a 32-bit — mirrors scripts/gateway.py fnv1a() so both render the
+// same deterministic company art
+function fnv1a(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+}
+
 function sealTier(label) {
     const l = (label || "").toLowerCase();
     for (const [name, c1, c2] of SEAL_TIERS) {
@@ -153,7 +168,41 @@ function sealTier(label) {
     return SEAL_TIER_FALLBACK;
 }
 
-function sealInner(plan, label) {
+// deterministic company art for the seal window; id rotates the motif so
+// each SIIR of a company differs slightly
+function sealArt(seed, id, c1, c2, mark) {
+    const hue = seed % 360;
+    const pat = (seed >>> 8) % 4;
+    const rot = (seed >>> 16) % 90 + (Number(id) % 5) * 18;
+    let motif;
+    if (pat === 0) {
+        motif = `<circle cx="100" cy="100" r="26" fill="none" stroke="${c1}" stroke-width="2" opacity=".8"/>
+            <circle cx="100" cy="100" r="38" fill="none" stroke="${c1}" stroke-width="1.5" opacity=".55"/>
+            <circle cx="100" cy="100" r="50" fill="none" stroke="${c1}" stroke-width="1" opacity=".3"/>`;
+    } else if (pat === 1) {
+        motif = `<g transform="rotate(${rot} 100 100)" stroke="${c1}" fill="none" opacity=".6">
+            <rect x="60" y="14" width="7" height="172"/><rect x="82" y="14" width="7" height="172"/>
+            <rect x="104" y="14" width="7" height="172"/><rect x="126" y="14" width="7" height="172"/></g>`;
+    } else if (pat === 2) {
+        motif = Array.from({ length: 4 }, (_, r) => Array.from({ length: 4 }, (_, c) =>
+            `<circle cx="${56 + c * 29}" cy="${56 + r * 29}" r="3.2" fill="${c1}" opacity=".55"/>`).join("")).join("");
+    } else {
+        motif = `<g transform="rotate(${rot} 100 100)" fill="none" stroke="${c1}" stroke-width="2.5" opacity=".65">
+            <path d="M58 122 l21 -24 l21 24"/><path d="M100 122 l21 -24 l21 24"/>
+            <path d="M58 96 l21 -24 l21 24"/><path d="M100 96 l21 -24 l21 24"/></g>`;
+    }
+    return `<defs><radialGradient id="cg" cx=".5" cy=".38" r=".95">
+        <stop offset="0" stop-color="hsl(${hue} 50% 36%)"/>
+        <stop offset="1" stop-color="hsl(${(hue + 40) % 360} 50% 15%)"/></radialGradient>
+        <clipPath id="cw"><rect x="42" y="42" width="116" height="116" rx="10"/></clipPath></defs>
+        <rect x="42" y="42" width="116" height="116" rx="10" fill="url(#cg)"/>
+        <g clip-path="url(#cw)">${motif}</g>
+        <circle cx="100" cy="100" r="38" fill="none" stroke="${c1}" stroke-width="3" opacity=".9"/>
+        <path d="M100 78l8 16 18 3-13 12 3 18-16-8-16 8 3-18-13-12 18-3z" fill="${c2}"/>
+        <text x="100" y="148" font-size="11" fill="#fff" text-anchor="middle" font-family="monospace">${esc(mark)}</text>`;
+}
+
+function sealInner(plan, label, seed, id) {
     const img = (plan && plan.image) || "";
     if (img) {
         const b64 = img.replace(/^data:[^,]+,/, "");
@@ -161,12 +210,7 @@ function sealInner(plan, label) {
     }
     const [c1, c2] = sealTier(label);
     const mark = (label || "SIIR").toUpperCase().slice(0, 9);
-    return `<defs><linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/></linearGradient></defs>
-        <rect x="42" y="42" width="116" height="116" rx="10" fill="url(#tg)"/>
-        <circle cx="100" cy="100" r="38" fill="none" stroke="#fff" stroke-width="5" opacity=".85"/>
-        <path d="M100 78l8 16 18 3-13 12 3 18-16-8-16 8 3-18-13-12 18-3z" fill="#fff"/>
-        <text x="100" y="148" font-size="11" fill="#fff" text-anchor="middle" font-family="monospace">${esc(mark)}</text>`;
+    return sealArt(seed, id, c1, c2, mark);
 }
 
 function sealCard(ms, s, id, opts) {
@@ -185,7 +229,7 @@ function sealCard(ms, s, id, opts) {
         <circle cx="100" cy="108" r="73" fill="#0b1220"/>
         <circle cx="100" cy="108" r="66" fill="none" stroke="#55647c" stroke-width="1"/>
         <clipPath id="sw"><circle cx="100" cy="108" r="62"/></clipPath>
-        <g clip-path="url(#sw)">${sealInner(plan, s.label)}</g>
+        <g clip-path="url(#sw)">${sealInner(plan, s.label, fnv1a(ms.address), id)}</g>
         <circle cx="100" cy="108" r="62" fill="none" stroke="#7d8aa0" stroke-width="2.5"/>
         <circle cx="100" cy="108" r="69" fill="none" stroke="#cdd6e4" stroke-width="1.5" stroke-dasharray="1 6"/>
         <rect x="28" y="200" width="144" height="44" rx="10" fill="#161d2b" stroke="#3d4a5e"/>
@@ -312,6 +356,8 @@ async function companyPage(ms, tabData) {
     const content = ms.contentInfo();
     let fp = "…";
     try { fp = await ms.charterFingerprint(); } catch {}
+    let dig = null;
+    try { dig = await ms.designDigest(); } catch {}
     const tabs = [
         ["", "overview"],
         ["/register", "SIIR register (" + c.issuedCount + ")"],
@@ -326,7 +372,7 @@ async function companyPage(ms, tabData) {
     } else if (tabData === "holders") {
         body = holdersSection(ms);
     } else {
-        body = overviewSection(ms, c, plans, div, content, fp);
+        body = await overviewSection(ms, c, plans, div, content, fp, dig);
     }
     return `
     <div class="card">
@@ -338,7 +384,7 @@ async function companyPage(ms, tabData) {
     ${body}`;
 }
 
-function overviewSection(ms, c, plans, div, content, fp) {
+function overviewSection(ms, c, plans, div, content, fp, dig) {
     const kvs = [
         ["founder", c.founder],
         ["factory", c.factory],
@@ -371,10 +417,20 @@ function overviewSection(ms, c, plans, div, content, fp) {
         <div class="kv"><div class="k">unclaimed rule</div><div class="v">${rules[g._dissolutionRule] || "—"}</div></div>
         <div class="kv"><div class="k">final deposit / finalized</div><div class="v">${g._finalDeposited ? "yes" : "no"} / ${g._finalized ? "yes" : "no"}</div></div>
     </div>`;
+    const digestCard = dig ? `<div class="card"><h2>design digest · protocol-committed</h2>
+        <div class="kv"><div class="k">committed at deploy (sha256 atoms)</div><div class="v addr">0x${esc(dig.committed || "")}</div></div>
+        <div class="kv"><div class="k">recomputed from state</div><div class="v addr">0x${esc(dig.recomputed)}</div></div>
+        <p class="note">${dig.committed
+            ? (dig.match
+                ? "matches — the design identity is locked on-chain: name, description, website, metadata, issuance model, plans (count / weight / label / image), logo, deed image, ui, charter, governance + dissolution params, dissolution destination."
+                : "MISMATCH — decoded state does not reproduce the committed digest.")
+            : "not committed — company deployed before the design-digest rule."}</p>
+    </div>` : "";
     return `<div class="card"><h2>company</h2>${grid}</div>
             <div class="card"><h2>dividends</h2>${divsTable}</div>
             <div class="card"><h2>plans</h2>${plansTable}</div>
             ${govCard}
+            ${digestCard}
             <div class="card"><h2>content</h2>
                <div class="kv"><div class="k">logo / deed / ui</div>
                <div class="v">${esc(content.logoSize)} / ${esc(content.siirImageSize)} / ${esc(content.uiSize)} bytes</div></div>
@@ -457,7 +513,9 @@ async function siirPage(addr, id) {
             <p><b>label</b> ${esc(s.label)}<br><b>metadata</b> ${esc(s.metadataUri)}</p>
             <p><b>fingerprint</b> <code>${esc(fp)}</code></p>
             </div>
-            <div class="card"><h2>claimable</h2><table><tbody><tr><th>currency</th><th>pending</th></tr>${rows}</tbody></table></div>
+            <div class="card"><h2>claimable</h2><table><tbody><tr><th>currency</th><th>pending</th></tr>${rows}</tbody></table>
+            ${claimButtonHtml(addr, [id], "claim this SIIR's dividends", s.owner)}
+            </div>
             <div class="card"><h2>provenance</h2><table><tbody><tr><th>time</th><th>from</th><th>to</th></tr>${histRows}</tbody></table></div>`;
 }
 
@@ -490,7 +548,21 @@ async function holderPage(addr, owner) {
     return `<div class="card"><h1>holder</h1><p class="addr">${esc(owner)}</p>
             <p class="mut">${fmtBig(total)} SIIRs in ${ranges.length} range(s)</p></div>
             <div class="card"><h2>owned</h2><table><tbody><tr><th>id / range</th><th>weight</th><th>round</th>${total <= 200n ? "" : "<th>size</th>"}</tr>${rows}</tbody></table></div>
-            <div class="card"><h2>total claimable</h2><table><tbody><tr><th>currency</th><th>pending</th></tr>${claimRows}</tbody></table></div>`;
+            <div class="card"><h2>total claimable</h2><table><tbody><tr><th>currency</th><th>pending</th></tr>${claimRows}</tbody></table>
+            ${claimButtonHtml(addr, ownedIds(ms, owner, 64), "claim owned SIIRs", owner)}
+            </div>`;
+}
+
+// all owned ids (capped, since claim(ids) serialises a dict of keys)
+function ownedIds(ms, owner, cap) {
+    const out = [];
+    for (const r of ms.idsOf(owner)) {
+        for (let i = r.start; i <= r.end; i++) {
+            out.push(String(i));
+            if (out.length >= cap) return out;
+        }
+    }
+    return out;
 }
 
 // ---------------- factory / search ----------------
@@ -710,6 +782,8 @@ async function route() {
         }
     } catch (e) {
         main.innerHTML = error((e && e.message) || String(e));
+    } finally {
+        mountWalletActions();
     }
 }
 
@@ -734,6 +808,126 @@ document.addEventListener("click", (e) => {
     route();
 });
 
-const FACTORY_ADDR = "c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66::c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66";
-const DEMO_ADDR = "c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66::a7b699c76d325999b220d8470433a9e9bd5caf6f6fa1b177cf4fe842fe6be75c";
+// ---------------- wallet (static/wallet.js) ----------------
+
+function walletLabel(info) {
+    return info && info.address ? info.address.slice(0, 10) + "…" : "…";
+}
+
+function renderWalletBar() {
+    const slot = document.getElementById("wslot");
+    if (!slot) return;
+    const p = currentProvider();
+    const demo = document.getElementById("demo");
+    if (demo) {
+        demo.style.display = p && p.isDemo ? "" : "none";
+        demo.innerHTML = p && p.isDemo
+            ? `DEV demo signer — in-browser key <code>${esc(p.seedHex.slice(0, 10))}…</code>. not a real account; write actions land on the real chain.`
+            : "";
+    }
+    if (!p) {
+        slot.innerHTML = `<span class="w-state">not connected</span>
+            <button id="w-connect" class="ghost">connect wallet</button>
+            <button id="w-demo" class="ghost">dev demo</button>`;
+        slot.querySelector("#w-connect").addEventListener("click", () => connectFlow(false));
+        slot.querySelector("#w-demo").addEventListener("click", () => connectFlow(true));
+        return;
+    }
+    p.getAccount().then((info) => {
+        slot.innerHTML = `<span class="w-state">${p.isDemo ? "demo" : "wallet"} <b>${esc(walletLabel(info))}</b></span>
+            <button id="w-off" class="ghost">disconnect</button>`;
+        slot.querySelector("#w-off").addEventListener("click", disconnectFlow);
+    }).catch(() => {
+        slot.innerHTML = `<span class="w-state">wallet error</span>
+            <button id="w-off" class="ghost">disconnect</button>`;
+        slot.querySelector("#w-off").addEventListener("click", disconnectFlow);
+    });
+}
+
+async function connectFlow(forceDemo) {
+    try {
+        const { provider, info } = await connectWallet(forceDemo);
+        renderWalletBar();
+        toast((provider.isDemo ? "demo wallet connected — " : "wallet connected — ") + walletLabel(info));
+        route();
+    } catch (e) {
+        toast("wallet connect failed: " + ((e && e.message) || e));
+    }
+}
+
+async function disconnectFlow() {
+    await disconnectWallet();
+    renderWalletBar();
+    toast("wallet disconnected");
+    route();
+}
+
+// claim button for a company's SIIR ids; owner "0:…" enables the
+// ownership hint (claim is rejected on-chain for non-holders)
+function claimButtonHtml(addr, ids, label, owner) {
+    if (!ids.length) return `<p class="note">nothing to claim</p>`;
+    const p = currentProvider();
+    if (!p) return `<p class="note">connect a wallet to claim pending dividends</p>`;
+    const mine = p._info && owner &&
+        String(owner).toLowerCase() !== String(p._info.address).toLowerCase();
+    return `<button type="button" data-claim="${esc(addr)}" data-ids="${esc(ids.join(","))}">${esc(label)}</button>` +
+        (mine ? `<p class="note">connected wallet is not the holder — the claim will be rejected on-chain</p>` : "");
+}
+
+async function submitToRelay(payload) {
+    const url = "https://" + NET + "/messages";
+    const post = (pl) => fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify([pl]),
+    });
+    let res = await post(payload);
+    if (res.ok) return null;
+    let j = null;
+    try { j = await res.json(); } catch {}
+    // one retry with the relay-issued ext_message_token if it asked for one
+    if (j && j.ext_message_token && payload.ext_message_token === null) {
+        payload.ext_message_token = j.ext_message_token;
+        res = await post(payload);
+        if (res.ok) return null;
+    }
+    return (j && (j.error || j.message)) || ("relay error " + res.status);
+}
+
+async function doClaim(addr, ids, btn) {
+    btn.disabled = true;
+    const base = btn.textContent;
+    btn.textContent = "signing…";
+    try {
+        const { payload, msgId } = await signAndSend(COMPANY_ABI, addr, "claim", { ids }, {});
+        btn.textContent = "submitting…";
+        const err = await submitToRelay(payload);
+        if (err) throw new Error(err);
+        toast("claim submitted — " + msgId.slice(0, 10) + "…");
+        setTimeout(() => route(), 35000); // re-read state after settle
+    } catch (e) {
+        toast("claim failed: " + ((e && e.message) || e));
+    }
+    btn.disabled = false;
+    btn.textContent = base;
+}
+
+function mountWalletActions() {
+    renderWalletBar();
+    if (!currentProvider()) {
+        const kind = storedProviderKind();
+        const injected = kind === "injected" && typeof InjectedProvider !== "undefined" && InjectedProvider.detect();
+        if (kind === "demo" || injected) {
+            connectWallet(false).then(() => { renderWalletBar(); route(); }).catch(() => {});
+        }
+    }
+    document.querySelectorAll("button[data-claim]").forEach((b) => {
+        b.addEventListener("click", () =>
+            doClaim(b.getAttribute("data-claim"),
+                    b.getAttribute("data-ids").split(",").filter(Boolean), b));
+    });
+}
+
+const FACTORY_ADDR = "21eacdb348e6d07166caaa372c7ebaef16d56cf43e87b2f4fbff3fb976e23239::21eacdb348e6d07166caaa372c7ebaef16d56cf43e87b2f4fbff3fb976e23239";
+const DEMO_ADDR = "95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b::95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b";
 route();

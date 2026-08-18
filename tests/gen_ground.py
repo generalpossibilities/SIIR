@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from mirror import MirrorState  # noqa: E402
 
 ADDR = (sys.argv[1] if len(sys.argv) > 1 else
-        "c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66"
-        "::a7b699c76d325999b220d8470433a9e9bd5caf6f6fa1b177cf4fe842fe6be75c")
+        "95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b"
+        "::95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b")
 F = sys.argv[2] if len(sys.argv) > 2 else "0:c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb"
 H = sys.argv[3] if len(sys.argv) > 3 else "0:0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa"
 
@@ -58,9 +58,39 @@ def main():
         "co_founders": ms.co_founders(),
         "founder_rights_holder": ms.founder_rights(H, "0x0000000000000000000000000000000000000000000000000000000000000000"),
         "founder_rights_original": ms.founder_rights(F, "0x0000000000000000000000000000000000000000000000000000000000000000"),
+        "design_digest": _design_digest(ms),
     }
     print(json.dumps(out, sort_keys=True))
     return 0
+
+
+def _design_digest(ms):
+    """Canonical design digest for the decoded state (design_digest.py)."""
+    import importlib.util
+
+    dd_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "scripts", "design_digest.py")
+    spec = importlib.util.spec_from_file_location("design_digest", dd_path)
+    dd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dd)
+    st = ms.state
+    return dd.digest({
+        "name": st.get("_name") or "",
+        "description": st.get("_description") or "",
+        "website": st.get("_website") or "",
+        "metadataUri": st.get("_metadataUri") or "",
+        "issuanceModel": st.get("_issuanceModel") or 0,
+        "governanceEnabled": bool(st.get("_governanceEnabled")),
+        "quorumPermille": st.get("_quorumPermille") or 0,
+        "dissolutionRule": st.get("_dissolutionRule") or 0,
+        "dissolutionDest": (st.get("_dissolutionDest") or "0:0").split(":")[-1],
+        "plans": [{"count": pl[0], "weight": pl[1], "label": pl[2], "image": pl[4]}
+                  for pl in (st.get("_plans") or [])],
+        "logoImage": st.get("_logoImage") or "",
+        "siirImage": st.get("_siirImage") or "",
+        "ui": st.get("_ui") or "",
+        "charter": st.get("_charter") or "",
+    })
 
 
 if __name__ == "__main__":

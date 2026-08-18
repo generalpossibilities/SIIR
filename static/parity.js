@@ -9,7 +9,7 @@ global.atob = (s) => Buffer.from(s, "base64").toString("binary");
 const XP = require("./core.js");
 const ABI = { fields: require("./fields.js").ABI_FIELDS };
 
-const ADDR = process.env.PARITY_ADDR || "c78d472dc72593494e3ebe90acc79790bee94ad9b131b2a06f4307c92d7abd66::a7b699c76d325999b220d8470433a9e9bd5caf6f6fa1b177cf4fe842fe6be75c";
+const ADDR = process.env.PARITY_ADDR || "95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b::95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b";
 const F = process.env.PARITY_FOUNDER || "0:c4d1738754335536ec61d32bdf872bffd1f9a9a114c4f2bc8328f0726ed275cb";
 const H = process.env.PARITY_HOLDER || "0:0f077a5e0f4630b9696db80a77b357ab576773d0a278590a22408d1c89366caa";
 
@@ -39,6 +39,7 @@ async function main() {
         co_founders: ms.coFounders(),
         founder_rights_holder: ms.founderRights(H, "0x0000000000000000000000000000000000000000000000000000000000000000"),
         founder_rights_original: ms.founderRights(F, "0x0000000000000000000000000000000000000000000000000000000000000000"),
+        design_digest: (await ms.designDigest()).recomputed,
     };
     const py = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
     // normalize: BigInt -> string, and sort object keys recursively, so the

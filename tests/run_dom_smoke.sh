@@ -15,7 +15,8 @@ CHROME="${CHROME_BIN:-$(command -v google-chrome || command -v chromium || comma
 PORT="${SMOKE_PORT:-8099}"
 HOST="http://127.0.0.1:$PORT"
 OUT="$(mktemp -d)"
-CHROME_RUN() { timeout 40 "$CHROME" --headless=new --disable-gpu --no-sandbox \
+CHROME_RUN() { timeout 90 "$CHROME" --headless=new --disable-gpu --no-sandbox \
+    --virtual-time-budget=20000 \
     --user-data-dir="$OUT/profile$$" --dump-dom "$HOST$1" 2>"$OUT/chrome.err"; }
 trap 'rm -rf "$OUT"; kill $GW 2>/dev/null || true' EXIT
 
@@ -33,6 +34,14 @@ check() { # check <name> <file> <regex>
 dump() { # dump <route> <outfile>
     CHROME_RUN "$1" >"$2"
 }
+# cdp_dump: keep a page open and poll the live DOM (real time) until <marker>
+# appears, then save it — the SPA's in-browser BOC decode + sha256 chain is
+# too slow for one-shot --dump-dom.
+cdp_dump() { # cdp_dump <route> <marker-regex> <outfile>
+    node --experimental-websocket "$(dirname "$0")/cdp_dump.mjs" \
+        "http://127.0.0.1:$PORT$1" "$2" "$3" >/dev/null 2>&1 || {
+        echo "FAIL cdp dump $1 (never matched: $2)"; }
+}
 wait_ready() {
     for _ in $(seq 1 30); do
         CHROME_RUN "$1" >/dev/null && return 0
@@ -45,8 +54,8 @@ echo "== dumping routes =="
 wait_ready "/" || { echo "gateway never became ready"; cat "$OUT/gw.log"; exit 1; }
 
 dump "/"           "$OUT/landing.html"
-dump "/search?q=njd" "$OUT/search.html"
-dump "/company/d0f0bb83c277e3de12da83c97a6cb1fb0b4bf2e616e788f13bf728dfd986a5ea::a334e243be3f9e8b95814e06c2a718095f05803f6d9635e1dbdd501d37762303" "$OUT/company.html"
+cdp_dump "/static/index.html#/search/njd" "njd|NJD|result" "$OUT/search.html"
+cdp_dump "/static/index.html#/company/95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b::95021c8e8642f60da6aaa316f4eb2b3d22e3626a734336adf4779ccecc56844b" "0xd711348c" "$OUT/company.html"
 
 echo "== asserting =="
 check "landing title"        "$OUT/landing.html"  "SIIR"
@@ -55,6 +64,9 @@ check "search gates"         "$OUT/landing.html"  "search"
 check "search results"       "$OUT/search.html"   "NJD|njd|result"
 check "company name"         "$OUT/company.html"  "CompanySIIR|company"
 check "company charter"      "$OUT/company.html"  "charter"
+check "design digest card"   "$OUT/company.html"  "design digest · protocol-committed"
+check "digest match badge"   "$OUT/company.html"  "matches — the design identity is locked on-chain"
+check "digest committed hash" "$OUT/company.html" "0xd711348c3d0c08ebb4dda7aa1a37dd9e086f6b4a1a17d7afe79960e66d334bd5"
 
 echo "== $pass passed, $fail failed =="
 [[ $fail -eq 0 ]]
